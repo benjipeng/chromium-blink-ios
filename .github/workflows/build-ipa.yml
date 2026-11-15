@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       build_mode:
-        description: "Compile strategy: 'auto' runs the 12-shard farm on warm per-shard ccache; 'incremental' compiles inside the link job from the merged ccache"
+        description: "Compile strategy: 'auto' runs the parallel shard farm on warm per-shard ccache; 'incremental' compiles inside the link job from the merged ccache"
         required: false
         type: choice
         options:
@@ -44,7 +44,8 @@ permissions:
   actions: read
 
 env:
-  SHARD_COUNT: "12"
+  # Free plan: 20 concurrent jobs. 18 shards leave headroom for other runs.
+  SHARD_COUNT: "18"
 
 jobs:
   plan:
@@ -57,6 +58,7 @@ jobs:
       stub_ref: ${{ steps.plan.outputs.stub_ref }}
       s1_ref: ${{ steps.plan.outputs.s1_ref }}
       s2a_ref: ${{ steps.plan.outputs.s2a_ref }}
+      shards_ref: ${{ steps.plan.outputs.shards_ref }}
       s3_ref: ${{ steps.plan.outputs.s3_ref }}
       ccache_repo: ${{ steps.plan.outputs.ccache_repo }}
       merged_ccache_ref: ${{ steps.plan.outputs.merged_ccache_ref }}
@@ -67,8 +69,8 @@ jobs:
       has_stub: ${{ steps.plan.outputs.has_stub }}
       has_merged_ccache: ${{ steps.plan.outputs.has_merged_ccache }}
       use_s2a_in_link: ${{ steps.plan.outputs.use_s2a_in_link }}
+      incremental_link: ${{ steps.plan.outputs.incremental_link }}
       run_stage1: ${{ steps.plan.outputs.run_stage1 }}
-      run_preflight: ${{ steps.plan.outputs.run_preflight }}
       run_codegen: ${{ steps.plan.outputs.run_codegen }}
       run_shards: ${{ steps.plan.outputs.run_shards }}
       run_link: ${{ steps.plan.outputs.run_link }}
@@ -173,14 +175,25 @@ jobs:
               pathlib.Path("scripts/plan_shards.py"),
               job_yaml("apple-prebuild"),
           )
-          k2 = hash_items("codegen-v1", k1, job_yaml("codegen"))
-          k3 = hash_items(
-              "link-v1",
-              k2,
-              shard_count,
-              job_yaml("compile-shards"),
-              job_yaml("link"),
+          # Codegen runs on Linux in parallel with Stage 1 and consumes only
+          # the SDK stub, so its key is independent of K1 (Mac-only changes
+          # never invalidate it).
+          k2 = hash_items(
+              "codegen-v2",
+              chromium_rev,
+              stub_tag,
+              bundle_prefix,
+              pathlib.Path("patches"),
+              pathlib.Path("args"),
+              pathlib.Path("scripts/apply_patches.sh"),
+              pathlib.Path("scripts/apple_tool_wrapper.py"),
+              pathlib.Path("scripts/plan_shards.py"),
+              job_yaml("codegen"),
           )
+          # KS marks a fully compiled shard farm (merged ccache complete), so a
+          # link-only failure resumes at link instead of re-running the shards.
+          ks = hash_items("shards-v1", k1, k2, shard_count, job_yaml("compile-shards"))
+          k3 = hash_items("link-v2", ks, job_yaml("link"))
           k4 = hash_items(
               "package-v1",
               k3,
@@ -193,6 +206,7 @@ jobs:
           stub_ref = f"ghcr.io/{repo_lc}/xcode-stub:{stub_tag}"
           s1_ref = f"ghcr.io/{repo_lc}/stage-cache:stage1-{k1}"
           s2a_ref = f"ghcr.io/{repo_lc}/stage-cache:codegen-{k2}"
+          shards_ref = f"ghcr.io/{repo_lc}/stage-cache:shards-{ks}"
           s3_ref = f"ghcr.io/{repo_lc}/stage-cache:link-{k3}"
           ccache_repo = f"ghcr.io/{repo_lc}/chromium-ios-ccache"
           merged_ccache_ref = f"{ccache_repo}:{chromium_rev}"
@@ -214,20 +228,22 @@ jobs:
           raw_has_s2a = oci_exists(s2a_ref)
           raw_has_s3 = oci_exists(s3_ref)
           has_merged_ccache = oci_exists(merged_ccache_ref)
+          raw_has_shards = has_merged_ccache and oci_exists(shards_ref)
 
           eff_s1 = raw_has_s1
           eff_s2a = raw_has_s2a
+          eff_shards = raw_has_shards
           eff_s3 = raw_has_s3
           force_shards = False
 
           if force_from == "stage1":
-              eff_s1 = eff_s2a = eff_s3 = False
+              eff_s1 = eff_s2a = eff_shards = eff_s3 = False
               force_shards = True
           elif force_from == "codegen":
-              eff_s2a = eff_s3 = False
+              eff_s2a = eff_shards = eff_s3 = False
               force_shards = True
           elif force_from == "shards":
-              eff_s3 = False
+              eff_shards = eff_s3 = False
               force_shards = True
           elif force_from == "link":
               eff_s3 = False
@@ -247,14 +263,19 @@ jobs:
           else:
               run_link = True
               run_stage1 = not eff_s1
-              # Warm per-shard buckets recompile only changed TUs across 12
-              # runners, so wall-clock stays bounded regardless of change size.
+              # Warm per-shard buckets recompile only changed TUs across the
+              # farm, so wall-clock stays bounded regardless of change size.
               # 'incremental' (serial, inside the link job) is opt-in only.
-              run_shards = force_shards or build_mode != "incremental"
+              if force_shards:
+                  run_shards = True
+              else:
+                  run_shards = build_mode != "incremental" and not eff_shards
               run_codegen = run_shards and (not eff_s2a)
 
           use_s2a_in_link = run_codegen or eff_s2a
-          run_preflight = run_link and raw_has_stub and (run_stage1 or run_codegen)
+          # Only a link job that compiles real misses needs to refresh the
+          # merged cache afterwards; a completed shard farm already pushed it.
+          incremental_link = run_link and not run_shards and not eff_shards
 
           def bstr(v: bool) -> str:
               return "true" if v else "false"
@@ -266,6 +287,7 @@ jobs:
               "stub_ref": stub_ref,
               "s1_ref": s1_ref,
               "s2a_ref": s2a_ref,
+              "shards_ref": shards_ref,
               "s3_ref": s3_ref,
               "ccache_repo": ccache_repo,
               "merged_ccache_ref": merged_ccache_ref,
@@ -276,8 +298,8 @@ jobs:
               "has_stub": bstr(raw_has_stub),
               "has_merged_ccache": bstr(has_merged_ccache),
               "use_s2a_in_link": bstr(use_s2a_in_link),
+              "incremental_link": bstr(incremental_link),
               "run_stage1": bstr(run_stage1),
-              "run_preflight": bstr(run_preflight),
               "run_codegen": bstr(run_codegen),
               "run_shards": bstr(run_shards),
               "run_link": bstr(run_link),
@@ -299,10 +321,9 @@ jobs:
               "",
               "| Stage | Key | GHCR Checkpoint | Action |",
               "| :--- | :--- | :--- | :--- |",
-              f"| Stage 1 (`apple-prebuild`) | `{k1}` | `{'HIT' if raw_has_s1 else 'MISS'}` | **{'RUN' if run_stage1 else 'SKIP (reuse)'}** |",
-              f"| Preflight (`linux-preflight`) | `{stub_tag}` | `{'READY' if raw_has_stub else 'WAIT FOR STUB'}` | **{'RUN' if run_preflight else 'SKIP'}** |",
-              f"| Stage 2a (`codegen`) | `{k2}` | `{'HIT' if raw_has_s2a else 'MISS'}` | **{'RUN' if run_codegen else 'SKIP (reuse)'}** |",
-              f"| Stage 2b (`compile-shards` × {shard_count}) | `sha1-mod-{shard_count}` | `per-shard ccache` | **{'RUN' if run_shards else 'SKIP (warm ccache)'}** |",
+              f"| Stage 1 (`apple-prebuild`, Mac) | `{k1}` | `{'HIT' if raw_has_s1 else 'MISS'}` | **{'RUN' if run_stage1 else 'SKIP (reuse)'}** |",
+              f"| Stage 2a (`codegen`, Linux, parallel to Stage 1) | `{k2}` | `{'HIT' if raw_has_s2a else 'MISS'}` | **{'RUN' if run_codegen else 'SKIP (reuse)'}** |",
+              f"| Stage 2b (`compile-shards` × {shard_count}) | `{ks}` | `{'COMPLETE' if raw_has_shards else 'per-shard ccache'}` | **{'RUN' if run_shards else 'SKIP (merged ccache)'}** |",
               f"| Stage 3 (`link`) | `{k3}` | `{'HIT' if raw_has_s3 else 'MISS'}` | **{'RUN' if run_link else 'SKIP (reuse)'}** |",
               f"| Stage 4 (`apple-package`) | `{k4}` | `final IPA` | **{'RUN' if run_package else 'SKIP'}** |",
               "",
@@ -506,76 +527,13 @@ jobs:
             --ccache-dir "$RUNNER_TEMP/ccache" \
             --ninja-log "$RUNNER_TEMP/ninja.log"
 
-  linux-preflight:
-    name: Linux Graph & Missing-Input Preflight
-    needs: plan
-    if: needs.plan.outputs.run_preflight == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Reclaim disk & install tools
-        id: init
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Validate Linux gn gen & scan full input closure of target 'chrome'
-        id: scan
-        env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-        run: |
-          source ./version.lock
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/stub"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.stub_ref }}" "$RUNNER_TEMP/stub"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/stub/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-
-          mkdir -p "$work/src/ci" "$work/src/out/Release"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$work/src/out/Release/args.gn"
-          cat >> "$work/src/out/Release/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          ios_sdk_developer_dir = "//xcode_stub"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          EOF
-
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          (cd "$work/src" && gn gen out/Release)
-
-          ./scripts/check_inputs.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$work/src/out/Release" \
-            --targets chrome
-
-      - name: Write preflight summary
-        if: always()
-        run: |
-          ./scripts/write_job_summary.py \
-            --title "Linux Graph & Input Preflight" \
-            --key "${{ needs.plan.outputs.k2 }}" \
-            --checkpoint "${{ needs.plan.outputs.stub_ref }}" \
-            --outcome "${{ steps.scan.outcome }}" \
-            --start-epoch "${{ steps.init.outputs.start_epoch }}"
-
   codegen:
+    # Runs concurrently with Stage 1: it needs only the SDK stub (published by
+    # Stage 1 within minutes on a new Xcode build) and doubles as the Linux
+    # graph & missing-input preflight.
     name: Stage 2a - Host Tools, Rust Stdlib & Shared Codegen
-    needs: [plan, apple-prebuild, linux-preflight]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_codegen == 'true' }}
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.outputs.run_codegen == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 165
     steps:
@@ -591,7 +549,7 @@ jobs:
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Pull source, Stage 1 checkpoint, warm codegen ccache, & verify inputs
+      - name: Pull source & SDK stub, warm codegen ccache, gn gen, & verify inputs
         env:
           CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
         run: |
@@ -599,17 +557,26 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
           work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/s1"
+          mkdir -p "$work" "$RUNNER_TEMP/stub"
           ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s1_ref }}" "$RUNNER_TEMP/s1"
           ./scripts/apply_patches.sh --src-dir "$work/src"
 
+          stub_ref="${{ needs.plan.outputs.stub_ref }}"
+          for attempt in $(seq 1 60); do
+            ./scripts/oci_artifacts.sh exists "$stub_ref" && break
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::SDK stub $stub_ref was not published by Stage 1 within 30 minutes"
+              exit 1
+            fi
+            echo "==> Waiting for Stage 1 to publish $stub_ref ($attempt/60)"
+            sleep 30
+          done
+          ./scripts/oci_artifacts.sh pull "$stub_ref" "$RUNNER_TEMP/stub"
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/s1/xcode_stub.tar.zst.enc" \
+            -in "$RUNNER_TEMP/stub/xcode_stub.tar.zst.enc" \
             | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/s1/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
-          rm -rf "$RUNNER_TEMP/s1"
+          rm -rf "$RUNNER_TEMP/stub"
 
           cg_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-codegen"
           export CCACHE_DIR="$RUNNER_TEMP/ccache"
@@ -655,8 +622,13 @@ jobs:
           out_dir="$work/src/out/Release"
           export PATH="$work/depot_tools:$PATH"
           export DEPOT_TOOLS_UPDATE=0
+          # Stage 1 runs concurrently, so no Apple tool outputs exist here. The
+          # few targets downstream of Swift/xcassets/ibtool (e.g. merged
+          # Info.plists) fail fast as replay misses and are built later by the
+          # shards/link, which restore Stage 1's recordings.
           export APPLE_TOOL_MODE=replay
-          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache_empty"
+          mkdir -p "$APPLE_TOOL_CACHE_DIR"
           export CCACHE_DIR="$RUNNER_TEMP/ccache"
           export CCACHE_BASEDIR="$work"
           export CCACHE_NOHASHDIR="true"
@@ -666,11 +638,38 @@ jobs:
           export CCACHE_COMPRESS="true"
           export CCACHE_MAXSIZE="0"
 
+          rc=0
           if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
             tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
-              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" \
-              2>&1 | tee "$RUNNER_TEMP/ninja.log"
+              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
+              2>&1 | tee "$RUNNER_TEMP/ninja.log" || rc=$?
           fi
+
+          if [ "$rc" -ne 0 ]; then
+            # Accept the run only if every failed edge is a deferred Apple tool.
+            python3 - "$RUNNER_TEMP/ninja.log" <<'PY'
+          import sys
+
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          deferred, real = [], []
+          for i, line in enumerate(lines):
+              if line.startswith("FAILED: "):
+                  cmd = lines[i + 1] if i + 1 < len(lines) else ""
+                  (deferred if "apple_tool_wrapper" in cmd else real).append(line[len("FAILED: "):])
+          print(f"==> {len(deferred)} Apple tool edge(s) deferred to shards/link")
+          for item in deferred[:40]:
+              print(f"  deferred: {item}")
+          if real or not deferred:
+              print(f"::error::{len(real)} non-Apple codegen failure(s); see FAILED blocks above", file=sys.stderr)
+              sys.exit(1)
+          PY
+          fi
+
+          pending="$(tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
+            | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -n 2>/dev/null \
+            | grep -c '^\[' || true)"
+          echo "==> ${pending} codegen edge(s) left for shards/link (downstream of Apple outputs)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Persist Stage 2a codegen checkpoint to GHCR
         if: steps.compile.outcome == 'success'
@@ -723,7 +722,7 @@ jobs:
 
   compile-shards:
     name: Stage 2b - C/C++/ObjC++ Shard ${{ matrix.shard }}
-    needs: [plan, apple-prebuild, linux-preflight, codegen]
+    needs: [plan, apple-prebuild, codegen]
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_shards == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 185
@@ -853,7 +852,7 @@ jobs:
 
   link:
     name: Stage 3 - Persist Merged ccache & Link Chromium.app
-    needs: [plan, apple-prebuild, linux-preflight, codegen, compile-shards]
+    needs: [plan, apple-prebuild, codegen, compile-shards]
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_link == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 215
@@ -870,24 +869,38 @@ jobs:
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Assemble 13 ccache buckets & push merged ccache to GHCR BEFORE linking
+      - name: Assemble codegen + shard ccache buckets & push merged ccache to GHCR BEFORE linking
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           export CCACHE_DIR="$RUNNER_TEMP/ccache"
           mkdir -p "$CCACHE_DIR"
 
           if [ "${{ needs.plan.outputs.run_shards }}" = "true" ]; then
-            echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Streaming 13 ccache buckets from GHCR one at a time"
             tags=("${{ needs.plan.outputs.chromium_rev }}-codegen")
             for (( i = 0; i < SHARD_COUNT; i++ )); do
               tags+=("${{ needs.plan.outputs.chromium_rev }}-shard-${i}")
             done
-            for tag in "${tags[@]}"; do
-              tmp_s="$(mktemp -d)"
-              ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.ccache_repo }}:${tag}" "$tmp_s"
-              rsync -a --ignore-existing "$tmp_s/ccache/" "$CCACHE_DIR/"
-              rm -rf "$tmp_s"
-              echo "  merged ${tag}"
+            # Pull 4 buckets concurrently, merge, delete, repeat: bounded disk
+            # peak with ~4x faster assembly than one-at-a-time.
+            batch=4
+            echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling ${#tags[@]} ccache buckets from GHCR, ${batch} at a time"
+            for (( b = 0; b < ${#tags[@]}; b += batch )); do
+              dirs=()
+              pids=()
+              for tag in "${tags[@]:b:batch}"; do
+                d="$(mktemp -d)"
+                dirs+=("$d")
+                ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.ccache_repo }}:${tag}" "$d" &
+                pids+=("$!")
+              done
+              for pid in "${pids[@]}"; do
+                wait "$pid"
+              done
+              for d in "${dirs[@]}"; do
+                rsync -a --ignore-existing "$d/ccache/" "$CCACHE_DIR/"
+                rm -rf "$d"
+              done
+              echo "  merged: ${tags[*]:b:batch}"
             done
 
             ccache -M 0
@@ -899,6 +912,15 @@ jobs:
               "${{ needs.plan.outputs.merged_ccache_ref }}" \
               "$RUNNER_TEMP" \
               ccache \
+              --repo "${{ github.repository }}"
+
+            # Mark this shard farm complete so a link-only failure resumes here.
+            mkdir -p "$RUNNER_TEMP/shards_marker"
+            echo "${{ needs.plan.outputs.shards_ref }}" > "$RUNNER_TEMP/shards_marker/complete.txt"
+            ./scripts/oci_artifacts.sh push \
+              "${{ needs.plan.outputs.shards_ref }}" \
+              "$RUNNER_TEMP/shards_marker" \
+              complete.txt \
               --repo "${{ github.repository }}"
           elif [ "${{ needs.plan.outputs.has_merged_ccache }}" = "true" ]; then
             echo "==> Pulling warm merged ccache from ${{ needs.plan.outputs.merged_ccache_ref }}"
@@ -1003,11 +1025,11 @@ jobs:
 
       # Incremental runs compile misses inside the link job; persist them even
       # when the link fails or times out so the next attempt makes progress.
-      # (Shard runs already pushed the complete merged cache before linking.)
+      # (A completed shard farm already pushed the merged cache before linking.)
       - name: Always refresh merged ccache after incremental compile
         if: >-
           always() &&
-          needs.plan.outputs.run_shards != 'true' &&
+          needs.plan.outputs.incremental_link == 'true' &&
           steps.link_chrome.outcome != 'skipped' &&
           steps.link_chrome.outcome != ''
         run: |
