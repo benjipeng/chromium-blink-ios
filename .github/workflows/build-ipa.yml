@@ -4,12 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       build_mode:
-        description: "Build strategy: 'auto' uses warm ccache if present else 12-shard farm"
+        description: "Compile strategy: 'auto' runs the 12-shard farm on warm per-shard ccache; 'incremental' compiles inside the link job from the merged ccache"
         required: false
         type: choice
         options:
           - auto
-          - cold-sharded
           - incremental
         default: auto
       force_from:
@@ -97,6 +96,7 @@ jobs:
           import json
           import os
           import pathlib
+          import re
           import subprocess
           import sys
 
@@ -139,6 +139,25 @@ jobs:
           stub_hash = hash_items(pathlib.Path("scripts/extract_xcode_stub.sh"))[:12]
           stub_tag = f"{xcode_build}-{stub_hash}"
 
+          # Each stage key also hashes the YAML of the job(s) producing it, so
+          # inline config (args.gn overlays, packing lists, ninja targets)
+          # invalidates exactly the stages it affects and nothing upstream.
+          workflow_lines = pathlib.Path(".github/workflows/build-ipa.yml").read_text(
+              encoding="utf-8"
+          ).splitlines(keepends=True)
+
+          def job_yaml(job_id: str) -> str:
+              start = None
+              for i, line in enumerate(workflow_lines):
+                  if start is None:
+                      if line.rstrip() == f"  {job_id}:":
+                          start = i
+                  elif re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+                      return "".join(workflow_lines[start:i])
+              if start is None:
+                  sys.exit(f"::error::job '{job_id}' not found in build-ipa.yml")
+              return "".join(workflow_lines[start:])
+
           # K1 covers every input that can change Stage 1 Swift/xcassets/ibtool outputs.
           k1 = hash_items(
               "stage1-v1",
@@ -152,11 +171,23 @@ jobs:
               pathlib.Path("scripts/apply_patches.sh"),
               pathlib.Path("scripts/apple_tool_wrapper.py"),
               pathlib.Path("scripts/plan_shards.py"),
-              pathlib.Path("scripts/check_inputs.py"),
+              job_yaml("apple-prebuild"),
           )
-          k2 = hash_items("codegen-v1", k1, pathlib.Path("scripts/reclaim_disk_linux.sh"))
-          k3 = hash_items("link-v1", k2, shard_count, pathlib.Path("scripts/plan_shards.py"))
-          k4 = hash_items("package-v1", k3, with_app_groups, pathlib.Path("scripts/package_ipa.sh"))
+          k2 = hash_items("codegen-v1", k1, job_yaml("codegen"))
+          k3 = hash_items(
+              "link-v1",
+              k2,
+              shard_count,
+              job_yaml("compile-shards"),
+              job_yaml("link"),
+          )
+          k4 = hash_items(
+              "package-v1",
+              k3,
+              with_app_groups,
+              pathlib.Path("scripts/package_ipa.sh"),
+              job_yaml("apple-package"),
+          )
 
           src_ref = f"ghcr.io/{repo_lc}/chromium-ios-src:{chromium_rev}"
           stub_ref = f"ghcr.io/{repo_lc}/xcode-stub:{stub_tag}"
@@ -204,8 +235,8 @@ jobs:
               pass
 
           if build_mode == "incremental" and not has_merged_ccache:
-              print(f"::warning::Requested 'incremental' but {merged_ccache_ref} is missing; falling back to 'cold-sharded'.")
-              build_mode = "cold-sharded"
+              print(f"::warning::Requested 'incremental' but {merged_ccache_ref} is missing; falling back to 'auto'.")
+              build_mode = "auto"
 
           run_package = True
           if eff_s3:
@@ -216,10 +247,10 @@ jobs:
           else:
               run_link = True
               run_stage1 = not eff_s1
-              if force_shards or build_mode == "cold-sharded" or (build_mode == "auto" and not has_merged_ccache):
-                  run_shards = True
-              else:
-                  run_shards = False
+              # Warm per-shard buckets recompile only changed TUs across 12
+              # runners, so wall-clock stays bounded regardless of change size.
+              # 'incremental' (serial, inside the link job) is opt-in only.
+              run_shards = force_shards or build_mode != "incremental"
               run_codegen = run_shards and (not eff_s2a)
 
           use_s2a_in_link = run_codegen or eff_s2a
@@ -321,7 +352,10 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator /Users/runner/Library/Android || true
           df -h /
 
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
           command -v zstd >/dev/null 2>&1 || brew install zstd
+          command -v ccache >/dev/null 2>&1 || brew install ccache
+          ccache --version | head -n 1
           chmod +x ./scripts/*.sh ./scripts/*.py
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           export PATH="$HOME/.local/bin:$PATH"
@@ -373,7 +407,18 @@ jobs:
           cat >> "$out_dir/args.gn" <<EOF
           ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
           apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+          cc_wrapper = "ccache"
           EOF
+
+          # Stage 1 compiles mac host tools (protoc, torque, mksnapshot, ...)
+          # for the Swift targets' hard deps; a warm bucket makes re-runs and
+          # post-timeout resumes cheap.
+          mac_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-mac"
+          mkdir -p "$RUNNER_TEMP/ccache"
+          if ./scripts/oci_artifacts.sh exists "$mac_ccache_ref"; then
+            echo "==> Pulling warm mac host ccache from $mac_ccache_ref"
+            ./scripts/oci_artifacts.sh pull "$mac_ccache_ref" "$RUNNER_TEMP"
+          fi
 
           (cd "$work/src" && "$work/src/buildtools/mac/gn" gen out/Release)
           targets_file="$RUNNER_TEMP/apple_targets.txt"
@@ -404,11 +449,20 @@ jobs:
           export APPLE_TOOL_MODE=record
           export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
           mkdir -p "$APPLE_TOOL_CACHE_DIR"
+          export CCACHE_DIR="$RUNNER_TEMP/ccache"
+          export CCACHE_BASEDIR="$work"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_COMPILERCHECK="content"
+          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
+          export CCACHE_COMPRESS="true"
+          export CCACHE_MAXSIZE="8G"
+          ccache -z
 
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting ninja on pre-link Apple targets"
           df -h /
           if [ -s "$RUNNER_TEMP/apple_targets.txt" ]; then
-            xargs "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$RUNNER_TEMP/apple_targets.txt" \
+            tr '\n' '\0' < "$RUNNER_TEMP/apple_targets.txt" \
+              | xargs -0 "$work/src/third_party/ninja/ninja" -C "$out_dir" \
               2>&1 | tee "$RUNNER_TEMP/ninja.log"
           fi
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Finished pre-link Apple targets"
@@ -427,6 +481,19 @@ jobs:
             apple_tool_cache.tar.zst \
             --repo "${{ github.repository }}"
 
+      - name: Always persist mac host ccache bucket to GHCR
+        if: always() && steps.compile.outcome != 'skipped' && steps.compile.outcome != ''
+        run: |
+          rm -rf "$RUNNER_TEMP/work"
+          if [ -d "$RUNNER_TEMP/ccache" ]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+            ./scripts/oci_artifacts.sh push \
+              "${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-mac" \
+              "$RUNNER_TEMP" \
+              ccache \
+              --repo "${{ github.repository }}"
+          fi
+
       - name: Write Stage 1 summary
         if: always()
         run: |
@@ -436,6 +503,7 @@ jobs:
             --checkpoint "${{ needs.plan.outputs.s1_ref }}" \
             --outcome "${{ steps.compile.outcome }}" \
             --start-epoch "${{ steps.init.outputs.start_epoch }}" \
+            --ccache-dir "$RUNNER_TEMP/ccache" \
             --ninja-log "$RUNNER_TEMP/ninja.log"
 
   linux-preflight:
@@ -599,8 +667,8 @@ jobs:
           export CCACHE_MAXSIZE="0"
 
           if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
-            xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" \
-              < "$RUNNER_TEMP/codegen_targets.txt" \
+            tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
+              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" \
               2>&1 | tee "$RUNNER_TEMP/ninja.log"
           fi
 
@@ -752,8 +820,8 @@ jobs:
           export CCACHE_MAXSIZE="0"
 
           if [ -s "$RUNNER_TEMP/shard_targets.txt" ]; then
-            xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
-              < "$RUNNER_TEMP/shard_targets.txt" \
+            tr '\n' '\0' < "$RUNNER_TEMP/shard_targets.txt" \
+              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
               2>&1 | tee "$RUNNER_TEMP/ninja.log"
           fi
 
@@ -933,8 +1001,20 @@ jobs:
             chromium_app_unsigned.tar.zst \
             --repo "${{ github.repository }}"
 
-          # On incremental runs, refresh the merged ccache with newly compiled objects.
-          if [ "${{ needs.plan.outputs.run_shards }}" != "true" ] && [ -d "$RUNNER_TEMP/ccache" ]; then
+      # Incremental runs compile misses inside the link job; persist them even
+      # when the link fails or times out so the next attempt makes progress.
+      # (Shard runs already pushed the complete merged cache before linking.)
+      - name: Always refresh merged ccache after incremental compile
+        if: >-
+          always() &&
+          needs.plan.outputs.run_shards != 'true' &&
+          steps.link_chrome.outcome != 'skipped' &&
+          steps.link_chrome.outcome != ''
+        run: |
+          ./scripts/reclaim_disk_linux.sh --drop-swap || true
+          rm -rf /tmp/cb_work
+          if [ -d "$RUNNER_TEMP/ccache" ]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
             ./scripts/oci_artifacts.sh push \
               "${{ needs.plan.outputs.merged_ccache_ref }}" \
               "$RUNNER_TEMP" \

@@ -109,7 +109,9 @@ def collect_apple_prebuild_targets(
     return targets
 
 
-_OBJ_OUT_RE = re.compile(r"(?:^|\s)-o\s+([^\s;&\"']+\.o)(?:\s|$)")
+# Ninja shell-escapes `$out`, so object paths containing characters such as `=`
+# (e.g. XNNPACK's `..._arch=armv8.2-a+fp16/` dirs) appear single-quoted.
+_OBJ_OUT_RE = re.compile(r"(?:^|\s)-o\s+(?:'([^']+\.o)'|([^\s;&\"']+\.o))(?:\s|$)")
 
 
 def collect_compile_object_targets(commands: list[str]) -> list[str]:
@@ -121,7 +123,7 @@ def collect_compile_object_targets(commands: list[str]) -> list[str]:
         m = _OBJ_OUT_RE.search(cmd)
         if not m:
             continue
-        obj = m.group(1)
+        obj = m.group(1) or m.group(2)
         # Host toolchain objects (`clang_x64*`) are built once in Stage 2a codegen.
         if obj.startswith("clang_x64"):
             continue
@@ -131,6 +133,13 @@ def collect_compile_object_targets(commands: list[str]) -> list[str]:
     return objs
 
 
+def unquote_ninja_path(raw: str) -> str:
+    """Strips POSIX single-quote shell escaping emitted by Ninja 1.11+ `-t inputs`."""
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("'\\''", "'")
+    return raw
+
+
 def collect_codegen_targets(
     ninja_bin: str,
     out_dir: pathlib.Path,
@@ -138,7 +147,10 @@ def collect_codegen_targets(
     declared: dict[str, str],
 ) -> list[str]:
     """Selects strictly transitive `chrome` inputs that produce `gen/**`, host tools, or Rust libs."""
-    closure = run_ninja_tool(ninja_bin, out_dir, "inputs", root_target)
+    closure = [
+        unquote_ninja_path(x)
+        for x in run_ninja_tool(ninja_bin, out_dir, "inputs", root_target)
+    ]
     selected: list[str] = []
     seen: set[str] = set()
     skip_rules = {"phony", "stamp", "swift", "compile_xcassets"}

@@ -17,6 +17,13 @@ import subprocess
 import sys
 
 
+def unquote_ninja_path(raw: str) -> str:
+    """Strips POSIX single-quote shell escaping emitted by Ninja 1.11+ `-t inputs`."""
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("'\\''", "'")
+    return raw
+
+
 def run_ninja_lines(ninja_bin: str, out_dir: pathlib.Path, *tool_args: str) -> list[str]:
     proc = subprocess.run(
         [ninja_bin, "-C", str(out_dir), "-t", *tool_args],
@@ -60,9 +67,10 @@ def main() -> int:
 
     raw_inputs_set: set[str] = set()
     for i in range(0, len(targets), 500):
-        raw_inputs_set.update(
-            run_ninja_lines(args.ninja, out_dir, "inputs", *targets[i : i + 500])
-        )
+        for line in run_ninja_lines(
+            args.ninja, out_dir, "inputs", *targets[i : i + 500]
+        ):
+            raw_inputs_set.add(unquote_ninja_path(line))
     raw_inputs = sorted(raw_inputs_set)
 
     checked = 0
