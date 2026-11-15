@@ -75,7 +75,8 @@ case "$cmd" in
     trap 'rm -rf "$stage"' EXIT
 
     echo "==> Compressing ${items[*]} from $src_dir and splitting into 1500M OCI layers"
-    tar -C "$src_dir" -I "zstd -T0 -5" -cf - "${items[@]}" \
+    tar -C "$src_dir" -cf - "${items[@]}" \
+      | zstd -T0 -5 \
       | split -b 1500m -d -a 3 - "$stage/part_"
 
     (
@@ -109,7 +110,7 @@ case "$cmd" in
         cat "$p"
         rm -f "$p"
       done
-    ) | tar -C "$dest_dir" -I "zstd -d" -xf -
+    ) | zstd -d | tar -C "$dest_dir" -xf -
     ;;
 
   *)

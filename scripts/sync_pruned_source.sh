@@ -119,6 +119,6 @@ du -sh "$work_dir/src" "$DEPOT_TOOLS"
 if [ -n "$output_archive" ]; then
   mkdir -p "$(dirname "$output_archive")"
   echo "==> Packing zstd source archive -> $output_archive"
-  tar -C "$work_dir" -I "zstd -T0 -6" -cf "$output_archive" src depot_tools
+  tar -C "$work_dir" -cf - src depot_tools | zstd -T0 -6 -o "$output_archive"
   ls -lh "$output_archive"
 fi

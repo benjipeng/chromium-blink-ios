@@ -93,7 +93,8 @@ echo "==> Extracted Xcode SDK stub size:"
 du -sh "$stub"
 
 mkdir -p "$(dirname "$out_enc")"
-tar -C "$plain_dir" -I "zstd -T0 -6" -cf - xcode_stub \
+tar -C "$plain_dir" -cf - xcode_stub \
+  | zstd -T0 -6 \
   | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:CI_ARTIFACT_KEY -out "$out_enc"
 
 ls -lh "$out_enc"

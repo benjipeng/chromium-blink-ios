@@ -176,7 +176,7 @@ jobs:
           if [ -s "$targets_file" ]; then
             xargs "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$targets_file"
           fi
-          tar -C "$RUNNER_TEMP" -I "zstd -T0 -5" -cf "$RUNNER_TEMP/apple_tool_cache.tar.zst" apple_tool_cache
+          tar -C "$RUNNER_TEMP" -cf - apple_tool_cache | zstd -T0 -5 -o "$RUNNER_TEMP/apple_tool_cache.tar.zst"
 
       - name: Upload encrypted SDK stub & recorded Apple outputs
         uses: actions/upload-artifact@v4
@@ -225,8 +225,8 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
             -in "$RUNNER_TEMP/stage1/xcode_stub.tar.zst.enc" \
-            | tar -C "$work/src" -I "zstd -d" -xf -
-          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/stage1/apple_tool_cache.tar.zst"
+            | zstd -d | tar -C "$work/src" -xf -
+          zstd -dc "$RUNNER_TEMP/stage1/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
 
           mkdir -p "$work/src/ci"
           cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
@@ -277,9 +277,9 @@ jobs:
             for hd in clang_x64*; do
               [ -d "$hd" ] && pack_items+=("$hd")
             done
-            tar -I "zstd -T0 -4" -cf "$RUNNER_TEMP/codegen_gen.tar.zst" "${pack_items[@]}"
+            tar -cf - "${pack_items[@]}" | zstd -T0 -4 -o "$RUNNER_TEMP/codegen_gen.tar.zst"
           )
-          tar -C "$RUNNER_TEMP" -I "zstd -T0 -3" -cf "$RUNNER_TEMP/ccache_shard_codegen.tar.zst" ccache
+          tar -C "$RUNNER_TEMP" -cf - ccache | zstd -T0 -3 -o "$RUNNER_TEMP/ccache_shard_codegen.tar.zst"
 
       - name: Upload shared codegen state
         uses: actions/upload-artifact@v4
@@ -337,8 +337,8 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
             -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
-            | tar -C "$work/src" -I "zstd -d" -xf -
-          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst"
+            | zstd -d | tar -C "$work/src" -xf -
+          zstd -dc "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
 
           mkdir -p "$work/src/ci"
           cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
@@ -370,7 +370,7 @@ jobs:
           EOF
 
           (cd "$work/src" && gn gen out/Release)
-          tar -C "$out_dir" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst"
+          zstd -dc "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
 
           ./scripts/plan_shards.py \
             --ninja "$work/src/third_party/ninja/ninja" \
@@ -384,7 +384,7 @@ jobs:
             xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 < "$RUNNER_TEMP/shard_targets.txt"
           fi
           ccache -s
-          tar -C "$RUNNER_TEMP" -I "zstd -T0 -3" -cf "$RUNNER_TEMP/ccache_shard_${{ matrix.shard }}.tar.zst" ccache
+          tar -C "$RUNNER_TEMP" -cf - ccache | zstd -T0 -3 -o "$RUNNER_TEMP/ccache_shard_${{ matrix.shard }}.tar.zst"
 
       - name: Upload ccache shard ${{ matrix.shard }}
         uses: actions/upload-artifact@v4
@@ -435,8 +435,8 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
             -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
-            | tar -C "$work/src" -I "zstd -d" -xf -
-          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst"
+            | zstd -d | tar -C "$work/src" -xf -
+          zstd -dc "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
 
           export CCACHE_DIR="$RUNNER_TEMP/ccache"
           export CCACHE_BASEDIR="$work"
@@ -453,7 +453,7 @@ jobs:
             for f in "$RUNNER_TEMP"/inputs/ccache-shard-*/ccache_shard_*.tar.zst; do
               [ -f "$f" ] || continue
               tmp_s="$(mktemp -d)"
-              tar -C "$tmp_s" -I "zstd -d" -xf "$f"
+              zstd -dc "$f" | tar -C "$tmp_s" -xf -
               rsync -a --ignore-existing "$tmp_s/ccache/" "$CCACHE_DIR/"
               rm -rf "$tmp_s" "$f"
             done
@@ -484,7 +484,7 @@ jobs:
 
           (cd "$work/src" && gn gen out/Release)
           if [ -f "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" ]; then
-            tar -C "$out_dir" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst"
+            zstd -dc "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
             rm -rf "$RUNNER_TEMP/inputs/stage2a-codegen"
           fi
 
@@ -498,7 +498,7 @@ jobs:
           if [ -d "$out_dir/.deferred_extract_metadata" ]; then
             mv "$out_dir/.deferred_extract_metadata" "$stage_out/.deferred_extract_metadata"
           fi
-          tar -C "$stage_out" -I "zstd -T0 -5" -cf "$RUNNER_TEMP/chromium_app_unsigned.tar.zst" .
+          tar -C "$stage_out" -cf - . | zstd -T0 -5 -o "$RUNNER_TEMP/chromium_app_unsigned.tar.zst"
 
           rm -rf "$work" "$stage_out"
           ./scripts/oci_artifacts.sh push \
@@ -536,7 +536,7 @@ jobs:
           source ./version.lock
           work="$RUNNER_TEMP/work"
           mkdir -p "$work/src/out/Release"
-          tar -C "$work/src/out/Release" -I "zstd -d" -xf "$RUNNER_TEMP/stage3/chromium_app_unsigned.tar.zst"
+          zstd -dc "$RUNNER_TEMP/stage3/chromium_app_unsigned.tar.zst" | tar -C "$work/src/out/Release" -xf -
 
           extra_flags=()
           if [ "${{ inputs.with_app_groups }}" = "true" ]; then
