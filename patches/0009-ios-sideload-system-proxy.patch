@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: use the system proxy settings for web content
+
+diff --git a/services/network/network_context.cc b/services/network/network_context.cc
+index 15181930c2b628f0353ec096203387b34860cba0..b6ac8262bdcb8aad6d4b44877df523efc373c82d 100644
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -113,6 +113,7 @@
+ #include "net/net_buildflags.h"
+ #include "net/proxy_resolution/configured_proxy_resolution_service.h"
+ #include "net/proxy_resolution/proxy_config.h"
++#include "net/proxy_resolution/proxy_config_service.h"
+ #include "net/shared_dictionary/shared_dictionary_isolation_key.h"
+ #include "net/shared_dictionary/shared_dictionary_network_transaction_factory.h"
+ #include "net/socket/delayed_client_socket_factory.h"
+@@ -3515,6 +3516,16 @@ URLRequestContextOwner NetworkContext::MakeURLRequestContext(
+   SSLConfigServiceMojo* ssl_config_service_raw = ssl_config_service.get();
+   builder.set_ssl_config_service(std::move(ssl_config_service));
+ 
++#if BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] ios/web never gives the network service a proxy
++  // config, so it would connect directly and ignore the system proxy settings
++  // (a Wi-Fi HTTP proxy or PAC; the Mac's proxy in the simulator) that Safari
++  // honors. Read the system settings instead, as Chrome's WebKit build does;
++  // URLRequestContextBuilder then resolves PAC with the system resolver.
++  const bool use_system_proxy_config =
++      !params_->initial_proxy_config &&
++      !params_->proxy_config_client_receiver.is_valid();
++#endif
+   if (!params_->initial_proxy_config &&
+       !params_->proxy_config_client_receiver.is_valid()) {
+     params_->initial_proxy_config =
+@@ -3524,6 +3535,13 @@ URLRequestContextOwner NetworkContext::MakeURLRequestContext(
+       std::move(params_->proxy_config_client_receiver),
+       std::move(params_->initial_proxy_config),
+       std::move(params_->proxy_config_poller_client)));
++#if BUILDFLAG(IS_IOS)
++  if (use_system_proxy_config) {
++    builder.set_proxy_config_service(
++        net::ProxyConfigService::CreateSystemProxyConfigService(
++            base::SequencedTaskRunner::GetCurrentDefault()));
++  }
++#endif
+   builder.set_pac_quick_check_enabled(params_->pac_quick_check_enabled);
+ 
+   std::unique_ptr<PrefService> pref_service;
+-- 
+2.54.0 (Apple Git-157)
+

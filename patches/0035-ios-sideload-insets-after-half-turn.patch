@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: page insets after a half turn
+
+diff --git a/ios/chrome/browser/browser_view/ui_bundled/browser_view_controller.mm b/ios/chrome/browser/browser_view/ui_bundled/browser_view_controller.mm
+index 24201af6ec2324603dd1d78856c03da8dc4ce241..2317acc5deabd38a3b130f877f324327c4a66527 100644
+--- a/ios/chrome/browser/browser_view/ui_bundled/browser_view_controller.mm
++++ b/ios/chrome/browser/browser_view/ui_bundled/browser_view_controller.mm
+@@ -703,6 +703,14 @@ - (void)layoutState:(SceneLayoutState*)layoutState
+   [self updateToolbarConstraints];
+   [self updateSecondaryToolbarBottomConstraint];
+   [self animateTransition];
++  // [ios-blink-sideload] The page's insets follow the App Bar too. Turning the
++  // phone from one landscape side to the other moves the App Bar across but
++  // keeps the view's size, so -viewWillTransitionToSize: isn't called to
++  // invalidate them: the page stayed inset on the side the App Bar left, and
++  // partly under the App Bar on the other side.
++  if (IsFullscreenRefactoringEnabled() && _fullscreenBrowserAgent) {
++    _fullscreenBrowserAgent->InvalidateInsetRange();
++  }
+ }
+ 
+ #pragma mark - Public methods
+-- 
+2.54.0 (Apple Git-157)
+

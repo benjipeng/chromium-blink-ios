@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: show the system edit menu for text
+
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+index ca54cfe5aa639484f85e9108dd7a434720690879..df9d371656412443bf004adc70a38b0d391cfa4c 100644
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -111,6 +111,7 @@ source_set("ui") {
+     "//ios/web/public",
+     "//ios/web/public/ui",
+   ]
++  frameworks = [ "BrowserEngineKit.framework" ]
+ }
+ 
+ test("ios_web_content_unittests") {
+diff --git a/ios/web/content/ui/content_context_menu_controller.mm b/ios/web/content/ui/content_context_menu_controller.mm
+index 3cfe9e543aa48a1d4bbe9a5e5a0687601008bb59..1bdca76040d9b85d47518c21441ab81703573461 100644
+--- a/ios/web/content/ui/content_context_menu_controller.mm
++++ b/ios/web/content/ui/content_context_menu_controller.mm
+@@ -4,6 +4,7 @@
+ 
+ #import "ios/web/content/ui/content_context_menu_controller.h"
+ 
++#import <BrowserEngineKit/BrowserEngineKit.h>
+ #import <UIKit/UIKit.h>
+ 
+ #import "base/apple/foundation_util.h"
+@@ -138,6 +139,28 @@ - (void)contextMenuInteraction:(UIContextMenuInteraction*)interaction
+ 
+ namespace {
+ 
++// [ios-blink-sideload] Whether `params` asks for a menu for text, rather than
++// for a link or an image.
++bool IsEditMenuRequest(const content::ContextMenuParams& params) {
++  return params.link_url.is_empty() && params.src_url.is_empty() &&
++         (params.is_editable || !params.selection_text.empty());
++}
++
++// [ios-blink-sideload] Shows the system edit menu, the one Safari shows, for
++// the selection in the web view `view`: Blink asks for a context menu when text
++// or a text field is long-pressed, but Chrome only builds context menus for
++// links and images. The view's text interaction asks the view which actions
++// to offer, and sends them to it.
++void PresentEditMenu(UIView* view) {
++  for (id<UIInteraction> interaction in view.interactions) {
++    if (BETextInteraction* text_interaction =
++            base::apple::ObjCCast<BETextInteraction>(interaction)) {
++      [text_interaction presentEditMenuForSelection];
++      return;
++    }
++  }
++}
++
+ gfx::NativeView GetContentNativeView(content::WebContents* web_contents) {
+   content::RenderWidgetHostView* rwhv = web_contents->GetRenderWidgetHostView();
+   if (!rwhv) {
+@@ -167,6 +190,12 @@ - (void)contextMenuInteraction:(UIContextMenuInteraction*)interaction
+ 
+   UIView* view = base::apple::ObjCCastStrict<UIView>(
+       GetContentNativeView(web_contents).Get());
++  if (view && IsEditMenuRequest(params)) {
++    PresentEditMenu(view);
++    // The edit menu is not a Blink context menu, so this one is done.
++    web_contents->NotifyContextMenuClosed(GURL());
++    return;
++  }
+   CGRect frame = CGRectMake(params.x, params.y, 0, 0);
+ 
+   [hidden_button_->button_ removeFromSuperview];
+-- 
+2.54.0 (Apple Git-157)
+

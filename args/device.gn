@@ -1,0 +1,60 @@
+# Physical iPhone (arm64, iOS 26+) release configuration with Blink engine.
+# CI appends host-specific toolchain paths (ios_sdk_developer_dir,
+# apple_tool_wrapper, cc_wrapper, ios_app_bundle_id_prefix) at gen time.
+
+target_os = "ios"
+target_cpu = "arm64"
+target_environment = "device"
+use_blink = true
+
+# Release optimization with full symbol stripping to minimize object/cache bloat.
+is_debug = false
+is_component_build = false
+dcheck_always_on = false
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+exclude_unwind_tables = true
+
+# Use standard Ninja (no 2 GB Siso daemon overhead), disable style-lint Clang
+# plugins, and disable Clang C++ modules on host toolchains (`clang_x64` /
+# `clang_x64_v8_arm64`) so ccache 4.9+ achieves ~100% hits on both target and
+# host objects.
+use_siso = false
+clang_use_chrome_plugins = false
+use_clang_modules = false
+
+# Media codecs.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+
+# Unsigned output for sideloading / LiveContainer (re-signed at install time).
+ios_enable_code_signing = false
+
+# Disable Apple iOS system .appex bundles (Share Sheet, Home Screen Widgets, etc.)
+# so sideloading does not consume per-extension Apple Developer App IDs.
+# Note: This is unrelated to Chrome Web Extensions (//extensions), which live
+# in-process inside the Blink/Content layer.
+ios_enable_share_extension = false
+ios_enable_extended_share_extension = false
+ios_enable_open_extension = false
+ios_enable_credential_provider_extension = false
+ios_enable_intents_extension = false
+ios_enable_widget_kit_extension = false
+ios_enable_lockscreen_widget = false
+ios_enable_push_notification_service_extension = false
+
+# Sideloaded apps cannot rely on extended-virtual-addressing entitlements;
+# disable multi-gigabyte virtual address reservations for V8 sandbox and Oilpan.
+v8_enable_sandbox = false
+cppgc_enable_caged_heap = false
+
+# Jitless WebAssembly execution via V8's DrumBrake interpreter with explicit
+# bounds checks (avoids 8 GB trap-handler guard regions on iOS).
+v8_enable_drumbrake = true
+v8_drumbrake_bounds_checks = true
+
+# Generate full open-source license attributions for chrome://credits and
+# disable RLZ attribution pings.
+generate_about_credits = true
+enable_rlz = false

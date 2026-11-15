@@ -1,0 +1,74 @@
+name: Sync Pruned Source to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force re-sync and overwrite existing GHCR source snapshot"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sync-source:
+    name: Sync & Prune Chromium iOS Source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load version.lock
+        id: lock
+        run: |
+          set -a
+          source ./version.lock
+          set +a
+          repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          src_ref="ghcr.io/${repo_lc}/chromium-ios-src:${CHROMIUM_REV}"
+          echo "chromium_rev=${CHROMIUM_REV}" >> "$GITHUB_OUTPUT"
+          echo "chromium_version=${CHROMIUM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "src_ref=${src_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Install zstd and log in to GHCR
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          chmod +x ./scripts/*.sh
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Check if source snapshot already exists in GHCR
+        id: check
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && ./scripts/oci_artifacts.sh exists "${{ steps.lock.outputs.src_ref }}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Snapshot already exists: ${{ steps.lock.outputs.src_ref }}"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reclaim runner disk space
+        if: steps.check.outputs.skip != 'true'
+        run: ./scripts/reclaim_disk_linux.sh
+
+      - name: Fetch, prune, and verify patch queue
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          ./scripts/sync_pruned_source.sh --work-dir "$RUNNER_TEMP/chromium-work"
+          ./scripts/apply_patches.sh --src-dir "$RUNNER_TEMP/chromium-work/src" --check
+
+      - name: Push sealed source snapshot to GHCR
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          ./scripts/oci_artifacts.sh push \
+            "${{ steps.lock.outputs.src_ref }}" \
+            "$RUNNER_TEMP/chromium-work" \
+            src depot_tools \
+            --repo "${{ github.repository }}"

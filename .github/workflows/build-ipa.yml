@@ -1,0 +1,574 @@
+name: Build Chromium Blink iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "Build strategy: 'auto' uses warm ccache if present else 12-shard farm"
+        required: false
+        type: choice
+        options:
+          - auto
+          - cold-sharded
+          - incremental
+        default: auto
+      with_app_groups:
+        description: "Ad-hoc sign IPA with App Group entitlements"
+        required: false
+        type: boolean
+        default: false
+      publish_release:
+        description: "Publish built IPA to GitHub Releases"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  SHARD_COUNT: "12"
+
+jobs:
+  plan:
+    name: Resolve Snapshot & Cache Mode
+    runs-on: ubuntu-24.04
+    outputs:
+      chromium_rev: ${{ steps.info.outputs.chromium_rev }}
+      chromium_version: ${{ steps.info.outputs.chromium_version }}
+      src_ref: ${{ steps.info.outputs.src_ref }}
+      ccache_ref: ${{ steps.info.outputs.ccache_ref }}
+      has_ccache: ${{ steps.info.outputs.has_ccache }}
+      need_shards: ${{ steps.info.outputs.need_shards }}
+      shards_json: ${{ steps.info.outputs.shards_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect GHCR snapshots and select build mode
+        id: info
+        run: |
+          chmod +x ./scripts/*.sh
+          set -a
+          source ./version.lock
+          set +a
+          repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          src_ref="ghcr.io/${repo_lc}/chromium-ios-src:${CHROMIUM_REV}"
+          ccache_ref="ghcr.io/${repo_lc}/chromium-ios-ccache:${CHROMIUM_REV}"
+
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          if ! ./scripts/oci_artifacts.sh exists "$src_ref"; then
+            echo "::error::Source snapshot $src_ref not found. Run 'Sync Pruned Source to GHCR' workflow first."
+            exit 1
+          fi
+
+          mode="${{ inputs.build_mode }}"
+          has_ccache="false"
+          if ./scripts/oci_artifacts.sh exists "$ccache_ref"; then
+            has_ccache="true"
+          fi
+
+          if [ "$mode" = "incremental" ] && [ "$has_ccache" = "false" ]; then
+            echo "::warning::Requested 'incremental' but no warm ccache exists at $ccache_ref; falling back to 'cold-sharded'."
+            mode="cold-sharded"
+          fi
+
+          if [ "$mode" = "cold-sharded" ] || { [ "$mode" = "auto" ] && [ "$has_ccache" = "false" ]; }; then
+            need_shards="true"
+          else
+            need_shards="false"
+          fi
+
+          shards_json="$(python3 -c "import json; print(json.dumps(list(range(int('${SHARD_COUNT}')))))")"
+          echo "chromium_rev=${CHROMIUM_REV}" >> "$GITHUB_OUTPUT"
+          echo "chromium_version=${CHROMIUM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "src_ref=${src_ref}" >> "$GITHUB_OUTPUT"
+          echo "ccache_ref=${ccache_ref}" >> "$GITHUB_OUTPUT"
+          echo "has_ccache=${has_ccache}" >> "$GITHUB_OUTPUT"
+          echo "need_shards=${need_shards}" >> "$GITHUB_OUTPUT"
+          echo "shards_json=${shards_json}" >> "$GITHUB_OUTPUT"
+          echo "Mode resolved: has_ccache=${has_ccache}, need_shards=${need_shards}"
+
+  apple-prebuild:
+    name: Stage 1 - Xcode 27 SDK Stub & Pre-Link Apple Targets
+    needs: plan
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim macOS runner disk space safely (realpath-aware)
+        run: |
+          source ./version.lock
+          df -h /
+          target_app="$XCODE_APP"
+          [ -e "$target_app" ] || target_app="/Applications/Xcode.app"
+          keep_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target_app")"
+          echo "Keeping Xcode installation at: $keep_real"
+          for app in /Applications/Xcode*; do
+            [ -e "$app" ] || [ -L "$app" ] || continue
+            app_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")"
+            if [ "$app" = "$keep_real" ] || [ "$app" = "$target_app" ]; then
+              continue
+            fi
+            if [ "$app_real" = "$keep_real" ] && [ -L "$app" ]; then
+              continue
+            fi
+            sudo rm -rf "$app" || true
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator /Users/runner/Library/Android || true
+          df -h /
+
+      - name: Install zstd and ORAS
+        run: |
+          command -v zstd >/dev/null 2>&1 || brew install zstd
+          chmod +x ./scripts/*.sh ./scripts/*.py
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Extract and AES-256 encrypt Xcode 27 iOS SDK stub
+        env:
+          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+        run: |
+          ./scripts/extract_xcode_stub.sh --output-encrypted "$RUNNER_TEMP/xcode_stub.tar.zst.enc"
+
+      - name: Pull source, bootstrap mac-arm64 host tools, and record pre-link Apple targets
+        run: |
+          source ./version.lock
+          work="$RUNNER_TEMP/work"
+          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          ./scripts/bootstrap_macos_host_tools.sh --work-dir "$work"
+          ./scripts/apply_patches.sh --src-dir "$work/src"
+
+          xcode_root="$XCODE_APP"
+          [ -d "$xcode_root" ] || xcode_root="/Applications/Xcode.app"
+          export DEVELOPER_DIR="$xcode_root/Contents/Developer"
+          export PATH="$work/depot_tools:$PATH"
+          export DEPOT_TOOLS_UPDATE=0
+          export APPLE_TOOL_MODE=record
+          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+          mkdir -p "$APPLE_TOOL_CACHE_DIR"
+
+          mkdir -p "$work/src/ci"
+          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
+
+          out_dir="$work/src/out/Release"
+          mkdir -p "$out_dir"
+          cp ./args/device.gn "$out_dir/args.gn"
+          cat >> "$out_dir/args.gn" <<EOF
+          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
+          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+          EOF
+
+          (cd "$work/src" && "$work/src/buildtools/mac/gn" gen out/Release)
+          targets_file="$RUNNER_TEMP/apple_targets.txt"
+          ./scripts/plan_shards.py \
+            --ninja "$work/src/third_party/ninja/ninja" \
+            --out-dir "$out_dir" \
+            --mode apple-prebuild > "$targets_file"
+
+          echo "==> Pre-link Apple targets count: $(wc -l < "$targets_file")"
+          if [ -s "$targets_file" ]; then
+            xargs "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$targets_file"
+          fi
+          tar -C "$RUNNER_TEMP" -I "zstd -T0 -5" -cf "$RUNNER_TEMP/apple_tool_cache.tar.zst" apple_tool_cache
+
+      - name: Upload encrypted SDK stub & recorded Apple outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-apple-bundle
+          path: |
+            ${{ runner.temp }}/xcode_stub.tar.zst.enc
+            ${{ runner.temp }}/apple_tool_cache.tar.zst
+          retention-days: 1
+
+  codegen:
+    name: Stage 2a - Host Tools, Rust Stdlib & Shared Codegen
+    needs: [plan, apple-prebuild]
+    if: needs.plan.outputs.need_shards == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim disk & install tools
+        run: |
+          chmod +x ./scripts/*.sh ./scripts/*.py
+          ./scripts/reclaim_disk_linux.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download Stage 1 Apple bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-apple-bundle
+          path: ${{ runner.temp }}/stage1
+
+      - name: Build host tools, Rust rlibs, V8 snapshot, & generated headers
+        env:
+          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+        run: |
+          source ./version.lock
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          work="/tmp/cb_work"
+          mkdir -p "$work"
+          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          ./scripts/apply_patches.sh --src-dir "$work/src"
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:CI_ARTIFACT_KEY \
+            -in "$RUNNER_TEMP/stage1/xcode_stub.tar.zst.enc" \
+            | tar -C "$work/src" -I "zstd -d" -xf -
+          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/stage1/apple_tool_cache.tar.zst"
+
+          mkdir -p "$work/src/ci"
+          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
+
+          export PATH="$work/depot_tools:$PATH"
+          export DEPOT_TOOLS_UPDATE=0
+          export APPLE_TOOL_MODE=replay
+          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+
+          export CCACHE_DIR="$RUNNER_TEMP/ccache"
+          export CCACHE_BASEDIR="$work"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_CPP2="true"
+          export CCACHE_COMPILERCHECK="content"
+          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
+          export CCACHE_COMPRESS="true"
+          export CCACHE_MAXSIZE="8G"
+          mkdir -p "$CCACHE_DIR"
+          ccache -z
+
+          out_dir="$work/src/out/Release"
+          mkdir -p "$out_dir"
+          cp ./args/device.gn "$out_dir/args.gn"
+          cat >> "$out_dir/args.gn" <<EOF
+          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
+          ios_sdk_developer_dir = "//xcode_stub"
+          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+          cc_wrapper = "ccache"
+          EOF
+
+          (cd "$work/src" && gn gen out/Release)
+          ./scripts/plan_shards.py \
+            --ninja "$work/src/third_party/ninja/ninja" \
+            --out-dir "$out_dir" \
+            --mode codegen > "$RUNNER_TEMP/codegen_targets.txt"
+
+          echo "==> Building $(wc -l < "$RUNNER_TEMP/codegen_targets.txt") host/Rust/codegen outputs"
+          if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
+            xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$RUNNER_TEMP/codegen_targets.txt"
+          fi
+          ccache -s
+
+          (
+            cd "$out_dir"
+            pack_items=(gen .ninja_deps .ninja_log)
+            [ -d obj ] && pack_items+=(obj)
+            [ -d local_rustc_sysroot ] && pack_items+=(local_rustc_sysroot)
+            for hd in clang_x64*; do
+              [ -d "$hd" ] && pack_items+=("$hd")
+            done
+            tar -I "zstd -T0 -4" -cf "$RUNNER_TEMP/codegen_gen.tar.zst" "${pack_items[@]}"
+          )
+          tar -C "$RUNNER_TEMP" -I "zstd -T0 -3" -cf "$RUNNER_TEMP/ccache_shard_codegen.tar.zst" ccache
+
+      - name: Upload shared codegen state
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2a-codegen
+          path: ${{ runner.temp }}/codegen_gen.tar.zst
+          retention-days: 1
+
+      - name: Upload host ccache bucket
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccache-shard-codegen
+          path: ${{ runner.temp }}/ccache_shard_codegen.tar.zst
+          retention-days: 1
+
+  compile-shards:
+    name: Stage 2b - C/C++/ObjC++ Shard ${{ matrix.shard }}
+    needs: [plan, apple-prebuild, codegen]
+    if: needs.plan.outputs.need_shards == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards_json) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim disk & install tools
+        run: |
+          chmod +x ./scripts/*.sh ./scripts/*.py
+          ./scripts/reclaim_disk_linux.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download Stage 1 & Stage 2a artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stage*
+          path: ${{ runner.temp }}/inputs
+
+      - name: Compile shard ${{ matrix.shard }} into ccache bucket
+        env:
+          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+        run: |
+          source ./version.lock
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          work="/tmp/cb_work"
+          mkdir -p "$work"
+          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          ./scripts/apply_patches.sh --src-dir "$work/src"
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:CI_ARTIFACT_KEY \
+            -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
+            | tar -C "$work/src" -I "zstd -d" -xf -
+          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst"
+
+          mkdir -p "$work/src/ci"
+          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
+
+          export PATH="$work/depot_tools:$PATH"
+          export DEPOT_TOOLS_UPDATE=0
+          export APPLE_TOOL_MODE=replay
+          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+
+          export CCACHE_DIR="$RUNNER_TEMP/ccache"
+          export CCACHE_BASEDIR="$work"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_CPP2="true"
+          export CCACHE_COMPILERCHECK="content"
+          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
+          export CCACHE_COMPRESS="true"
+          export CCACHE_MAXSIZE="8G"
+          mkdir -p "$CCACHE_DIR"
+          ccache -z
+
+          out_dir="$work/src/out/Release"
+          mkdir -p "$out_dir"
+          cp ./args/device.gn "$out_dir/args.gn"
+          cat >> "$out_dir/args.gn" <<EOF
+          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
+          ios_sdk_developer_dir = "//xcode_stub"
+          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+          cc_wrapper = "ccache"
+          EOF
+
+          (cd "$work/src" && gn gen out/Release)
+          tar -C "$out_dir" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst"
+
+          ./scripts/plan_shards.py \
+            --ninja "$work/src/third_party/ninja/ninja" \
+            --out-dir "$out_dir" \
+            --mode c-shard \
+            --shard-count "${SHARD_COUNT}" \
+            --shard-index "${{ matrix.shard }}" > "$RUNNER_TEMP/shard_targets.txt"
+
+          echo "==> Compiling $(wc -l < "$RUNNER_TEMP/shard_targets.txt") objects for shard ${{ matrix.shard }}"
+          if [ -s "$RUNNER_TEMP/shard_targets.txt" ]; then
+            xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 < "$RUNNER_TEMP/shard_targets.txt"
+          fi
+          ccache -s
+          tar -C "$RUNNER_TEMP" -I "zstd -T0 -3" -cf "$RUNNER_TEMP/ccache_shard_${{ matrix.shard }}.tar.zst" ccache
+
+      - name: Upload ccache shard ${{ matrix.shard }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccache-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ccache_shard_${{ matrix.shard }}.tar.zst
+          retention-days: 1
+
+  link:
+    name: Stage 3 - Link Chromium.app & Persist ccache
+    needs: [plan, apple-prebuild, codegen, compile-shards]
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      needs.apple-prebuild.result == 'success' &&
+      (needs.codegen.result == 'success' || needs.codegen.result == 'skipped') &&
+      (needs.compile-shards.result == 'success' || needs.compile-shards.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim disk, mount 16 GB swapfile, & install tools
+        run: |
+          chmod +x ./scripts/*.sh ./scripts/*.py
+          ./scripts/reclaim_disk_linux.sh --with-swap 16
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache rsync
+          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download Stage 1, codegen, & ccache shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/inputs
+
+      - name: Assemble ccache, link Chromium.app via ld64.lld, & persist cache
+        env:
+          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+        run: |
+          source ./version.lock
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          work="/tmp/cb_work"
+          mkdir -p "$work"
+          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          ./scripts/apply_patches.sh --src-dir "$work/src"
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:CI_ARTIFACT_KEY \
+            -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
+            | tar -C "$work/src" -I "zstd -d" -xf -
+          tar -C "$RUNNER_TEMP" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst"
+
+          export CCACHE_DIR="$RUNNER_TEMP/ccache"
+          export CCACHE_BASEDIR="$work"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_CPP2="true"
+          export CCACHE_COMPILERCHECK="content"
+          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
+          export CCACHE_COMPRESS="true"
+          export CCACHE_MAXSIZE="16G"
+          mkdir -p "$CCACHE_DIR"
+
+          if [ "${{ needs.plan.outputs.need_shards }}" = "true" ]; then
+            echo "==> Merging codegen + ${SHARD_COUNT} target ccache shards"
+            for f in "$RUNNER_TEMP"/inputs/ccache-shard-*/ccache_shard_*.tar.zst; do
+              [ -f "$f" ] || continue
+              tmp_s="$(mktemp -d)"
+              tar -C "$tmp_s" -I "zstd -d" -xf "$f"
+              rsync -a --ignore-existing "$tmp_s/ccache/" "$CCACHE_DIR/"
+              rm -rf "$tmp_s" "$f"
+            done
+            rm -rf "$RUNNER_TEMP/inputs/ccache-shard-"*
+          elif [ "${{ needs.plan.outputs.has_ccache }}" = "true" ]; then
+            echo "==> Pulling warm ccache from ${{ needs.plan.outputs.ccache_ref }}"
+            ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.ccache_ref }}" "$RUNNER_TEMP"
+          fi
+
+          ccache -z
+          mkdir -p "$work/src/ci"
+          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
+
+          export PATH="$work/depot_tools:$PATH"
+          export DEPOT_TOOLS_UPDATE=0
+          export APPLE_TOOL_MODE=replay
+          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+
+          out_dir="$work/src/out/Release"
+          mkdir -p "$out_dir"
+          cp ./args/device.gn "$out_dir/args.gn"
+          cat >> "$out_dir/args.gn" <<EOF
+          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
+          ios_sdk_developer_dir = "//xcode_stub"
+          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+          cc_wrapper = "ccache"
+          EOF
+
+          (cd "$work/src" && gn gen out/Release)
+          if [ -f "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" ]; then
+            tar -C "$out_dir" -I "zstd -d" -xf "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst"
+            rm -rf "$RUNNER_TEMP/inputs/stage2a-codegen"
+          fi
+
+          echo "==> Building & linking target 'chrome'"
+          "$work/src/third_party/ninja/ninja" -C "$out_dir" chrome
+          ccache -s
+
+          stage_out="$RUNNER_TEMP/linked_stage"
+          mkdir -p "$stage_out"
+          mv "$out_dir/Chromium.app" "$stage_out/Chromium.app"
+          if [ -d "$out_dir/.deferred_extract_metadata" ]; then
+            mv "$out_dir/.deferred_extract_metadata" "$stage_out/.deferred_extract_metadata"
+          fi
+          tar -C "$stage_out" -I "zstd -T0 -5" -cf "$RUNNER_TEMP/chromium_app_unsigned.tar.zst" .
+
+          rm -rf "$work" "$stage_out"
+          ./scripts/oci_artifacts.sh push \
+            "${{ needs.plan.outputs.ccache_ref }}" \
+            "$RUNNER_TEMP" \
+            ccache \
+            --repo "${{ github.repository }}"
+
+      - name: Upload unsigned Chromium.app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-unsigned-app
+          path: ${{ runner.temp }}/chromium_app_unsigned.tar.zst
+          retention-days: 3
+
+  apple-package:
+    name: Stage 4 - Finalize AppIntents Metadata & Package IPA
+    needs: [plan, link]
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linked Chromium.app
+        uses: actions/download-artifact@v4
+        with:
+          name: stage3-unsigned-app
+          path: ${{ runner.temp }}/stage3
+
+      - name: Finalize AppIntents metadata and package IPA
+        run: |
+          command -v zstd >/dev/null 2>&1 || brew install zstd
+          chmod +x ./scripts/*.sh ./scripts/*.py
+
+          source ./version.lock
+          work="$RUNNER_TEMP/work"
+          mkdir -p "$work/src/out/Release"
+          tar -C "$work/src/out/Release" -I "zstd -d" -xf "$RUNNER_TEMP/stage3/chromium_app_unsigned.tar.zst"
+
+          extra_flags=()
+          if [ "${{ inputs.with_app_groups }}" = "true" ]; then
+            extra_flags+=(--with-app-groups)
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          ./scripts/package_ipa.sh \
+            --src-dir "$work/src" \
+            --out-rel "out/Release" \
+            --output-ipa "$GITHUB_WORKSPACE/dist/Chromium-Blink-${CHROMIUM_VERSION}-arm64.ipa" \
+            "${extra_flags[@]}"
+
+      - name: Upload final IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chromium-Blink-${{ needs.plan.outputs.chromium_version }}-arm64
+          path: |
+            dist/*.ipa
+            dist/*.ipa.sha256
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source ./version.lock
+          tag="v${CHROMIUM_VERSION}-r${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" \
+            dist/*.ipa \
+            dist/*.ipa.sha256 \
+            --clobber \
+            --title "Chromium Blink iOS ${CHROMIUM_VERSION} (Build #${GITHUB_RUN_NUMBER})" \
+            --notes "Unsigned arm64 iOS build with Blink engine (\`use_blink = true\`), built from Chromium \`${CHROMIUM_REV:0:12}\`."

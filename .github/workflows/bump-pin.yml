@@ -1,0 +1,40 @@
+name: Check Upstream iOS Blink Pin
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_update:
+        description: "Commit updated version.lock back to main if a newer compile-green revision exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-pin:
+    name: Query Buildbucket ios-blink-rel-fyi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest compile-green revision
+        run: |
+          python3 ./scripts/resolve_pin.py --write
+          git diff version.lock
+
+      - name: Commit updated version.lock
+        if: inputs.commit_update == true
+        run: |
+          if git diff --quiet version.lock; then
+            echo "version.lock is already at the latest compile-green revision."
+            exit 0
+          fi
+          source ./version.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.lock
+          git commit -m "chore(pin): advance Chromium to ${CHROMIUM_VERSION} (${CHROMIUM_REV:0:12})"
+          git push

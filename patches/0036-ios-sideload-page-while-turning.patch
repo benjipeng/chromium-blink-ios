@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: keep the page on screen while turning
+
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.h b/content/browser/renderer_host/render_widget_host_view_ios.h
+index bc8ebf032006cb54afa515c9c2214990b4b538dd..14e301a8d4177b9694ec63e167b63be9f3fa70b3 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.h
++++ b/content/browser/renderer_host/render_widget_host_view_ios.h
+@@ -241,6 +241,9 @@ class CONTENT_EXPORT RenderWidgetHostViewIOS
+   void ContentInsetChanged();
+   // [ios-blink-sideload] Called when the scroll view's contentOffset changes.
+   void ContentOffsetChanged();
++  // [ios-blink-sideload] Called when the view shows a snapshot of the page
++  // while a rotation resizes it (-[RenderWidgetUIView prepareForSize:]).
++  void OnAnimatedResizeStarted();
+ #if !BUILDFLAG(IS_IOS_TVOS)
+   void OnKeyboardVisibilityChanged();
+ #endif  // !BUILDFLAG(IS_IOS_TVOS)
+@@ -316,6 +319,12 @@ class CONTENT_EXPORT RenderWidgetHostViewIOS
+   // keyboard, until a frame with it is active.
+   viz::LocalSurfaceId keyboard_surface_id_;
+ 
++  // [ios-blink-sideload] While the view shows a snapshot for a rotation:
++  // whether it does, and the surface id of its new size until a frame with it
++  // is active.
++  bool awaiting_resize_frame_ = false;
++  viz::LocalSurfaceId resize_surface_id_;
++
+   // This stores the underlying view bounds. The UIView might change size but
+   // we do not change its size during scroll.
+   gfx::Rect view_bounds_;
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.mm b/content/browser/renderer_host/render_widget_host_view_ios.mm
+index bac9d1a71327fa9cec7e2ba546c1ee22a7745e33..6ad11676ea99737655d072f805d8a8a02844c29e 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios.mm
+@@ -30,6 +30,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/common/content_switches.h"
++#include "skia/ext/skia_utils_ios.h"
+ #include "ui/accelerated_widget_mac/display_ca_layer_tree.h"
+ #include "ui/base/ime/text_input_mode.h"
+ #include "ui/base/ime/text_input_type.h"
+@@ -411,8 +412,14 @@ bool IsTesting() {
+   if (!color) {
+     return;
+   }
+-  browser_compositor_->SetBackgroundColor(
+-      *color == SK_ColorTRANSPARENT ? SK_ColorWHITE : *color);
++  const SkColor opaque_color =
++      *color == SK_ColorTRANSPARENT ? SK_ColorWHITE : *color;
++  browser_compositor_->SetBackgroundColor(opaque_color);
++  // [ios-blink-sideload] And on the view itself, as the Mac's background layer
++  // does: while the phone turns, the view grows at once, and the part the last
++  // frame doesn't cover showed what is behind the view until the page drew at
++  // its new size.
++  ui_view_->view_.backgroundColor = skia::UIColorFromSkColor(opaque_color);
+ }
+ 
+ void RenderWidgetHostViewIOS::
+@@ -496,6 +503,10 @@ bool IsTesting() {
+   if (!use_fixed_size_for_testing_ &&
+       (compositor_size_changed || screen_info_changed)) {
+     browser_compositor_->UpdateSurfaceFromUIView(native_view_size);
++    // [ios-blink-sideload] See OnAnimatedResizeStarted().
++    if (awaiting_resize_frame_) {
++      resize_surface_id_ = GetLocalSurfaceId();
++    }
+   }
+   ComputeDisplayFeature();
+ 
+@@ -529,6 +540,13 @@ bool IsTesting() {
+   display_tree_->UpdateCALayerTree(std::move(ca_layer_params));
+ }
+ 
++void RenderWidgetHostViewIOS::OnAnimatedResizeStarted() {
++  // [ios-blink-sideload] Wait for a frame with the surface id of the view's
++  // new size (UpdateScreenInfo() allocates it as the view lays out).
++  awaiting_resize_frame_ = true;
++  resize_surface_id_ = viz::LocalSurfaceId();
++}
++
+ void RenderWidgetHostViewIOS::OnOldViewDidNavigatePreCommit() {
+   CHECK(browser_compositor_) << "Shouldn't be called during destruction!";
+   browser_compositor_->DidNavigateMainFramePreCommit();
+@@ -1102,6 +1120,22 @@ bool IsTesting() {
+       input_handler->ScrollFocusedEditableNodeIntoView();
+     }
+   }
++#if !BUILDFLAG(IS_IOS_TVOS)
++  // [ios-blink-sideload] See OnAnimatedResizeStarted(): the page has a frame at
++  // its new size. Remove the rotation's snapshot once the GPU thread has had a
++  // few frames to show it (it draws straight into the view's layer).
++  if (resize_surface_id_.is_valid() && metadata.local_surface_id &&
++      metadata.local_surface_id->is_valid() &&
++      metadata.local_surface_id->IsSameOrNewerThan(resize_surface_id_)) {
++    resize_surface_id_ = viz::LocalSurfaceId();
++    awaiting_resize_frame_ = false;
++    __weak RenderWidgetUIView* view = ui_view_->view_;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC),
++                   dispatch_get_main_queue(), ^{
++                     [view removeResizeSnapshot];
++                   });
++  }
++#endif  // !BUILDFLAG(IS_IOS_TVOS)
+ }
+ 
+ void RenderWidgetHostViewIOS::ExtendSelectionAndDelete(int32_t before,
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.h b/content/browser/renderer_host/render_widget_host_view_ios_uiview.h
+index 1ba5744901b76c80ceff6dcf499890602715f9b1..ad8b3d9a4a11a5fa54e123298723c8c11cf7a082 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.h
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.h
+@@ -94,6 +94,10 @@ inline constexpr CGFloat kInputAccessoryToolbarBottomMargin = 8;
+ - (void)presentEditMenuWhenTouchesEnd;
+ - (void)updateView:(UIScrollView*)view;
+ - (void)removeView;
++// [ios-blink-sideload] Removes the page's snapshot shown while a rotation
++// resizes the view (see -prepareForSize: in the .mm), once the page has drawn
++// at its new size.
++- (void)removeResizeSnapshot;
+ @end
+ 
+ #endif  // CONTENT_BROWSER_RENDERER_HOST_RENDER_WIDGET_HOST_VIEW_IOS_UIVIEW_H_
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index aff5a86fa346563b542bba9a2acc787f1ae3eda3..1ed339d510e22deff3b552844915605157574d47 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -161,6 +161,18 @@ - (void)resetBlinkAnimation {
+ 
+ @end
+ 
++@interface RenderWidgetUIView () {
++  // [ios-blink-sideload] While a rotation resizes the view: a cover in the
++  // page's background color with a snapshot of the page as it was, scaled to
++  // the view's new width, the size it was taken at, and a count that ties a
++  // removal timer to its snapshot.
++  UIView* _resizeSnapshot;
++  UIView* _resizeSnapshotImage;
++  CGSize _resizeSnapshotSize;
++  NSUInteger _resizeSnapshotCount;
++}
++@end
++
+ @implementation RenderWidgetUIView
+ @synthesize tokenizer;
+ 
+@@ -185,6 +197,94 @@ - (instancetype)initWithWidget:
+   return self;
+ }
+ 
++- (void)setFrame:(CGRect)frame {
++  [self prepareForSize:frame.size];
++  [super setFrame:frame];
++}
++
++- (void)setBounds:(CGRect)bounds {
++  [self prepareForSize:bounds.size];
++  [super setBounds:bounds];
++}
++
++// [ios-blink-sideload] When a rotation animates the view to another width,
++// shows the page as it was, scaled to the new width, as WKWebView does, until
++// the page draws at its new size (RenderWidgetHostViewIOS calls
++// -removeResizeSnapshot). The last frame only covered part of the view until
++// then, the rest showing what was behind it.
++- (void)prepareForSize:(CGSize)size {
++  if (_resizeSnapshot) {
++    [self layoutResizeSnapshotForSize:size];
++    return;
++  }
++  const CGSize oldSize = self.bounds.size;
++  if (size.width == oldSize.width || size.width <= 0 || oldSize.width <= 0 ||
++      oldSize.height <= 0 || !self.window ||
++      UIView.inheritedAnimationDuration <= 0) {
++    return;
++  }
++  UIView* image = [self snapshotViewAfterScreenUpdates:NO];
++  if (!image) {
++    return;
++  }
++  // On the page's background color, over the whole view: where the scaled
++  // picture doesn't reach (turning to portrait), the view's layer still
++  // showed the old frame, or black.
++  UIView* snapshot = [[UIView alloc] init];
++  snapshot.userInteractionEnabled = NO;
++  snapshot.backgroundColor = self.backgroundColor;
++  [snapshot addSubview:image];
++  [UIView performWithoutAnimation:^{
++    snapshot.frame = CGRectMake(0, 0, oldSize.width, oldSize.height);
++    image.frame = snapshot.bounds;
++    [self addSubview:snapshot];
++  }];
++  _resizeSnapshot = snapshot;
++  _resizeSnapshotImage = image;
++  _resizeSnapshotSize = oldSize;
++  self.clipsToBounds = YES;
++  [self layoutResizeSnapshotForSize:size];
++
++  // Don't keep it if the page doesn't draw. WKWebView keeps its picture until
++  // the page has drawn, and a busy page can take seconds without JIT on the
++  // phone.
++  const NSUInteger count = ++_resizeSnapshotCount;
++  __weak RenderWidgetUIView* weakSelf = self;
++  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5000 * NSEC_PER_MSEC),
++                 dispatch_get_main_queue(), ^{
++                   [weakSelf removeResizeSnapshotIfCount:count];
++                 });
++  if (_view) {
++    _view->OnAnimatedResizeStarted();
++  }
++}
++
++// [ios-blink-sideload] Covers the view at size `size`, with the snapshot
++// scaled to its width.
++- (void)layoutResizeSnapshotForSize:(CGSize)size {
++  const CGFloat scale = size.width / _resizeSnapshotSize.width;
++  _resizeSnapshot.frame = CGRectMake(0, 0, size.width, size.height);
++  _resizeSnapshotImage.frame =
++      CGRectMake(0, 0, _resizeSnapshotSize.width * scale,
++                 _resizeSnapshotSize.height * scale);
++}
++
++- (void)removeResizeSnapshot {
++  if (!_resizeSnapshot) {
++    return;
++  }
++  [_resizeSnapshot removeFromSuperview];
++  _resizeSnapshot = nil;
++  _resizeSnapshotImage = nil;
++  self.clipsToBounds = NO;
++}
++
++- (void)removeResizeSnapshotIfCount:(NSUInteger)count {
++  if (count == _resizeSnapshotCount) {
++    [self removeResizeSnapshot];
++  }
++}
++
+ - (void)layoutSubviews {
+   CHECK(_view);
+   [super layoutSubviews];
+diff --git a/content/browser/web_contents/web_contents_view_ios.mm b/content/browser/web_contents/web_contents_view_ios.mm
+index ea68df4ee80f6f3107f595b102ffc4bb8b995430..82f29aa0efb92e331658ffc9ef69beed9c3b6254 100644
+--- a/content/browser/web_contents/web_contents_view_ios.mm
++++ b/content/browser/web_contents/web_contents_view_ios.mm
+@@ -134,7 +134,12 @@ - (void)updateVisibility:(BOOL)visible {
+   [ui_view_->view_ setScrollEnabled:NO];
+   [ui_view_->view_ setAutoresizingMask:UIViewAutoresizingFlexibleWidth |
+                                        UIViewAutoresizingFlexibleHeight];
+-  ui_view_->view_.backgroundColor = [UIColor lightGrayColor];
++  // [ios-blink-sideload] The system's background, not light gray: while the
++  // phone turns, the view grows before the page draws at its new size, and
++  // the page showed a large gray area until it did (Safari shows none). The
++  // page's own view shows the page's background color over it
++  // (RenderWidgetHostViewIOS::UpdateBackgroundColor()).
++  ui_view_->view_.backgroundColor = UIColor.systemBackgroundColor;
+ }
+ 
+ WebContentsViewIOS::~WebContentsViewIOS() {
+-- 
+2.54.0 (Apple Git-157)
+

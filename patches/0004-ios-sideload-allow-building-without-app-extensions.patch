@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: allow building Chrome without any app extension
+
+diff --git a/ios/chrome/app/BUILD.gn b/ios/chrome/app/BUILD.gn
+index 9ff08490b3dc8121a7d7864a9a082bc91356bb74..bc7f20a5b8b3d5ad754b87ef8cc94383c0e36400 100644
+--- a/ios/chrome/app/BUILD.gn
++++ b/ios/chrome/app/BUILD.gn
+@@ -1023,6 +1023,9 @@ chrome_app("chrome") {
+ 
+ if (current_toolchain == default_toolchain && !ios_chrome_generate_order_file) {
+   _extension_toolchain = "${current_toolchain}_app_ext"
++
++  # [ios-blink-sideload] Sideload builds turn off every extension below.
++  not_needed([ "_extension_toolchain" ])
+   if (ios_enable_share_extension) {
+     extension_bundle_data("share_extension_bundle") {
+       extension_name = "share_extension.appex"
+-- 
+2.54.0 (Apple Git-157)
+

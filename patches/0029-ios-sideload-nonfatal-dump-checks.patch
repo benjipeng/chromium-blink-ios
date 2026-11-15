@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: report invariants without crashing on devices
+
+diff --git a/base/check.cc b/base/check.cc
+index f935dbad049bd60e39ebe19f1beb485339f4fc43..a2f380b31e38b001677d0d878440d9d4ee2f76c6 100644
+--- a/base/check.cc
++++ b/base/check.cc
+@@ -60,7 +60,13 @@ constexpr char kCheckFailureMessageSeparator[] =
+     ;
+ 
+ LogSeverity GetDumpSeverity() {
+-#if defined(OFFICIAL_BUILD)
++#if defined(OFFICIAL_BUILD) || BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] The sideloaded app is a user-facing build that isn't
++  // an official one: report and go on, as Chrome does, instead of crashing on
++  // invariants Chrome only reports. The app crashed every time it was closed
++  // (DUMP_WILL_BE_NOTREACHED() in ~BrowserContextImpl(): the in-process
++  // renderer's host outlives the profile). Builds with DCHECKs, such as the
++  // simulator's, still crash.
+   return DCHECK_IS_ON() ? LOGGING_DCHECK : LOGGING_ERROR;
+ #else
+   // Crash outside official builds (outside user-facing builds) to detect
+-- 
+2.54.0 (Apple Git-157)
+

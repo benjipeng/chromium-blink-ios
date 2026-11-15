@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: single-process, RAM-scaled jitless V8, and background bloat suppression
+
+diff --git a/content/app/content_main.cc b/content/app/content_main.cc
+index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5502aac06 100644
+--- a/content/app/content_main.cc
++++ b/content/app/content_main.cc
+@@ -27,6 +27,9 @@
+ #include "base/run_loop.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/synchronization/condition_variable.h"
++#include <string>
++
++#include "base/system/sys_info.h"
+ #include "base/task/single_thread_task_executor.h"
+ #include "base/task/thread_pool/thread_pool_instance.h"
+ #include "base/threading/platform_thread.h"
+@@ -113,6 +116,94 @@ void SetupSignalHandlers() {
+ 
+ #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
+ 
++#if BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
++// [ios-blink-sideload] Adds |features| to a comma-separated feature switch
++// without discarding values that are already present.
++void AppendToFeatureSwitch(base::CommandLine* command_line,
++                           const char* switch_name,
++                           const std::string& features) {
++  std::string value = command_line->GetSwitchValueASCII(switch_name);
++  if (!value.empty()) {
++    value += ",";
++  }
++  value += features;
++  command_line->AppendSwitchASCII(switch_name, value);
++}
++
++// [ios-blink-sideload] A sideloaded app cannot hold the BrowserEngineKit
++// entitlements, so the web content, GPU and network extension processes can
++// never be launched and V8 cannot allocate executable memory. Run the way the
++// tvOS port does: everything in one process, V8 jitless, and memory budgets
++// sized for a single shared process.
++void AppendSideloadSwitches(base::CommandLine* command_line) {
++  // blink::switches::kJavaScriptFlags; spelled out to keep content/app free of
++  // a direct Blink dependency.
++  constexpr char kJsFlagsSwitch[] = "js-flags";
++
++  command_line->AppendSwitch(switches::kSingleProcess);
++
++  const uint64_t ram_mb =
++      base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
++
++  if (!command_line->HasSwitch(kJsFlagsSwitch)) {
++    // Scale V8 heap ceilings by physical RAM (accounting for iOS kernel
++    // carveouts on 4 GB, 6 GB, and 8 GB+ devices).
++    int old_space_mb = 256;
++    int semi_space_mb = 8;
++    if (ram_mb >= 7000) {
++      old_space_mb = 1024;
++      semi_space_mb = 32;
++    } else if (ram_mb >= 5120) {
++      old_space_mb = 512;
++      semi_space_mb = 16;
++    } else if (ram_mb >= 3500) {
++      old_space_mb = 384;
++      semi_space_mb = 16;
++    }
++    // --wasm-jitless runs WebAssembly in DrumBrake, V8's interpreter: under
++    // --jitless, V8 exposes WebAssembly only with it. It goes last because it
++    // can only be set in builds with DrumBrake (args/*.gn), and V8 ignores
++    // every flag after one it rejects.
++    command_line->AppendSwitchASCII(
++        kJsFlagsSwitch,
++        "--jitless --max-old-space-size=" +
++            base::NumberToString(old_space_mb) +
++            " --max-semi-space-size=" + base::NumberToString(semi_space_mb) +
++            " --wasm-jitless");
++  }
++
++  // In-process, the GPU watchdog killing a slow GPU thread takes the whole app
++  // down; a slow first GL/ANGLE init is expected here.
++  command_line->AppendSwitch("disable-gpu-watchdog");
++
++  // Cap the compositor's estimate of available GPU memory so tile caches on
++  // heavy pages do not push the single process over the jetsam limit.
++  if (!command_line->HasSwitch("force-gpu-mem-available-mb")) {
++    command_line->AppendSwitchASCII(
++        "force-gpu-mem-available-mb",
++        ram_mb >= 7000 ? "768" : (ram_mb >= 5120 ? "512" : (ram_mb >= 3500 ? "384" : "192")));
++  }
++
++  AppendToFeatureSwitch(command_line, switches::kEnableFeatures,
++                        "WebContentsDiscard");
++  // AVSampleBufferDisplayLayer video needs extra fixes before it draws through
++  // the in-process layer tree, and the
++  // back/forward cache keeps whole pages alive inside the one process.
++  // NetTaskScheduler would point net::GetTaskRunner() at the in-process
++  // network service thread, while the Chrome app's ios/web NetworkContext
++  // runs its URLLoaders on the IO thread.
++  AppendToFeatureSwitch(command_line, switches::kDisableFeatures,
++                        "avfoundation-overlays,BackForwardCache,"
++                        "NetTaskScheduler,OptimizationHints,"
++                        "OptimizationTargetPrediction,"
++                        "OptimizationGuideModelExecution,"
++                        "OptimizationGuidePageContentExtraction,"
++                        "ModelQualityLogging,PageContentCache,"
++                        "PageSettledMonitor,"
++                        "PageContentExtractionUsingPageSettledMonitor");
++}
++#endif  // BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
++
+ bool IsSubprocess() {
+   auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+       switches::kProcessType);
+@@ -288,6 +379,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+     // Enable spatial navigation; we interpret remote control swipes as arrow
+     // keys.
+     command_line->AppendSwitch(switches::kEnableSpatialNavigation);
++#else
++    // [ios-blink-sideload] Single-process, jitless defaults for sideloading.
++    AppendSideloadSwitches(command_line);
+ #endif
+ #endif
+ 

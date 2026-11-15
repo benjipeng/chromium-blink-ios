@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: don't crash when UIAccessibility queries a dead
+
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index 122735282a3cf01f936a2943cc8432c66ad6009e..2762f2adf4f2041691117a64a0d731bce923ee40 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -1327,9 +1327,15 @@ - (nullable UITextRange*)characterRangeAtPoint:(CGPoint)point {
+ }
+ 
+ - (NSArray*)accessibilityElements {
++  // [ios-blink-sideload] UIAccessibility can still query this view after its
++  // RenderWidgetHostViewIOS is gone (e.g. right after a navigation swaps the
++  // view), and before the page's accessibility tree has a root.
++  if (!_view) {
++    return nil;
++  }
+   ui::BrowserAccessibilityManager* manager =
+       _view->host()->GetRootBrowserAccessibilityManager();
+-  if (manager) {
++  if (manager && manager->GetBrowserAccessibilityRoot()) {
+     id root =
+         manager->GetBrowserAccessibilityRoot()->GetNativeViewAccessible().Get();
+     if (root) {
+-- 
+2.54.0 (Apple Git-157)
+

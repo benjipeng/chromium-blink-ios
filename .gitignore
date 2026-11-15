@@ -1,0 +1,10 @@
+# Build outputs and temporary workspaces
+work/
+out/
+dist/
+*.ipa
+*.tar.zst
+*.tar.zst.enc
+__pycache__/
+*.pyc
+.DS_Store

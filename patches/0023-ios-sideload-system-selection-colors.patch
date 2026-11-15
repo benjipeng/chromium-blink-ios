@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: system colors for the caret and text selection
+
+diff --git a/content/browser/renderer_host/ios_extended_text_input_traits.mm b/content/browser/renderer_host/ios_extended_text_input_traits.mm
+index 8ec46f22d966be95ccf47498eb6f71a986ff9586..9ff724f97a31564acbba7ddb8b2f1d7409f7b2a2 100644
+--- a/content/browser/renderer_host/ios_extended_text_input_traits.mm
++++ b/content/browser/renderer_host/ios_extended_text_input_traits.mm
+@@ -180,7 +180,9 @@ - (instancetype)init {
+     return nil;
+   }
+   self.typingAdaptationEnabled = YES;
+-  self.selectionHandleColor = [UIColor blueColor];
++  // [ios-blink-sideload] systemBlue, as in Safari, to match the caret and the
++  // selection that Blink paints (LayoutThemeIOS).
++  self.selectionHandleColor = UIColor.systemBlueColor;
+   return self;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/editing/caret_display_item_client.cc b/third_party/blink/renderer/core/editing/caret_display_item_client.cc
+index 3afebb08c2f7d488008f82c3caa44680dbb01a90..877943d421a3a87cb79243195c7ea1e26d273a91 100644
+--- a/third_party/blink/renderer/core/editing/caret_display_item_client.cc
++++ b/third_party/blink/renderer/core/editing/caret_display_item_client.cc
+@@ -27,6 +27,7 @@
+ 
+ #include <cmath>
+ 
++#include "build/build_config.h"
+ #include "third_party/blink/renderer/core/display_lock/display_lock_utilities.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/editing/editing_utilities.h"
+@@ -50,6 +51,10 @@
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/renderer/core/layout/layout_theme_ios.h"
++#endif
++
+ namespace blink {
+ 
+ CaretDisplayItemClient::CaretDisplayItemClient() = default;
+@@ -294,6 +299,13 @@ void CaretDisplayItemClient::UpdateStyleAndLayoutIfNeeded(
+     new_color = caret_position.AnchorNode()->GetLayoutObject()->ResolveColor(
+         GetCSSPropertyCaretColor());
+   }
++#if BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] As in Safari, the caret is systemBlue unless the page
++  // sets caret-color.
++  if (style && style->IsCaretColorAuto()) {
++    new_color = LayoutThemeIOS::SystemBlueColor(style->UsedColorScheme());
++  }
++#endif
+   if (new_color != color_) {
+     needs_paint_invalidation_ = true;
+     color_ = new_color;
+diff --git a/third_party/blink/renderer/core/frame/local_frame_view.cc b/third_party/blink/renderer/core/frame/local_frame_view.cc
+index 3fd80748467b8ca5639000041f12bff97ccfa85c..bce41211c6a76f9ce9ae7a80c24ba42bb58ac470 100644
+--- a/third_party/blink/renderer/core/frame/local_frame_view.cc
++++ b/third_party/blink/renderer/core/frame/local_frame_view.cc
+@@ -5489,8 +5489,15 @@ void LocalFrameView::MapLocalToRemoteMainFrame(
+ }
+ 
+ LayoutUnit LocalFrameView::BarCaretWidth() const {
++#if BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] The system's caret is 2 points wide, as in Safari.
++  constexpr float kBarCaretWidth = 2.0f;
++#else
++  constexpr float kBarCaretWidth = 1.0f;
++#endif
+   return LayoutUnit(std::max<float>(
+-      1.0f, GetChromeClient()->WindowToViewportScalar(&GetFrame(), 1.0f)));
++      1.0f,
++      GetChromeClient()->WindowToViewportScalar(&GetFrame(), kBarCaretWidth)));
+ }
+ 
+ void LocalFrameView::RegisterTapEvent(Element* target) {
+diff --git a/third_party/blink/renderer/core/layout/layout_theme_ios.h b/third_party/blink/renderer/core/layout/layout_theme_ios.h
+index 61f5f9579cc0644ec6ee68777e1bbd09c1168d89..7d6db0b539a9f2058cfc7ad59c6fd6aa88a66c28 100644
+--- a/third_party/blink/renderer/core/layout/layout_theme_ios.h
++++ b/third_party/blink/renderer/core/layout/layout_theme_ios.h
+@@ -12,12 +12,17 @@ namespace blink {
+ class LayoutThemeIOS final : public LayoutThemeMobile {
+  public:
+   static scoped_refptr<LayoutTheme> Create();
++  // [ios-blink-sideload] UIColor.systemBlueColor, which iOS uses for the caret
++  // and the text selection.
++  static Color SystemBlueColor(mojom::blink::ColorScheme color_scheme);
+   Color PlatformActiveSelectionBackgroundColor(
+       mojom::blink::ColorScheme color_scheme) const override;
+   Color PlatformActiveSelectionForegroundColor(
+       mojom::blink::ColorScheme color_scheme) const override;
+   Color PlatformSpellingMarkerUnderlineColor() const override;
+   Color PlatformGrammarMarkerUnderlineColor() const override;
++  // [ios-blink-sideload] Selected text keeps its color, as in Safari.
++  bool SupportsSelectionForegroundColors() const override { return false; }
+ 
+  private:
+   ~LayoutThemeIOS() override;
+diff --git a/third_party/blink/renderer/core/layout/layout_theme_ios.mm b/third_party/blink/renderer/core/layout/layout_theme_ios.mm
+index 670a1ff9a567dd83bc4fa2a337d54b2af4d7c0e9..88bd00901c8e6da87efc201c117c6e65708c7379 100644
+--- a/third_party/blink/renderer/core/layout/layout_theme_ios.mm
++++ b/third_party/blink/renderer/core/layout/layout_theme_ios.mm
+@@ -22,12 +22,21 @@
+ 
+ LayoutThemeIOS::~LayoutThemeIOS() {}
+ 
++// static
++Color LayoutThemeIOS::SystemBlueColor(mojom::blink::ColorScheme color_scheme) {
++  // As of iOS 26.
++  return color_scheme == mojom::blink::ColorScheme::kDark
++             ? Color::FromRGB(0x00, 0x91, 0xFF)
++             : Color::FromRGB(0x00, 0x88, 0xFF);
++}
++
+ Color LayoutThemeIOS::PlatformActiveSelectionBackgroundColor(
+     mojom::blink::ColorScheme color_scheme) const {
+-  return color_scheme == mojom::blink::ColorScheme::kDark
+-             ? Color::FromRGBA32(0xFF99C8FF)
+-             : LayoutThemeMobile::PlatformActiveSelectionBackgroundColor(
+-                   color_scheme);
++  // [ios-blink-sideload] The system's text selection, as in Safari: systemBlue
++  // at 20% opacity (instead of Android's), over text that keeps its color.
++  Color color = SystemBlueColor(color_scheme);
++  color.SetAlpha(0.2f);
++  return color;
+ }
+ 
+ Color LayoutThemeIOS::PlatformActiveSelectionForegroundColor(
+-- 
+2.54.0 (Apple Git-157)
+
