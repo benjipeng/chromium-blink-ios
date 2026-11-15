@@ -26,6 +26,7 @@ on:
 permissions:
   contents: write
   packages: write
+  actions: read
 
 env:
   SHARD_COUNT: "12"
@@ -42,8 +43,96 @@ jobs:
       has_ccache: ${{ steps.info.outputs.has_ccache }}
       need_shards: ${{ steps.info.outputs.need_shards }}
       shards_json: ${{ steps.info.outputs.shards_json }}
+      stub_cache_key: ${{ steps.keys.outputs.stub_cache_key }}
+      apple_cache_key: ${{ steps.keys.outputs.apple_cache_key }}
+      need_apple_prebuild: ${{ steps.info.outputs.need_apple_prebuild }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute deterministic Xcode SDK stub & Apple prebuild cache keys
+        id: keys
+        run: |
+          source ./version.lock
+          python3 - "$CHROMIUM_REV" "$XCODE_BUILD" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib, pathlib, sys
+
+          chromium_rev, xcode_build, gh_out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          stub_h = hashlib.sha256()
+          stub_h.update(pathlib.Path("scripts/extract_xcode_stub.sh").read_bytes())
+          stub_key = f"xcode-stub-v1-{xcode_build}-{stub_h.hexdigest()[:16]}"
+
+          # Stage 1 compiles Swift, xcassets, storyboards/xibs, and intents.
+          # Pure C/C++/ObjC/ObjC++ implementation files (.c/.cc/.cpp/.m/.mm) are never
+          # inputs to Stage 1 tools, whereas headers (.h), Swift, GN/GNI, Mojo/IDL/GRD,
+          # plists, and assets are hashed so C++-only patch iterations reuse Stage 1.
+          IMPL_EXTS = (".c", ".cc", ".cpp", ".cxx", ".m", ".mm")
+          apple_h = hashlib.sha256()
+          for p in sorted(pathlib.Path("args").rglob("*")):
+              if p.is_file():
+                  apple_h.update(p.as_posix().encode())
+                  apple_h.update(b"\0")
+                  apple_h.update(p.read_bytes())
+                  apple_h.update(b"\0")
+          for helper in ("scripts/apple_tool_wrapper.py", "scripts/plan_shards.py"):
+              apple_h.update(helper.encode())
+              apple_h.update(b"\0")
+              apple_h.update(pathlib.Path(helper).read_bytes())
+              apple_h.update(b"\0")
+
+          series = pathlib.Path("patches/series")
+          if series.is_file():
+              for raw in series.read_text(encoding="utf-8").splitlines():
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  patch_file = pathlib.Path("patches") / line
+                  text = patch_file.read_text(encoding="utf-8", errors="replace")
+                  chunks = text.split("\ndiff --git ")
+                  for idx, chunk in enumerate(chunks):
+                      block = chunk if idx == 0 else "diff --git " + chunk
+                      if not block.startswith("diff --git "):
+                          idx_dg = block.find("diff --git ")
+                          if idx_dg == -1:
+                              continue
+                          block = block[idx_dg:]
+                      first_line = block.splitlines()[0]
+                      parts = first_line.split()
+                      target_path = parts[-1] if len(parts) >= 4 else ""
+                      if target_path.startswith("b/"):
+                          target_path = target_path[2:]
+                      if target_path.endswith(IMPL_EXTS):
+                          continue
+                      apple_h.update(line.encode())
+                      apple_h.update(b"\0")
+                      apple_h.update(block.encode())
+                      apple_h.update(b"\0")
+
+          apple_key = f"apple-prebuild-v1-{chromium_rev[:16]}-{xcode_build}-{apple_h.hexdigest()[:20]}"
+          with open(gh_out, "a", encoding="utf-8") as out:
+              out.write(f"stub_cache_key={stub_key}\n")
+              out.write(f"apple_cache_key={apple_key}\n")
+          print("stub_cache_key =", stub_key)
+          print("apple_cache_key =", apple_key)
+          PY
+
+      - name: Probe Xcode 27 SDK stub cache
+        id: stub_probe
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ steps.keys.outputs.stub_cache_key }}
+          lookup-only: true
+          enableCrossOsArchive: true
+
+      - name: Probe Stage 1 Apple tool cache
+        id: apple_probe
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ steps.keys.outputs.apple_cache_key }}
+          lookup-only: true
+          enableCrossOsArchive: true
 
       - name: Inspect GHCR snapshots and select build mode
         id: info
@@ -82,6 +171,12 @@ jobs:
             need_shards="false"
           fi
 
+          if [ "${{ steps.stub_probe.outputs.cache-hit }}" = "true" ] && [ "${{ steps.apple_probe.outputs.cache-hit }}" = "true" ]; then
+            need_apple_prebuild="false"
+          else
+            need_apple_prebuild="true"
+          fi
+
           shards_json="$(python3 -c "import json; print(json.dumps(list(range(int('${SHARD_COUNT}')))))")"
           echo "chromium_rev=${CHROMIUM_REV}" >> "$GITHUB_OUTPUT"
           echo "chromium_version=${CHROMIUM_VERSION}" >> "$GITHUB_OUTPUT"
@@ -89,14 +184,16 @@ jobs:
           echo "ccache_ref=${ccache_ref}" >> "$GITHUB_OUTPUT"
           echo "has_ccache=${has_ccache}" >> "$GITHUB_OUTPUT"
           echo "need_shards=${need_shards}" >> "$GITHUB_OUTPUT"
+          echo "need_apple_prebuild=${need_apple_prebuild}" >> "$GITHUB_OUTPUT"
           echo "shards_json=${shards_json}" >> "$GITHUB_OUTPUT"
-          echo "Mode resolved: has_ccache=${has_ccache}, need_shards=${need_shards}"
+          echo "Resolved: has_ccache=${has_ccache}, need_shards=${need_shards}, need_apple_prebuild=${need_apple_prebuild}"
 
   apple-prebuild:
     name: Stage 1 - Xcode 27 SDK Stub & Pre-Link Apple Targets
     needs: plan
+    if: needs.plan.outputs.need_apple_prebuild == 'true'
     runs-on: xcode-27
-    timeout-minutes: 120
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v4
 
@@ -107,7 +204,11 @@ jobs:
           target_app="$XCODE_APP"
           [ -e "$target_app" ] || target_app="/Applications/Xcode.app"
           keep_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target_app")"
-          echo "Keeping Xcode installation at: $keep_real"
+          actual_build="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["ProductBuildVersion"])' "$keep_real/Contents/version.plist")"
+          echo "Keeping Xcode installation at: $keep_real (ProductBuildVersion=$actual_build, expected=$XCODE_BUILD)"
+          if [ "$actual_build" != "$XCODE_BUILD" ]; then
+            echo "::warning::Runner Xcode build ($actual_build) differs from version.lock XCODE_BUILD ($XCODE_BUILD)"
+          fi
           for app in /Applications/Xcode*; do
             [ -e "$app" ] || [ -L "$app" ] || continue
             app_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")"
@@ -120,6 +221,7 @@ jobs:
             sudo rm -rf "$app" || true
           done
           sudo rm -rf /Library/Developer/CoreSimulator /Users/runner/Library/Android || true
+          mkdir -p .ci-cache
           df -h /
 
       - name: Install zstd and ORAS
@@ -131,19 +233,51 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Restore cached Xcode 27 SDK stub if present
+        id: restore_stub
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ needs.plan.outputs.stub_cache_key }}
+          enableCrossOsArchive: true
+
       - name: Extract and AES-256 encrypt Xcode 27 iOS SDK stub
+        if: steps.restore_stub.outputs.cache-hit != 'true'
         env:
           CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
         run: |
-          ./scripts/extract_xcode_stub.sh --output-encrypted "$RUNNER_TEMP/xcode_stub.tar.zst.enc"
+          ./scripts/extract_xcode_stub.sh --output-encrypted ".ci-cache/xcode_stub.tar.zst.enc"
+
+      - name: Save Xcode 27 SDK stub to Actions cache
+        if: steps.restore_stub.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ needs.plan.outputs.stub_cache_key }}
+          enableCrossOsArchive: true
+
+      - name: Probe cached Stage 1 Apple tool outputs
+        id: probe_apple
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ needs.plan.outputs.apple_cache_key }}
+          lookup-only: true
+          enableCrossOsArchive: true
 
       - name: Pull source, bootstrap mac-arm64 host tools, and record pre-link Apple targets
+        if: steps.probe_apple.outputs.cache-hit != 'true'
         run: |
           source ./version.lock
           work="$RUNNER_TEMP/work"
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling source snapshot"
           ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          df -h /
+
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Bootstrapping mac-arm64 host tools from src/DEPS"
           ./scripts/bootstrap_macos_host_tools.sh --work-dir "$work"
           ./scripts/apply_patches.sh --src-dir "$work/src"
+          df -h /
 
           xcode_root="$XCODE_APP"
           [ -d "$xcode_root" ] || xcode_root="/Applications/Xcode.app"
@@ -165,6 +299,7 @@ jobs:
           apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
           EOF
 
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Running gn gen out/Release"
           (cd "$work/src" && "$work/src/buildtools/mac/gn" gen out/Release)
           targets_file="$RUNNER_TEMP/apple_targets.txt"
           ./scripts/plan_shards.py \
@@ -172,27 +307,36 @@ jobs:
             --out-dir "$out_dir" \
             --mode apple-prebuild > "$targets_file"
 
-          echo "==> Pre-link Apple targets count: $(wc -l < "$targets_file")"
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building $(wc -l < "$targets_file") pre-link Apple targets"
+          df -h /
           if [ -s "$targets_file" ]; then
             xargs "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$targets_file"
           fi
-          tar -C "$RUNNER_TEMP" -cf - apple_tool_cache | zstd -T0 -5 -o "$RUNNER_TEMP/apple_tool_cache.tar.zst"
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Finished pre-link Apple targets"
+          df -h /
 
-      - name: Upload encrypted SDK stub & recorded Apple outputs
-        uses: actions/upload-artifact@v4
+          tar -C "$RUNNER_TEMP" -cf - apple_tool_cache | zstd -T0 -5 -o ".ci-cache/apple_tool_cache.tar.zst"
+          ls -lh .ci-cache/apple_tool_cache.tar.zst
+          rm -rf "$work"
+
+      - name: Save Stage 1 Apple tool cache to Actions cache
+        if: steps.probe_apple.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          name: stage1-apple-bundle
-          path: |
-            ${{ runner.temp }}/xcode_stub.tar.zst.enc
-            ${{ runner.temp }}/apple_tool_cache.tar.zst
-          retention-days: 1
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ needs.plan.outputs.apple_cache_key }}
+          enableCrossOsArchive: true
 
   codegen:
     name: Stage 2a - Host Tools, Rust Stdlib & Shared Codegen
     needs: [plan, apple-prebuild]
-    if: needs.plan.outputs.need_shards == 'true'
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.apple-prebuild.result == 'success' || needs.apple-prebuild.result == 'skipped') &&
+      needs.plan.outputs.need_shards == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -204,11 +348,21 @@ jobs:
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Download Stage 1 Apple bundle
-        uses: actions/download-artifact@v4
+      - name: Restore Xcode 27 SDK stub from cache
+        uses: actions/cache/restore@v4
         with:
-          name: stage1-apple-bundle
-          path: ${{ runner.temp }}/stage1
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ needs.plan.outputs.stub_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+
+      - name: Restore Stage 1 Apple tool outputs from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ needs.plan.outputs.apple_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
 
       - name: Build host tools, Rust rlibs, V8 snapshot, & generated headers
         env:
@@ -224,9 +378,10 @@ jobs:
 
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/stage1/xcode_stub.tar.zst.enc" \
+            -in ".ci-cache/xcode_stub.tar.zst.enc" \
             | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/stage1/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
+          zstd -dc ".ci-cache/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
+          rm -rf .ci-cache
 
           mkdir -p "$work/src/ci"
           cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
@@ -243,8 +398,9 @@ jobs:
           export CCACHE_COMPILERCHECK="content"
           export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
           export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="8G"
+          export CCACHE_MAXSIZE="0"
           mkdir -p "$CCACHE_DIR"
+          ccache -M 0
           ccache -z
 
           out_dir="$work/src/out/Release"
@@ -263,11 +419,13 @@ jobs:
             --out-dir "$out_dir" \
             --mode codegen > "$RUNNER_TEMP/codegen_targets.txt"
 
-          echo "==> Building $(wc -l < "$RUNNER_TEMP/codegen_targets.txt") host/Rust/codegen outputs"
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building $(wc -l < "$RUNNER_TEMP/codegen_targets.txt") host/Rust/codegen outputs"
+          df -h / /mnt 2>/dev/null || df -h /
           if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
             xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" < "$RUNNER_TEMP/codegen_targets.txt"
           fi
           ccache -s
+          df -h / /mnt 2>/dev/null || df -h /
 
           (
             cd "$out_dir"
@@ -298,7 +456,12 @@ jobs:
   compile-shards:
     name: Stage 2b - C/C++/ObjC++ Shard ${{ matrix.shard }}
     needs: [plan, apple-prebuild, codegen]
-    if: needs.plan.outputs.need_shards == 'true'
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.apple-prebuild.result == 'success' || needs.apple-prebuild.result == 'skipped') &&
+      needs.codegen.result == 'success' &&
+      needs.plan.outputs.need_shards == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -316,11 +479,27 @@ jobs:
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Download Stage 1 & Stage 2a artifacts
+      - name: Restore Xcode 27 SDK stub from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ needs.plan.outputs.stub_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+
+      - name: Restore Stage 1 Apple tool outputs from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ needs.plan.outputs.apple_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+
+      - name: Download Stage 2a shared codegen state
         uses: actions/download-artifact@v4
         with:
-          pattern: stage*
-          path: ${{ runner.temp }}/inputs
+          name: stage2a-codegen
+          path: ${{ runner.temp }}/stage2a
 
       - name: Compile shard ${{ matrix.shard }} into ccache bucket
         env:
@@ -336,9 +515,10 @@ jobs:
 
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
+            -in ".ci-cache/xcode_stub.tar.zst.enc" \
             | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
+          zstd -dc ".ci-cache/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
+          rm -rf .ci-cache
 
           mkdir -p "$work/src/ci"
           cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
@@ -355,8 +535,9 @@ jobs:
           export CCACHE_COMPILERCHECK="content"
           export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
           export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="8G"
+          export CCACHE_MAXSIZE="0"
           mkdir -p "$CCACHE_DIR"
+          ccache -M 0
           ccache -z
 
           out_dir="$work/src/out/Release"
@@ -370,7 +551,8 @@ jobs:
           EOF
 
           (cd "$work/src" && gn gen out/Release)
-          zstd -dc "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
+          zstd -dc "$RUNNER_TEMP/stage2a/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
+          rm -rf "$RUNNER_TEMP/stage2a"
 
           ./scripts/plan_shards.py \
             --ninja "$work/src/third_party/ninja/ninja" \
@@ -379,11 +561,13 @@ jobs:
             --shard-count "${SHARD_COUNT}" \
             --shard-index "${{ matrix.shard }}" > "$RUNNER_TEMP/shard_targets.txt"
 
-          echo "==> Compiling $(wc -l < "$RUNNER_TEMP/shard_targets.txt") objects for shard ${{ matrix.shard }}"
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Compiling $(wc -l < "$RUNNER_TEMP/shard_targets.txt") objects for shard ${{ matrix.shard }}"
           if [ -s "$RUNNER_TEMP/shard_targets.txt" ]; then
             xargs -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 < "$RUNNER_TEMP/shard_targets.txt"
           fi
           ccache -s
+          du -sh "$CCACHE_DIR"
+          df -h / /mnt 2>/dev/null || df -h /
           tar -C "$RUNNER_TEMP" -cf - ccache | zstd -T0 -3 -o "$RUNNER_TEMP/ccache_shard_${{ matrix.shard }}.tar.zst"
 
       - name: Upload ccache shard ${{ matrix.shard }}
@@ -399,45 +583,47 @@ jobs:
     if: >-
       always() &&
       needs.plan.result == 'success' &&
-      needs.apple-prebuild.result == 'success' &&
+      (needs.apple-prebuild.result == 'success' || needs.apple-prebuild.result == 'skipped') &&
       (needs.codegen.result == 'success' || needs.codegen.result == 'skipped') &&
       (needs.compile-shards.result == 'success' || needs.compile-shards.result == 'skipped')
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reclaim disk, mount 16 GB swapfile, & install tools
+      - name: Reclaim disk & install tools (swap deferred until after ccache merge)
         run: |
           chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh --with-swap 16
+          ./scripts/reclaim_disk_linux.sh
           sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache rsync
           ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Download Stage 1, codegen, & ccache shard artifacts
-        uses: actions/download-artifact@v4
+      - name: Restore Xcode 27 SDK stub from cache
+        uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/inputs
+          path: .ci-cache/xcode_stub.tar.zst.enc
+          key: ${{ needs.plan.outputs.stub_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
 
-      - name: Assemble ccache, link Chromium.app via ld64.lld, & persist cache
+      - name: Restore Stage 1 Apple tool outputs from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/apple_tool_cache.tar.zst
+          key: ${{ needs.plan.outputs.apple_cache_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+
+      - name: Stream-merge ccache, link Chromium.app via ld64.lld, & persist cache
         env:
           CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           source ./version.lock
           echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
           work="/tmp/cb_work"
-          mkdir -p "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/inputs/stage1-apple-bundle/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/inputs/stage1-apple-bundle/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
-
           export CCACHE_DIR="$RUNNER_TEMP/ccache"
           export CCACHE_BASEDIR="$work"
           export CCACHE_NOHASHDIR="true"
@@ -445,25 +631,51 @@ jobs:
           export CCACHE_COMPILERCHECK="content"
           export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
           export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="16G"
+          export CCACHE_MAXSIZE="0"
           mkdir -p "$CCACHE_DIR"
 
           if [ "${{ needs.plan.outputs.need_shards }}" = "true" ]; then
-            echo "==> Merging codegen + ${SHARD_COUNT} target ccache shards"
-            for f in "$RUNNER_TEMP"/inputs/ccache-shard-*/ccache_shard_*.tar.zst; do
-              [ -f "$f" ] || continue
-              tmp_s="$(mktemp -d)"
-              zstd -dc "$f" | tar -C "$tmp_s" -xf -
-              rsync -a --ignore-existing "$tmp_s/ccache/" "$CCACHE_DIR/"
-              rm -rf "$tmp_s" "$f"
+            echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Streaming shard-by-shard ccache merge"
+            shard_names=("ccache-shard-codegen")
+            for (( i = 0; i < SHARD_COUNT; i++ )); do
+              shard_names+=("ccache-shard-${i}")
             done
-            rm -rf "$RUNNER_TEMP/inputs/ccache-shard-"*
+            for sname in "${shard_names[@]}"; do
+              tmp_dl="$(mktemp -d)"
+              tmp_s="$(mktemp -d)"
+              gh run download "${GITHUB_RUN_ID}" -R "${GITHUB_REPOSITORY}" -n "$sname" -D "$tmp_dl"
+              tarball="$(find "$tmp_dl" -name '*.tar.zst' -print -quit)"
+              [ -n "$tarball" ] || { echo "::error::Missing tarball in artifact $sname"; exit 1; }
+              zstd -dc "$tarball" | tar -C "$tmp_s" -xf -
+              rm -rf "$tmp_dl"
+              rsync -a --ignore-existing "$tmp_s/ccache/" "$CCACHE_DIR/"
+              rm -rf "$tmp_s"
+              echo "  merged $sname"
+            done
           elif [ "${{ needs.plan.outputs.has_ccache }}" = "true" ]; then
-            echo "==> Pulling warm ccache from ${{ needs.plan.outputs.ccache_ref }}"
+            echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling warm ccache from ${{ needs.plan.outputs.ccache_ref }}"
             ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.ccache_ref }}" "$RUNNER_TEMP"
           fi
 
+          # Remove any max_size limit inherited from shard ccache.conf files so zero objects evict.
+          ccache -M 0
           ccache -z
+          echo "==> Merged ccache footprint & disk headroom:"
+          du -sh "$CCACHE_DIR"
+          df -h / /mnt 2>/dev/null || df -h /
+
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling source snapshot & staging build directory"
+          mkdir -p "$work"
+          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
+          ./scripts/apply_patches.sh --src-dir "$work/src"
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -pass env:CI_ARTIFACT_KEY \
+            -in ".ci-cache/xcode_stub.tar.zst.enc" \
+            | zstd -d | tar -C "$work/src" -xf -
+          zstd -dc ".ci-cache/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
+          rm -rf .ci-cache
+
           mkdir -p "$work/src/ci"
           cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
 
@@ -483,14 +695,26 @@ jobs:
           EOF
 
           (cd "$work/src" && gn gen out/Release)
-          if [ -f "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" ]; then
-            zstd -dc "$RUNNER_TEMP/inputs/stage2a-codegen/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
-            rm -rf "$RUNNER_TEMP/inputs/stage2a-codegen"
+          if [ "${{ needs.plan.outputs.need_shards }}" = "true" ]; then
+            tmp_cg="$(mktemp -d)"
+            gh run download "${GITHUB_RUN_ID}" -R "${GITHUB_REPOSITORY}" -n "stage2a-codegen" -D "$tmp_cg"
+            zstd -dc "$tmp_cg/codegen_gen.tar.zst" | tar -C "$out_dir" -xf -
+            rm -rf "$tmp_cg"
           fi
 
-          echo "==> Building & linking target 'chrome'"
+          echo "==> Pre-link disk usage (mounting adaptive SSD swapfile):"
+          df -h / /mnt 2>/dev/null || df -h /
+          ./scripts/reclaim_disk_linux.sh --swap-only 16
+
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building & linking target 'chrome'"
           "$work/src/third_party/ninja/ninja" -C "$out_dir" chrome
+          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Link finished"
           ccache -s
+          du -sh "$CCACHE_DIR"
+          df -h / /mnt 2>/dev/null || df -h /
+
+          # Reclaim swapfile space immediately before archiving app & pushing ccache.
+          ./scripts/reclaim_disk_linux.sh --drop-swap
 
           stage_out="$RUNNER_TEMP/linked_stage"
           mkdir -p "$stage_out"
@@ -501,6 +725,7 @@ jobs:
           tar -C "$stage_out" -cf - . | zstd -T0 -5 -o "$RUNNER_TEMP/chromium_app_unsigned.tar.zst"
 
           rm -rf "$work" "$stage_out"
+          df -h / /mnt 2>/dev/null || df -h /
           ./scripts/oci_artifacts.sh push \
             "${{ needs.plan.outputs.ccache_ref }}" \
             "$RUNNER_TEMP" \

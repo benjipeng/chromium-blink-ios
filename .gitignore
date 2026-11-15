@@ -1,4 +1,5 @@
 # Build outputs and temporary workspaces
+.ci-cache/
 work/
 out/
 dist/
