@@ -77,7 +77,7 @@ case "$cmd" in
     echo "==> Compressing ${items[*]} from $src_dir and splitting into 1500M OCI layers"
     tar -C "$src_dir" -cf - "${items[@]}" \
       | zstd -T0 -5 \
-      | split -b 1500m -d -a 3 - "$stage/part_"
+      | split -b 1500m -a 3 - "$stage/part_"
 
     (
       cd "$stage"

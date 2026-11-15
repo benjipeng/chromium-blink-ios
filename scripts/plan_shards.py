@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import re
 import shlex
@@ -189,7 +190,12 @@ def main() -> int:
             raise ValueError("Invalid --shard-index / --shard-count")
         commands = run_ninja_tool(args.ninja, args.out_dir, "commands", args.root_target)
         all_objs = collect_compile_object_targets(commands)
-        targets = all_objs[args.shard_index :: args.shard_count]
+        targets = [
+            obj
+            for obj in all_objs
+            if int(hashlib.sha1(obj.encode("utf-8")).hexdigest(), 16) % args.shard_count
+            == args.shard_index
+        ]
 
     for t in targets:
         print(t)
