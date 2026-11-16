@@ -109,6 +109,43 @@ See //extensions/browser/api/BUILD.gn:64:7: which caused the file to be included
 - Combined with Probes 2 and 3, this shows `enable_extensions = true` is self-contradictory on iOS unless either `//components/web_modal` is enabled on iOS (`enable_platform_apps = true`) or `//extensions/browser/api/BUILD.gn` is patched to gate app APIs on `enable_platform_apps`.
 - **Desktop Android comparison:** Desktop Android avoids this deadlock entirely because `enable_extensions` stays `false` (`enable_extensions_core = true`, `enable_platform_apps = false`).
 
+### Probe 5 (Core Iteration 1): `enable_extensions_core = true` + guard `//chrome:resources` ([run 43938061454](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43938061454))
+
+- **Extra GN args:** `enable_extensions_core = true`
+- **Patch added (`0056a38`):** `patches/0047-ios-extensions-guard-renderer-chrome-resources.patch` — guards `"//chrome:resources"` behind `if (!is_ios)` in `//extensions/renderer/BUILD.gn:256`.
+
+**Verbatim `gn gen` error:**
+```text
+ERROR at //chrome/common/net/BUILD.gn:8:1: Assertion failed.
+assert(!is_ios, "Chromium/iOS shouldn't use anything in //chrome")
+^-----
+Chromium/iOS shouldn't use anything in //chrome
+See //chrome/common/BUILD.gn:197:5: which caused the file to be included.
+    "//chrome/common/net",
+    ^--------------------
+```
+
+**Why this triggers:**
+- With `//extensions/renderer/BUILD.gn` unblocked, GN finishes parsing `//extensions/BUILD.gn`, where `static_library("test_support")` (`//extensions/BUILD.gn:159`) unconditionally depends on `"//chrome/common:buildflags"`.
+- Parsing `//chrome/common/BUILD.gn` (`assert(!is_fuchsia)` only) evaluates `static_library("common")`, whose `public_deps` at `:197` includes `"//chrome/common/net"`, hitting `assert(!is_ios)` at `//chrome/common/net/BUILD.gn:8:1`.
+
+### Probe 6 (Core Iteration 2): `enable_extensions_core = true` + guard `//chrome/common:buildflags` ([run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679))
+
+- **Extra GN args:** `enable_extensions_core = true`
+- **Cumulative patches (`442b330`):**
+  1. `patches/0047-ios-extensions-guard-renderer-chrome-resources.patch` (`//extensions/renderer/BUILD.gn`)
+  2. `patches/0048-ios-extensions-guard-test-support-chrome-buildflags.patch` — guards `"//chrome/common:buildflags"` behind `if (!is_ios)` in `//extensions/BUILD.gn:159`.
+
+**Verbatim `gn gen` output (`exit 0`):**
+```text
+Done. Made 34280 targets from 4878 files in 6426ms
+```
+
+**Offline `compare_graphs.py` & `chrome` reachability audit on downloaded `graph-diagnosis` artifacts (`43940083679` vs. `43868838103`):**
+- `graph-raw`: `13,870` archive entries (`13,869` `.ninja` files + `args.gn`; `23` changed, `0` only in baseline, `100` only in current — `78` under `obj/extensions/**`, `17` under `obj/components/{enterprise/browser/promotion,onc,safe_browsing/content,services/app_service,services/unzip/content,zoom}/**`, `4` under `obj/services/accessibility/public/mojom/**`, `1` under `obj/tools/json_schema_compiler/**`). Total edges: `265,988` vs. `263,702` (`+2,286` edges).
+- `codegen` plan: `43,247` planned roots (`10,939` closure edges; `0` off-limits crossings) vs. baseline artifact's `43,467` (`0` added, `220` removed due to the Stage 1/2 storyboard/intents planner split between `5edf7b1` and `c1c326f`; re-running the current `plan_shards.py` on both pruned graphs gives `43,247` vs. `43,247`, `0` delta).
+- **Reachability from `//ios/chrome/app:chrome` (`chrome`):** Out of `370` `phony/extensions/*` GN target nodes emitted in `out/Release`, `chrome`'s transitive closure grows by only `+15` nodes / `+11` unique edges (`73,712` -> `73,723`), adding 4 `.o` compiles: `obj/extensions/common/constants_impl/constants.o`, `obj/extensions/common/extension_features/extension_features.o`, `obj/components/omnibox/browser/browser/omnibox_input_watcher.o`, and `obj/components/omnibox/browser/browser/omnibox_suggestions_watcher.o` (pulled via `//components/omnibox/browser` and `//components/saved_tab_groups/public`). None of `//extensions/common`, `//extensions/common/api`, `//extensions/browser`, `//extensions/browser/api`, `//extensions/renderer`, `//extensions:extensions_resources`, or `//extensions/strings` is reachable from `chrome` yet; wiring those core runtime roots into `chrome` adds `+2,182` unique Ninja edges (`+1,006` target C/C++/ObjC `.o` compiles) on top of `chrome`'s existing closure.
+
 ### Additional static `//chrome` / `!is_ios` traps found in `//extensions` at `34d81e7bfe669b8eccaaf35c6e14c7bfc0689703`
 - `//extensions/BUILD.gn:159`: `static_library("test_support")` depends on `"//chrome/common:buildflags"` (unconditionally inside `//extensions/BUILD.gn`, which imports `//chrome` -> hits `assert(!is_ios)` in `//chrome/BUILD.gn:77` whenever `//extensions/BUILD.gn` is parsed, unless `//chrome/common:buildflags` is removed or guarded).
 - `//extensions/BUILD.gn:280`: `test("extensions_unittests")` lists `data = [ ..., "//chrome/test/data/extensions/" ]`.
