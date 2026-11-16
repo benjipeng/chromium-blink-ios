@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-1. **Core-only graph generation now passes with two narrow iOS dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`. Unpatched Chromium still fails. This proves graph generation, not extension compilation or runtime support: the current `chrome` closure reaches only the extensions constants and feature definitions.
+1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.
 4. **The only realistic architecture to run Chromium extensions on iOS Blink** is to (a) decouple `//extensions` from its residual `//chrome` GN deps and desktop-only assumptions (notably `//extensions/renderer/BUILD.gn:256`'s `"//chrome:resources"`), (b) build a dedicated iOS Blink embedder in `//ios/web/content` + `//ios/chrome/browser` implementing `ExtensionsClient`, `ExtensionsBrowserClient`, `ExtensionsRendererClient`, and core API delegates (mirroring Desktop Android's `enable_extensions_core` split), and (c) build mobile extension UI (`chrome://extensions` or native UIKit/SwiftUI) against `ProfileIOS` / `WebStateList` while respecting sideloading's `--single-process` + `--jitless` constraints.
@@ -156,7 +156,21 @@ The successful core-only probe has **265,988 edges across 13,869 Ninja files**. 
 
 The actual `chrome` closure contains only `extensions/common/constants_impl.ninja` and `extensions/common/extension_features.ninja` from the extensions tree. Full `extensions/common:common` and renderer targets would pull in 15,940 and 27,318 device C-family compilations respectively. The next compile probe therefore selects individual object outputs rather than those transitive targets.
 
-The successful run's comparison step did not execute: `compare_graphs.py` lacked executable permission and `tee` masked that error. Commit `8ec9f1d` invokes Python explicitly, propagates pipeline failures, and reports expected feature-probe graph changes without treating them as baseline regressions. The GN and codegen checks were separate and did pass.
+The first successful run's comparison step did not execute: `compare_graphs.py` lacked executable permission and `tee` masked that error. Commit `8ec9f1d` invokes Python explicitly, propagates pipeline failures, and reports expected feature-probe graph changes without treating them as baseline regressions. The GN and codegen checks were separate and did pass. The corrected comparison ran successfully in `43944365971`.
+
+### Minimal remote compile probe
+
+[Run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) used the existing Linux source/SDK preparation and budget helpers, then built only:
+
+| Layer | Object output | Result |
+|---|---|---|
+| Common extension model | `obj/extensions/common/common/extension.o` | Pass |
+| Browser process/lifecycle manager | `obj/extensions/browser/browser_sources/process_manager.o` | Pass |
+| Renderer dispatcher | `obj/extensions/renderer/renderer/dispatcher.o` | Pass |
+
+The graph gate verified exactly these three device C-family objects and no Apple tools in their prerequisite closure. All compilation ran on GitHub; no source checkout or compilation was needed locally. Of 783 cacheable compiler calls, **780 were cache hits (99.62%) and only the three sampled iOS objects were misses**. Ninja executed 3,439 steps, mostly prerequisites; its build budget interval took 4m16s. Total job time was 15m33s, including runner cleanup, source preparation, graph checks, comparison, and report upload.
+
+The probe reads the existing codegen ccache bucket but never writes GHCR checkpoints. Run provenance records the branch, commit, source/SDK digests, GN overrides, and probe mode. The default workflow mode remains graph-only; `compile_extensions=true` explicitly enables the three-object probe.
 
 ---
 

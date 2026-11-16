@@ -18,11 +18,10 @@ obj/extensions/renderer/renderer/dispatcher.o
 EOF
   python3 - <<'PY'
 import os
-import re
 import sys
 from pathlib import Path
 sys.path.insert(0, "scripts")
-from ninja_graph import Graph
+from ninja_graph import Graph, deps, is_target_object, is_target_work
 
 graph = Graph(Path("/tmp/cb_work/src/out/Release"))
 targets = (Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis/compile_targets.txt").read_text().splitlines()
@@ -40,9 +39,11 @@ while pending:
     edge = graph.edges[index]
     if graph.is_apple(edge):
         sys.exit(f"Unexpected Apple tool dependency: {edge.outs}")
-    if re.fullmatch(r"(?:.+_)?(?:cc|cxx|objc|objcxx|asm)", edge.rule):
-        device_objects.update(out for out in edge.outs if not out.startswith("clang_"))
-    pending.extend(edge.ins + edge.iins + edge.oins)
+    if is_target_object(edge):
+        device_objects.update(edge.outs)
+    elif is_target_work(edge):
+        sys.exit(f"Unexpected device archive, link or Swift dependency: {edge.outs}")
+    pending.extend(deps(edge))
 if device_objects != set(targets):
     sys.exit(f"Probe must compile exactly its three device objects: {sorted(device_objects)}")
 print(f"Verified {len(targets)} device objects; no Apple tools in their dependency closure")
