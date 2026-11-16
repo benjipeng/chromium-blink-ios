@@ -1,0 +1,515 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: initialize core extension clients and renderer hooks
+
+diff --git a/ios/web/content/init/ios_content_client.h b/ios/web/content/init/ios_content_client.h
+--- a/ios/web/content/init/ios_content_client.h
++++ b/ios/web/content/init/ios_content_client.h
+@@ -25,6 +25,7 @@
+   ~IOSContentClient() override;
+ 
+   // ContentClient implementation:
++  void AddAdditionalSchemes(Schemes* schemes) override;
+   blink::OriginTrialPolicy* GetOriginTrialPolicy() override;
+   std::u16string GetLocalizedString(int message_id) override;
+   std::u16string GetLocalizedString(int message_id,
+diff --git a/ios/web/content/init/ios_content_client.cc b/ios/web/content/init/ios_content_client.cc
+--- a/ios/web/content/init/ios_content_client.cc
++++ b/ios/web/content/init/ios_content_client.cc
+@@ -4,6 +4,12 @@
+ 
+ #import "ios/web/content/init/ios_content_client.h"
+ 
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "extensions/common/constants.h"
++#import "ios/web/content/init/extensions/ios_extensions_client.h"
++#endif
++
+ #include <string_view>
+ 
+ #import "base/memory/ref_counted_memory.h"
+@@ -12,9 +18,24 @@
+ 
+ namespace web {
+ 
++IOSContentClient::IOSContentClient() {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsClient();
++#endif
++}
+-IOSContentClient::IOSContentClient() {}
+ IOSContentClient::~IOSContentClient() {}
+ 
++void IOSContentClient::AddAdditionalSchemes(Schemes* schemes) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  schemes->standard_schemes.push_back(extensions::kExtensionScheme);
++  schemes->secure_schemes.push_back(extensions::kExtensionScheme);
++  schemes->cors_enabled_schemes.push_back(extensions::kExtensionScheme);
++  schemes->service_worker_schemes.push_back(extensions::kExtensionScheme);
++  schemes->extension_schemes.push_back(extensions::kExtensionScheme);
++  schemes->code_cache_schemes.push_back(extensions::kExtensionScheme);
++#endif
++}
++
+ blink::OriginTrialPolicy* IOSContentClient::GetOriginTrialPolicy() {
+   return &origin_trial_policy_;
+ }
+diff --git a/ios/web/content/init/ios_content_renderer_client.h b/ios/web/content/init/ios_content_renderer_client.h
+--- a/ios/web/content/init/ios_content_renderer_client.h
++++ b/ios/web/content/init/ios_content_renderer_client.h
+@@ -26,6 +26,7 @@
+   void RenderFrameCreated(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentStart(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentEnd(content::RenderFrame* render_frame) override;
++  void RunScriptsAtDocumentIdle(content::RenderFrame* render_frame) override;
+   void PrepareErrorPage(content::RenderFrame* render_frame,
+                         const blink::WebURLError& error,
+                         const std::string& http_method,
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -4,6 +4,12 @@
+ 
+ #import "ios/web/content/init/ios_content_renderer_client.h"
+ 
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "extensions/renderer/extensions_renderer_client.h"
++#import "ios/web/content/init/extensions/ios_extensions_client.h"
++#endif
++
+ #import <string>
+ 
+ #import "components/error_page/common/error.h"
+@@ -54,6 +60,9 @@
+ IOSContentRendererClient::~IOSContentRendererClient() = default;
+ 
+ void IOSContentRendererClient::RenderThreadStarted() {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  GetIOSExtensionsRendererClient()->RenderThreadStarted();
++#endif
+   // TODO(crbug.com/40260088): Create and register a v8::Extension for receiving
+   // messages from JavaScript.
+ }
+@@ -63,10 +72,18 @@
+   // As a RenderFrameObserver, JSCommunication handles destroying
+   // itself when its RenderFrame is destroyed.
+   new js_injection::JsCommunication(render_frame);
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsRenderFrame(render_frame);
++#endif
+ }
+ 
+ void IOSContentRendererClient::RunScriptsAtDocumentStart(
+     content::RenderFrame* render_frame) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (!RunIOSExtensionScriptsAtDocumentStart(render_frame)) {
++    return;
++  }
++#endif
+   js_injection::JsCommunication* communication =
+       js_injection::JsCommunication::Get(render_frame);
+   communication->RunScripts(
+@@ -75,12 +92,24 @@
+ 
+ void IOSContentRendererClient::RunScriptsAtDocumentEnd(
+     content::RenderFrame* render_frame) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (!RunIOSExtensionScriptsAtDocumentEnd(render_frame)) {
++    return;
++  }
++#endif
+   js_injection::JsCommunication* communication =
+       js_injection::JsCommunication::Get(render_frame);
+   communication->RunScripts(
+       js_injection::mojom::DocumentInjectionTime::kDocumentEnd);
+ }
+ 
++void IOSContentRendererClient::RunScriptsAtDocumentIdle(
++    content::RenderFrame* render_frame) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  GetIOSExtensionsRendererClient()->RunScriptsAtDocumentIdle(render_frame);
++#endif
++}
++
+ void IOSContentRendererClient::PrepareErrorPage(
+     content::RenderFrame* render_frame,
+     const blink::WebURLError& error,
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/ios/ios_sdk.gni")
++import("//extensions/buildflags/buildflags.gni")
+ 
+ source_set("init") {
+   sources = [
+@@ -27,6 +28,7 @@
+ 
+   deps = [
+     "//build:blink_buildflags",
++    "//extensions/buildflags",
+     "//components/embedder_support:user_agent",
+     "//components/embedder_support/origin_trials",
+     "//components/error_page/common",
+@@ -49,4 +51,7 @@
+     "//ui/base",
+     "//ui/native_theme",
+   ]
++  if (enable_extensions_core) {
++    deps += [ "extensions:clients" ]
++  }
+ }
+diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.gn
+--- a/ios/chrome/app/resources/BUILD.gn
++++ b/ios/chrome/app/resources/BUILD.gn
+@@ -5,6 +5,7 @@
+ import("//build/apple/tweak_info_plist.gni")
+ import("//build/config/chrome_build.gni")
+ import("//build/config/features.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//build/config/ios/rules.gni")
+ import("//build/config/locales.gni")
+ import("//ios/build/chrome_build.gni")
+@@ -127,6 +128,16 @@
+     "//ui/webui/resources",
+   ]
+ 
++  if (enable_extensions_core) {
++    sources += [
++      "$root_gen_dir/extensions/extensions_browser_resources_100_percent.pak",
++      "$root_gen_dir/extensions/extensions_renderer_generated_resources.pak",
++      "$root_gen_dir/extensions/extensions_renderer_resources.pak",
++      "$root_gen_dir/extensions/extensions_resources.pak",
++    ]
++    deps += [ "//extensions:extensions_resources" ]
++  }
++
+   output = "$target_gen_dir/resources.pak"
+   copy_data_to_bundle = true
+ 
+diff --git a/ios/chrome/app/resources/ios_chrome_repack.gni b/ios/chrome/app/resources/ios_chrome_repack.gni
+--- a/ios/chrome/app/resources/ios_chrome_repack.gni
++++ b/ios/chrome/app/resources/ios_chrome_repack.gni
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/chrome_build.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//tools/grit/repack.gni")
+ 
+ declare_args() {
+@@ -64,6 +65,13 @@
+              "//ui/strings:ui_strings",
+            ] + ios_locales_pack_extra_deps
+ 
++    if (enable_extensions_core) {
++      source_patterns += [
++        "${root_gen_dir}/extensions/strings/extensions_strings_",
++      ]
++      deps += [ "//extensions/strings" ]
++    }
++
+     copy_data_to_bundle = true
+ 
+     if (enable_builtin_search_provider_assets) {
+diff --git a/ios/web/content/init/extensions/ios_extensions_client.h b/ios/web/content/init/extensions/ios_extensions_client.h
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_extensions_client.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_CLIENT_H_
++#define IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_CLIENT_H_
++
++namespace content {
++class RenderFrame;
++}
++namespace extensions {
++class ExtensionsRendererClient;
++}
++namespace web {
++
++void InitializeIOSExtensionsClient();
++extensions::ExtensionsRendererClient* GetIOSExtensionsRendererClient();
++void InitializeIOSExtensionsRenderFrame(content::RenderFrame* render_frame);
++// Return false when an extension script destroys the frame.
++bool RunIOSExtensionScriptsAtDocumentStart(content::RenderFrame* render_frame);
++bool RunIOSExtensionScriptsAtDocumentEnd(content::RenderFrame* render_frame);
++
++}  // namespace web
++
++#endif  // IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_CLIENT_H_
+diff --git a/ios/web/content/init/extensions/ios_extensions_client.cc b/ios/web/content/init/extensions/ios_extensions_client.cc
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_extensions_client.cc
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/web/content/init/extensions/ios_extensions_client.h"
++
++#include <memory>
++#include <string>
++
++#include "base/no_destructor.h"
++#include "extensions/common/core_extensions_api_provider.h"
++#include "extensions/common/extension_urls.h"
++#include "extensions/common/extensions_client.h"
++#include "extensions/common/permissions/manifest_permission.h"
++#include "extensions/common/permissions/permission_message_provider.h"
++#include "extensions/common/permissions/permission_set.h"
++#include "extensions/common/url_pattern_set.h"
++#include "url/gurl.h"
++
++namespace web {
++namespace {
++
++class IOSPermissionMessageProvider final
++    : public extensions::PermissionMessageProvider {
++ public:
++  extensions::PermissionMessages GetPermissionMessages(
++      const extensions::PermissionIDSet& permissions) const override {
++    if (permissions.empty()) {
++      return {};
++    }
++    return {extensions::PermissionMessage(
++        u"Access the websites and browser capabilities requested by this extension.",
++        permissions)};
++  }
++
++  bool IsPrivilegeIncrease(
++      const extensions::PermissionSet& granted,
++      const extensions::PermissionSet& requested,
++      extensions::Manifest::Type extension_type) const override {
++    return !granted.Contains(requested);
++  }
++
++  extensions::PermissionIDSet GetAllPermissionIDs(
++      const extensions::PermissionSet& permissions,
++      extensions::Manifest::Type extension_type) const override {
++    extensions::PermissionIDSet ids;
++    for (const auto* permission : permissions.apis()) {
++      ids.InsertAll(permission->GetPermissions());
++    }
++    for (const auto* permission : permissions.manifest_permissions()) {
++      ids.InsertAll(permission->GetPermissions());
++    }
++    if (!permissions.effective_hosts().is_empty()) {
++      ids.insert(extensions::mojom::APIPermissionID::kHostReadWrite);
++    }
++    return ids;
++  }
++};
++
++class IOSExtensionsClient final : public extensions::ExtensionsClient {
++ public:
++  IOSExtensionsClient()
++      : webstore_url_(extension_urls::kChromeWebstoreBaseURL),
++        new_webstore_url_(extension_urls::kNewChromeWebstoreBaseURL),
++        update_url_(extension_urls::kChromeWebstoreUpdateURL) {
++    AddAPIProvider(std::make_unique<extensions::CoreExtensionsAPIProvider>());
++  }
++
++  void Initialize() override {}
++  void InitializeWebStoreUrls(base::CommandLine* command_line) override {}
++
++  const extensions::PermissionMessageProvider& GetPermissionMessageProvider()
++      const override {
++    return permission_messages_;
++  }
++
++  const std::string GetProductName() override { return "Chromium Blink iOS"; }
++
++  void FilterHostPermissions(const extensions::URLPatternSet& hosts,
++                             extensions::URLPatternSet* new_hosts,
++                             extensions::PermissionIDSet* permissions) const override {
++    *new_hosts = hosts.Clone();
++  }
++
++  void SetScriptingAllowlist(const ScriptingAllowlist& allowlist) override {
++    scripting_allowlist_ = allowlist;
++  }
++
++  const ScriptingAllowlist& GetScriptingAllowlist() const override {
++    return scripting_allowlist_;
++  }
++
++  extensions::URLPatternSet GetPermittedChromeSchemeHosts(
++      const extensions::Extension* extension,
++      const extensions::APIPermissionSet& api_permissions) const override {
++    return {};
++  }
++
++  bool IsScriptableURL(const GURL& url, std::string* error) const override {
++    if (url.SchemeIsHTTPOrHTTPS() &&
++        !url.DomainIs("chromewebstore.google.com") &&
++        !(url.DomainIs("chrome.google.com") &&
++          url.path().starts_with("/webstore"))) {
++      return true;
++    }
++    if (error) {
++      *error = "Extensions cannot script this URL.";
++    }
++    return false;
++  }
++
++  const GURL& GetWebstoreBaseURL() const override { return webstore_url_; }
++  const GURL& GetNewWebstoreBaseURL() const override { return new_webstore_url_; }
++  const GURL& GetWebstoreUpdateURL() const override { return update_url_; }
++  bool IsBlocklistUpdateURL(const GURL& url) const override { return false; }
++
++ private:
++  IOSPermissionMessageProvider permission_messages_;
++  ScriptingAllowlist scripting_allowlist_;
++  const GURL webstore_url_;
++  const GURL new_webstore_url_;
++  const GURL update_url_;
++};
++
++}  // namespace
++
++void InitializeIOSExtensionsClient() {
++  static base::NoDestructor<IOSExtensionsClient> client;
++  static const bool initialized = [] {
++    extensions::ExtensionsClient::Set(client.get());
++    return true;
++  }();
++  (void)initialized;
++}
++
++}  // namespace web
+diff --git a/ios/web/content/init/extensions/ios_extensions_renderer_client.cc b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/web/content/init/extensions/ios_extensions_client.h"
++
++#include <memory>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "content/public/common/isolated_world_ids.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "content/public/renderer/render_frame_observer_tracker.h"
++#include "extensions/renderer/api/core_extensions_renderer_api_provider.h"
++#include "extensions/renderer/extensions_renderer_client.h"
++#include "services/service_manager/public/cpp/binder_registry.h"
++
++namespace web {
++namespace {
++
++class IOSExtensionsRendererClient final
++    : public extensions::ExtensionsRendererClient {
++ public:
++  IOSExtensionsRendererClient() {
++    AddAPIProvider(
++        std::make_unique<extensions::CoreExtensionsRendererAPIProvider>());
++  }
++
++  bool IsIncognitoProcess() const override { return false; }
++
++  int GetLowestIsolatedWorldId() const override {
++    // Keep Content's public injection world IDs separate from extension worlds.
++    return content::ISOLATED_WORLD_ID_MAX + 1;
++  }
++};
++
++class IOSExtensionsRenderFrame final
++    : public content::RenderFrameObserver,
++      public content::RenderFrameObserverTracker<IOSExtensionsRenderFrame> {
++ public:
++  explicit IOSExtensionsRenderFrame(content::RenderFrame* frame)
++      : content::RenderFrameObserver(frame),
++        content::RenderFrameObserverTracker<IOSExtensionsRenderFrame>(frame) {
++    GetIOSExtensionsRendererClient()->RenderFrameCreated(frame, &registry_);
++  }
++
++  void OnInterfaceRequestForFrame(
++      const std::string& interface_name,
++      mojo::ScopedMessagePipeHandle* interface_pipe) override {
++    registry_.TryBindInterface(interface_name, interface_pipe);
++  }
++
++  base::WeakPtr<IOSExtensionsRenderFrame> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++
++  void OnDestruct() override { delete this; }
++
++ private:
++  service_manager::BinderRegistry registry_;
++  base::WeakPtrFactory<IOSExtensionsRenderFrame> weak_factory_{this};
++};
++
++}  // namespace
++
++extensions::ExtensionsRendererClient* GetIOSExtensionsRendererClient() {
++  InitializeIOSExtensionsClient();
++  static base::NoDestructor<IOSExtensionsRendererClient> client;
++  static const bool initialized = [] {
++    extensions::ExtensionsRendererClient::Set(client.get());
++    return true;
++  }();
++  (void)initialized;
++  return client.get();
++}
++
++void InitializeIOSExtensionsRenderFrame(content::RenderFrame* frame) {
++  new IOSExtensionsRenderFrame(frame);
++}
++
++bool RunIOSExtensionScriptsAtDocumentStart(content::RenderFrame* frame) {
++  auto weak_frame = IOSExtensionsRenderFrame::Get(frame)->GetWeakPtr();
++  GetIOSExtensionsRendererClient()->RunScriptsAtDocumentStart(frame);
++  return !!weak_frame;
++}
++
++bool RunIOSExtensionScriptsAtDocumentEnd(content::RenderFrame* frame) {
++  auto weak_frame = IOSExtensionsRenderFrame::Get(frame)->GetWeakPtr();
++  GetIOSExtensionsRendererClient()->RunScriptsAtDocumentEnd(frame);
++  return !!weak_frame;
++}
++
++}  // namespace web
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+--- /dev/null
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -0,0 +1,25 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//extensions/buildflags/buildflags.gni")
++
++assert(enable_extensions_core)
++
++source_set("clients") {
++  sources = [
++    "ios_extensions_client.cc",
++    "ios_extensions_client.h",
++    "ios_extensions_renderer_client.cc",
++  ]
++  public_deps = [
++    "//extensions/common",
++    "//extensions/renderer",
++  ]
++  deps = [
++    "//base",
++    "//extensions/common:core_api_provider",
++    "//services/service_manager/public/cpp",
++    "//url",
++  ]
++}
+

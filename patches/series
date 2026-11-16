@@ -38,3 +38,5 @@
 0046-ios-sideload-google-services-off-by-default.patch
 0047-ios-extensions-guard-renderer-chrome-resources.patch
 0048-ios-extensions-guard-test-support-chrome-buildflags.patch
+0049-ios-extensions-common-renderer-integration.patch
+0050-ios-extensions-platform-feature-gate.patch

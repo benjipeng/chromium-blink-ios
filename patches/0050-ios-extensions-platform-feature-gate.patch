@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] extensions: identify iOS explicitly in feature availability
+
+diff --git a/extensions/common/features/feature.h b/extensions/common/features/feature.h
+--- a/extensions/common/features/feature.h
++++ b/extensions/common/features/feature.h
+@@ -132,6 +132,7 @@
+     MACOSX_PLATFORM,
+     WIN_PLATFORM,
+     DESKTOP_ANDROID_PLATFORM,
++    IOS_PLATFORM,
+   };
+ 
+   // Whether a feature is available in a given situation or not, and if not,
+diff --git a/extensions/common/features/feature.cc b/extensions/common/features/feature.cc
+--- a/extensions/common/features/feature.cc
++++ b/extensions/common/features/feature.cc
+@@ -29,6 +29,8 @@
+   return WIN_PLATFORM;
+ #elif BUILDFLAG(ENABLE_DESKTOP_ANDROID_EXTENSIONS)
+   return DESKTOP_ANDROID_PLATFORM;
++#elif BUILDFLAG(IS_IOS)
++  return IOS_PLATFORM;
+ #else
+   return UNSPECIFIED_PLATFORM;
+ #endif
+diff --git a/tools/json_schema_compiler/feature_compiler.py b/tools/json_schema_compiler/feature_compiler.py
+--- a/tools/json_schema_compiler/feature_compiler.py
++++ b/tools/json_schema_compiler/feature_compiler.py
+@@ -248,6 +248,7 @@
+       'enum_map': {
+         'chromeos': 'Feature::CHROMEOS_PLATFORM',
+         'desktop_android': 'Feature::DESKTOP_ANDROID_PLATFORM',
++        'ios': 'Feature::IOS_PLATFORM',
+         'linux': 'Feature::LINUX_PLATFORM',
+         'mac': 'Feature::MACOSX_PLATFORM',
+         'win': 'Feature::WIN_PLATFORM',
+

@@ -3,7 +3,7 @@ run-name: ${{ inputs.compile_extensions && 'Extension object probe' || 'GN probe
 
 # Prepares the Linux tree exactly as the codegen stage does (scripts/stage.sh),
 # then plans codegen without compiling and audits the stage contract.
-# An opt-in probe compiles three extension objects on Linux, without linking.
+# An opt-in probe compiles core and iOS client objects on Linux, without linking.
 # Both modes compare graphs with a baseline and upload graphs and reports.
 
 on:
@@ -18,9 +18,14 @@ on:
         default: ""
         type: string
       compile_extensions:
-        description: Compile three extensions core C++ objects on Linux after graph checks (no link)
+        description: Compile extension core and iOS client objects after graph checks (no link)
         default: false
         type: boolean
+      comparison_mode:
+        description: Report feature changes, or require identical graphs for a refactor
+        default: report
+        type: choice
+        options: [report, identical]
 
 permissions:
   contents: read
@@ -41,26 +46,33 @@ jobs:
       BASELINE_RUN: ${{ inputs.baseline_run }}
       EXTRA_GN_ARGS: ${{ inputs.extra_gn_args }}
       COMPILE_EXTENSIONS: ${{ inputs.compile_extensions }}
+      GRAPH_COMPARISON_MODE: ${{ inputs.comparison_mode }}
       JOB_TIMEOUT_MIN: 60
-      PERSIST_RESERVE_MIN: 5
+      PERSIST_RESERVE_MIN: 10
     steps:
       - uses: actions/checkout@v5
       - run: ./scripts/stage.sh plan refs
       - name: Record probe identity
+        id: identity
         run: |
           python3 - <<'PY'
           import json
           import os
+          from hashlib import sha256
           from pathlib import Path
 
           fields = (
               "GITHUB_REF", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
               "SRC_REF", "STUB_REF", "EXTRA_GN_ARGS", "COMPILE_EXTENSIONS",
+              "GRAPH_COMPARISON_MODE",
           )
           identity = {field: os.environ.get(field, "") for field in fields}
           report = Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis" / "probe-context.json"
           report.parent.mkdir(parents=True, exist_ok=True)
           report.write_text(json.dumps(identity, indent=2) + "\n")
+          scope = sha256((os.environ["SRC_REF"] + "\n" + os.environ["STUB_REF"]).encode()).hexdigest()[:20]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"cache_scope={scope}\n")
           PY
       - run: ./scripts/stage.sh diagnose init
       - name: Prepare tree (snapshots raw and pruned graphs)
@@ -84,7 +96,7 @@ jobs:
         run: |
           gh run download "$BASELINE_RUN" -R "$GITHUB_REPOSITORY" -n graph-diagnosis -D "$RUNNER_TEMP/baseline"
           comparison_args=()
-          if [ -n "$EXTRA_GN_ARGS" ]; then
+          if [ "$GRAPH_COMPARISON_MODE" = report ]; then
             comparison_args+=(--allow-differences)
           fi
           python3 ./scripts/compare_graphs.py --baseline "$RUNNER_TEMP/baseline" --current "$RUNNER_TEMP/graph-diagnosis" \
@@ -93,8 +105,20 @@ jobs:
           { echo "### Compared with run $BASELINE_RUN"; echo '```text'
             cat "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Compile three extension core objects (Linux)
+      - name: Restore probe compiler cache
         if: inputs.compile_extensions
+        id: probe_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ runner.os }}-extensions-${{ steps.identity.outputs.cache_scope }}-${{ hashFiles('ci/ccache.env') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-extensions-${{ steps.identity.outputs.cache_scope }}-${{ hashFiles('ci/ccache.env') }}-
+
+      - name: Compile extension core and iOS client objects (Linux)
+        if: inputs.compile_extensions
+        env:
+          PROBE_CACHE_RESTORED: ${{ steps.probe_cache.outputs.cache-matched-key != '' }}
         run: ./scripts/stage.sh probe compile
 
       - name: Upload graphs & reports
@@ -105,3 +129,12 @@ jobs:
           path: ${{ runner.temp }}/graph-diagnosis/
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Save compiler progress, including failed probes
+        if: always() && inputs.compile_extensions && env.PROBE_BUILD_STARTED == 'true'
+        continue-on-error: true
+        timeout-minutes: 4
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ steps.probe_cache.outputs.cache-primary-key }}
