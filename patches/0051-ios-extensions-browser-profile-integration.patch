@@ -293,7 +293,7 @@ diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/conten
 +    return;
 +  }
 +  const extensions::Extension* extension =
-+      registry->enabled_extensions().GetByID(principal.GetHost());
++      registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
 +  if (!extension) {
 +    return;
 +  }
@@ -329,7 +329,7 @@ diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/conten
 +      render_frame_host->GetSiteInstance()->GetSecurityPrincipal();
 +  if (principal.SchemeIs(extensions::kExtensionScheme)) {
 +    if (auto* registry = extensions::ExtensionRegistry::Get(context)) {
-+      extension = registry->enabled_extensions().GetByID(principal.GetHost());
++      extension = registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
 +    }
 +  }
 +  client->RegisterBrowserInterfaceBindersForFrame(map, render_frame_host,

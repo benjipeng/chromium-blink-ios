@@ -51,6 +51,17 @@ revision. The failed run saved its compiler cache successfully: 780 hits out of
 785 cacheable calls. The follow-up probe also covers the three content-client
 hooks and three service factory objects before scheduling the full IPA build.
 
+[Run 43972551829](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43972551829)
+then passed metagen and compiled **14 of the 15 selected iOS objects**, including
+all new extension clients, system services, renderer hooks, and service-factory
+lifetime changes. `IOSContentBrowserClient` reported only two explicit-conversion
+errors: `SecurityPrincipal::GetHost()` returns `std::string_view`, while
+`ExtensionSet::GetByID()` takes `ExtensionId` (`std::string`). Both call sites now
+construct the string explicitly. The run restored the prior failed run's cache,
+recorded 785 hits out of 794 cacheable calls, and saved its cache on failure.
+The next validation is the real staged IPA workflow, which also verifies the
+remaining production objects, libraries, resources, and final link.
+
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.
@@ -213,7 +224,7 @@ The first successful run's comparison step did not execute: `compare_graphs.py` 
 
 The graph gate verified exactly these three device C-family objects and no Apple tools in their prerequisite closure. All compilation ran on GitHub; no source checkout or compilation was needed locally. Of 783 cacheable compiler calls, **780 were cache hits (99.62%) and only the three sampled iOS objects were misses**. Ninja executed 3,439 steps, mostly prerequisites; its build budget interval took 4m16s. Total job time was 15m33s, including runner cleanup, source preparation, graph checks, comparison, and report upload.
 
-The probe reads the existing codegen ccache bucket but never writes GHCR checkpoints. Run provenance records the branch, commit, source/SDK digests, GN overrides, and probe mode. The default workflow mode remains graph-only; `compile_extensions=true` explicitly enables the three-object probe.
+The probe reads the existing codegen ccache bucket but never writes GHCR checkpoints. Run provenance records the branch, commit, source/SDK digests, GN overrides, and probe mode. The default workflow mode remains graph-only; at this revision, `compile_extensions=true` enabled the three-object probe, subsequently expanded to 15 objects for embedder integration.
 
 ---
 
