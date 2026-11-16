@@ -47,6 +47,21 @@ ensure_oras() {
 
 ensure_oras
 
+# Retries a registry command. Parallel jobs moving multi-GB layers do see
+# transient resets; content is addressed by digest, so a retry is safe.
+retry() {
+  local attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 4 ]; then
+      echo "error: '$1 $2' failed after $attempt attempts" >&2
+      return 1
+    fi
+    echo "::warning::'$1 $2' failed (attempt $attempt of 4); retrying in $((attempt * 20))s" >&2
+    sleep $((attempt * 20))
+    attempt=$((attempt + 1))
+  done
+}
+
 case "$cmd" in
   setup)
     # Installs oras only (callers log in afterwards).
@@ -56,16 +71,19 @@ case "$cmd" in
   exists|resolve)
     ref="${1:?missing oci_ref}"
     ref="$(echo "$ref" | tr '[:upper:]' '[:lower:]')"
-    if out="$(oras resolve "$ref" 2>&1)"; then
-      [ "$cmd" = "resolve" ] && echo "$out" || echo "exists"
-      exit 0
-    fi
     # Only an explicit "not found" means missing; anything else (auth, rate
-    # limit, network) must not be mistaken for a cache miss.
-    if echo "$out" | grep -qiE '(: |^)not found$|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN'; then
-      echo "missing"
-      exit 1
-    fi
+    # limit, network) is retried, then reported, never taken for a cache miss.
+    for attempt in 1 2 3 4; do
+      if out="$(oras resolve "$ref" 2>&1)"; then
+        [ "$cmd" = "resolve" ] && echo "$out" || echo "exists"
+        exit 0
+      fi
+      if echo "$out" | grep -qiE '(: |^)not found$|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN'; then
+        echo "missing"
+        exit 1
+      fi
+      [ "$attempt" -lt 4 ] && sleep $((attempt * 10))
+    done
     echo "error: cannot query $ref: $out" >&2
     exit 2
     ;;
@@ -117,7 +135,8 @@ case "$cmd" in
         ann_args+=(--annotation "org.opencontainers.image.source=https://github.com/${gh_repo}")
       fi
       echo "==> Pushing ${#layer_args[@]} layer(s) to $ref"
-      oras push "$ref" ${ann_args[@]+"${ann_args[@]}"} "${layer_args[@]}" | tee "$stage/push.log"
+      retry oras push "$ref" ${ann_args[@]+"${ann_args[@]}"} "${layer_args[@]}" > "$stage/push.log"
+      cat "$stage/push.log"
     )
     pushed="$(grep -oE 'sha256:[0-9a-f]{64}' "$stage/push.log" | tail -1)"
     remote="$("$0" resolve "$ref")"
@@ -137,7 +156,7 @@ case "$cmd" in
     trap 'rm -rf "$stage"' EXIT
 
     echo "==> Pulling OCI layers from $ref"
-    oras pull "$ref" -o "$stage"
+    retry oras pull "$ref" -o "$stage"
     echo "==> Streaming and deleting chunks into $dest_dir"
     (
       for p in "$stage"/part_*; do
