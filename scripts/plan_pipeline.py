@@ -29,7 +29,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHARD_COUNT = 18  # Logical partitions. Changing it is a new partitioning: bump the compile epoch.
 
-# Inputs that shape every stage from codegen on.
+# Inputs that shape every stage from codegen on (scripts/stage.sh holds only
+# the helpers several stages share).
 COMMON = [
     "patches",
     "args",
@@ -43,12 +44,13 @@ COMMON = [
     "scripts/rewrite_ninja_graph.py",
     "scripts/plan_shards.py",
 ]
+# Each stage's own logic: changing it re-keys that stage and the ones after it.
 STAGE_FILES = {
-    "codegen": [],
-    "apple": ["scripts/bootstrap_macos_host_tools.sh"],
-    "compile": ["scripts/shard_artifact.py"],
-    "link": ["scripts/shard_artifact.py"],
-    "package": ["scripts/package_ipa.sh"],
+    "codegen": ["scripts/stages/codegen.sh"],
+    "apple": ["scripts/stages/apple.sh", "scripts/bootstrap_macos_host_tools.sh"],
+    "compile": ["scripts/stages/compile.sh", "scripts/shard_artifact.py"],
+    "link": ["scripts/stages/link.sh", "scripts/shard_artifact.py"],
+    "package": ["scripts/stages/package.sh", "scripts/package_ipa.sh"],
 }
 # Never part of a key: transport, reporting, budgets, audits, and the producers
 # of the source/SDK artifacts (which enter keys by digest instead).
@@ -66,6 +68,7 @@ NON_OUTPUT = {
     "scripts/resolve_pin.py",
     "scripts/run_with_budget.py",
     "scripts/sparse_checkout.conf",
+    "scripts/stages/sdk.sh",  # the SDK enters keys by digest
     "scripts/sync_pruned_source.sh",
     "scripts/write_job_summary.py",
 }
@@ -73,7 +76,7 @@ NON_OUTPUT = {
 
 def check_classification() -> None:
     keyed = set(COMMON) | {f for files in STAGE_FILES.values() for f in files}
-    on_disk = {p.relative_to(ROOT).as_posix() for d in ("scripts", "ci") for p in (ROOT / d).iterdir()
+    on_disk = {p.relative_to(ROOT).as_posix() for d in ("scripts", "scripts/stages", "ci") for p in (ROOT / d).iterdir()
                if p.is_file() and p.name != "__pycache__" and not p.name.endswith(".pyc")}
     unclassified = sorted(on_disk - keyed - NON_OUTPUT)
     stale = sorted((keyed | NON_OUTPUT) - on_disk - {"patches", "args"})

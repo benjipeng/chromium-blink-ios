@@ -13,8 +13,10 @@
 #   diagnose (Linux)  graph only, for graph-diagnose.yml
 #
 # Steps: check | init | prepare | build | persist | persist-cache | run.
-# The workflow passes refs and identities through the environment (see
-# build-ipa.yml); this script decides everything that shapes the outputs.
+# This file holds what several stages share; each stage's own logic lives in
+# scripts/stages/<stage>.sh, so a fix there re-keys only that stage and the
+# ones after it. The workflow passes refs and identities through the
+# environment (see build-ipa.yml).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -211,120 +213,23 @@ dry_run_summary() {
            END { for (k in n) printf "%7d  %s\n", n[k], k }' | sort -rn
 }
 
-# --- Stages ---------------------------------------------------------------------
-
-sdk_run() {
-  init_mac
-  mkdir -p "$STATE/stub_out"
-  "$SCRIPTS/extract_xcode_stub.sh" --output-encrypted "$STATE/stub_out/xcode_stub.tar.zst.enc"
-  oci push "${STUB_TAG:?}" "$STATE/stub_out" xcode_stub.tar.zst.enc --repo "$GITHUB_REPOSITORY" --once
+# Lines of a dry_run_summary that redo work restored from earlier stages:
+# C-family or Rust compiles anywhere, or any host-toolchain step but a stamp.
+restored_work() {
+  awk '$2 ~ /^(CC|CXX|OBJC|OBJCXX|ASM|CXX_MODULE|RUST)/ || ($3 ~ /^clang_/ && $2 != "STAMP")' "$1"
 }
 
-codegen_prepare() {
-  prepare_linux codegen
-  ccache_env
-  pull_bucket "$CCACHE_REPO:$CHROMIUM_REV-codegen" || log "No codegen ccache bucket yet"
-  "$SCRIPTS/check_inputs.py" --ninja "$NINJA" --out-dir "$LOUT" --targets chrome
-  "$SCRIPTS/plan_shards.py" --ninja "$NINJA" --out-dir "$LOUT" --mode codegen > "$STATE/targets.txt"
-  log "Planned $(wc -l < "$STATE/targets.txt") codegen targets"
-  # Contract gate: no target compile/link/Swift or Apple tools, and every
-  # generated input of the Apple edges planned. Fails before compiling.
-  "$SCRIPTS/diagnose_graph.py" --out-dir "$LOUT" --roots-file "$STATE/targets.txt" \
-    --report "$STATE/plan_audit.txt" --expect gen/ios/chrome/browser/shared/ui/buildflags.h --check
-  dry_run_summary "$STATE/targets.txt" | tee "$STATE/closure.txt"
-  { echo "### Codegen closure"; echo '```text'; cat "$STATE/closure.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+# Prints ninja's first reasons for considering targets dirty.
+explain_dirty() {
+  log "Why ninja would rebuild (first 40 entries of -d explain):"
+  "$NINJA" -C "$LOUT" -n -d explain "$@" 2>&1 | grep -m 40 '^ninja explain:' || true
 }
 
-codegen_build() {
-  ccache_env
-  export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  # Codegen runs no Apple tool; an empty replay cache makes any attempt fail.
-  export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$STATE/no_apple_outputs"
-  mkdir -p "$APPLE_TOOL_CACHE_DIR"
-  ccache -z >/dev/null
-  local rc=0
-  build_targets "$STATE/targets.txt" || rc=$?
-  [ "$rc" -ne 124 ] || fail "Codegen exceeded its build budget; progress is kept in the ccache bucket"
-  [ "$rc" -eq 0 ] || fail "Codegen failed (see FAILED blocks above)"
-  tr '\n' '\0' < "$STATE/targets.txt" | xargs -0 -r -s 1048576 "$NINJA" -C "$LOUT" -n > "$STATE/pending.txt"
-  local pending
-  pending="$(grep -c '^\[' "$STATE/pending.txt" || true)"
-  [ "$pending" -eq 0 ] || fail "Codegen left $pending planned edge(s) unbuilt"
-  ccache -s
-}
-
-codegen_persist() {
-  mkdir -p "$STATE/codegen_out"
-  (
-    cd "$LOUT"
-    items=(gen .ninja_deps .ninja_log)
-    for d in obj local_rustc_sysroot clang_x64*; do [ -d "$d" ] && items+=("$d"); done
-    # Planned outputs outside those trees (e.g. Apple tool inputs).
-    while IFS= read -r t; do
-      case "$t" in gen/*|obj/*|clang_x64*|local_rustc_sysroot/*) continue ;; esac
-      [ -e "$t" ] && items+=("$t")
-    done < "$STATE/targets.txt"
-    tar -cf - "${items[@]}" | zstd -T0 -4 -o "$STATE/codegen_out/codegen_gen.tar.zst"
-  )
-  rm -rf "$LWORK" || echo "::warning::Work tree not fully removed; continuing"
-  oci push "${CODEGEN_REF:?}" "$STATE/codegen_out" codegen_gen.tar.zst --repo "$GITHUB_REPOSITORY" --once
-}
+# --- Shared by several stages ----------------------------------------------------
 
 MWORK="${RUNNER_TEMP}/work"
+# shellcheck disable=SC2034  # used by stages/apple.sh and stages/package.sh
 MOUT="$MWORK/src/out/Release"
-
-apple_prepare() {
-  mkdir -p "$MWORK"
-  log "Pulling source snapshot and codegen tree"
-  oci pull "${SRC_REF:?}" "$MWORK"
-  pull_pinned "${CODEGEN_REF:?}" "$STATE/codegen"
-  "$SCRIPTS/bootstrap_macos_host_tools.sh" --work-dir "$MWORK"
-  "$SCRIPTS/apply_patches.sh" --src-dir "$MWORK/src"
-  install_wrapper "$MWORK/src"
-  write_args mac "$MOUT"
-  # Linux codegen's tree minus host binaries and Linux ninja state, extracted
-  # before gn gen. GNU tar stores Chromium's hard-linked copies as links (e.g.
-  # icudtl.dat -> clang_x64/icudtl.dat); links into the excluded host trees
-  # cannot resolve here and are skipped. The input check below still fails if
-  # an Apple edge needed one of them.
-  local err="$STATE/codegen_tar.err"
-  if ! zstd -dc "$STATE/codegen/codegen_gen.tar.zst" | tar -C "$MOUT" \
-      --exclude 'clang_x64*' --exclude 'local_rustc_sysroot' \
-      --exclude '.ninja_log' --exclude '.ninja_deps' --exclude '*.ninja' -xf - 2> "$err"; then
-    if grep -vE "Hard-link target '(clang_x64|local_rustc_sysroot)|Error exit delayed" "$err"; then
-      fail "Unexpected errors while extracting the codegen tree"
-    fi
-  fi
-  log "Skipped $(grep -c 'Hard-link target' "$err" || true) hard links into excluded host trees"
-  rm -rf "$STATE/codegen"
-  export PATH="$MWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  (cd "$MWORK/src" && "$MWORK/src/buildtools/mac/gn" gen out/Release)
-  # Plan on the full graph, then reduce it to the Apple edges (which also
-  # verifies every generated input they read came from codegen).
-  "$SCRIPTS/plan_shards.py" --ninja "$MWORK/src/third_party/ninja/ninja" --out-dir "$MOUT" \
-    --mode apple-prebuild > "$STATE/apple_targets.txt"
-  log "Planned $(wc -l < "$STATE/apple_targets.txt") Apple targets"
-  "$SCRIPTS/rewrite_ninja_graph.py" --out-dir "$MOUT" --mode apple-only
-  "$SCRIPTS/check_inputs.py" --ninja "$MWORK/src/third_party/ninja/ninja" --out-dir "$MOUT" \
-    --targets-file "$STATE/apple_targets.txt"
-}
-
-apple_build() {
-  export PATH="$MWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  export APPLE_TOOL_MODE=record APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-  mkdir -p "$APPLE_TOOL_CACHE_DIR"
-  [ -s "$STATE/apple_targets.txt" ] || fail "No Apple targets planned"
-  "$SCRIPTS/run_with_budget.py" --deadline-epoch "$(build_deadline)" --log "$STATE/ninja.log" -- \
-    bash -c 'tr "\n" "\0" < "$0" | xargs -0 "$1" -C "$2" -k 0' \
-    "$STATE/apple_targets.txt" "$MWORK/src/third_party/ninja/ninja" "$MOUT"
-}
-
-apple_persist() {
-  mkdir -p "$STATE/apple_out"
-  tar -C "$RUNNER_TEMP" -cf - apple_tool_cache | zstd -T0 -5 -o "$STATE/apple_out/apple_tool_cache.tar.zst"
-  rm -rf "$MWORK" || true
-  oci push "${APPLE_REF:?}" "$STATE/apple_out" apple_tool_cache.tar.zst --repo "$GITHUB_REPOSITORY" --once
-}
 
 shard_ref() { echo "${COMPILE_PREFIX:?}-${SHARD_INDEX:?}"; }
 shard_identity() { printf '{"key":"%s","shard":%s,"shards":%s}' "${COMPILE_PREFIX##*:}" "$1" "${SHARD_COUNT:?}"; }
@@ -334,138 +239,31 @@ plan_shard() {
     --shard-count "$1" --shard-index "$2" "${@:3}"
 }
 
-compile_prepare() {
-  prepare_linux compile
-  ccache_env
-  if ! pull_bucket "$CCACHE_REPO:$CHROMIUM_REV-shard-$SHARD_INDEX"; then
-    # First run of this partition: seed from codegen's bucket, back-dated so
-    # entries this shard never touches are evicted before its bucket is pushed.
-    if pull_bucket "$CCACHE_REPO:$CHROMIUM_REV-codegen"; then
-      find "$CCACHE_DIR" -type f -exec touch -t 200001010000 {} +
-      touch "$STATE/ccache_seeded"
-    fi
-  fi
-  plan_shard "$SHARD_COUNT" "$SHARD_INDEX" > "$STATE/targets.txt"
-  log "Planned $(wc -l < "$STATE/targets.txt") objects for shard $SHARD_INDEX of $SHARD_COUNT"
-}
-
-compile_build() {
-  ccache_env
-  export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-  ccache -z >/dev/null
-  local rc=0
-  build_targets "$STATE/targets.txt" || rc=$?
-  ccache -s || true
-  [ "$rc" -ne 124 ] || fail "Shard $SHARD_INDEX exceeded its build budget; progress is kept in the ccache bucket"
-  [ "$rc" -eq 0 ] || fail "Shard $SHARD_INDEX failed (see FAILED blocks above)"
-  inject shard-before-commit
-}
-
-compile_persist() {
-  "$SCRIPTS/shard_artifact.py" pack --out-dir "$LOUT" --targets "$STATE/targets.txt" \
-    --dest "$STATE/shard_out" --identity "$(shard_identity "$SHARD_INDEX")"
-  oci push "$(shard_ref)" "$STATE/shard_out" objects.tar manifest.json --repo "$GITHUB_REPOSITORY" --once
-  inject shard-after-commit
-}
-
-compile_persist_cache() {
-  rm -rf "$LWORK" || echo "::warning::Work tree not fully removed; continuing"
-  if [ -f "$STATE/ccache_seeded" ]; then
-    ccache_env
-    ccache --evict-older-than 1d
-  fi
-  push_bucket "$CCACHE_REPO:$CHROMIUM_REV-shard-$SHARD_INDEX"
-}
-
-# Imports every partition's verified objects, replaces exactly their compile
-# edges, and proves the remaining plan compiles nothing.
-link_prepare() {
-  prepare_linux link
-  # Today's plan for every partition, from this job's own graph.
-  plan_shard "$SHARD_COUNT" 0 --split-dir "$STATE/plan" >/dev/null
-  : > "$STATE/imported.txt"
-  local i
-  for (( i = 0; i < SHARD_COUNT; i++ )); do
-    pull_pinned "${COMPILE_PREFIX:?}-$i" "$STATE/shard"
-    tar -C "$LOUT" -xf "$STATE/shard/objects.tar"
-    "$SCRIPTS/shard_artifact.py" verify --out-dir "$LOUT" --targets "$STATE/plan/shard-$i.txt" \
-      --manifest "$STATE/shard/manifest.json" --identity "$(shard_identity "$i")"
-    cat "$STATE/plan/shard-$i.txt" >> "$STATE/imported.txt"
-    rm -rf "$STATE/shard"
-  done
-  sort "$STATE/imported.txt" | diff -q - <(sort "$STATE/plan/all.txt") >/dev/null \
-    || fail "Imported objects do not cover the link closure exactly"
-  "$SCRIPTS/rewrite_ninja_graph.py" --out-dir "$LOUT" --mode link-only --imported-file "$STATE/imported.txt"
-  dry_run_summary "" chrome | tee "$STATE/link_plan.txt"
-  if grep -qE ' (CXX|CC|OBJC|OBJCXX|ASM) ' "$STATE/link_plan.txt"; then
-    fail "The link plan still compiles objects (see above)"
-  fi
-  inject link
-  "$SCRIPTS/reclaim_disk_linux.sh" --swap-only 16
-}
-
-link_build() {
-  export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-  "$SCRIPTS/run_with_budget.py" --deadline-epoch "$(build_deadline)" --log "$STATE/ninja.log" -- \
-    "$NINJA" -C "$LOUT" chrome
-}
-
-link_persist() {
-  "$SCRIPTS/reclaim_disk_linux.sh" --drop-swap
-  mkdir -p "$STATE/app" "$STATE/link_out"
-  mv "$LOUT/Chromium.app" "$STATE/app/Chromium.app"
-  [ -d "$LOUT/.deferred_extract_metadata" ] && mv "$LOUT/.deferred_extract_metadata" "$STATE/app/"
-  tar -C "$STATE/app" -cf - . | zstd -T0 -5 -o "$STATE/link_out/chromium_app_unsigned.tar.zst"
-  rm -rf "$LWORK" "$STATE/app" || echo "::warning::Work tree not fully removed; continuing"
-  oci push "${LINK_REF:?}" "$STATE/link_out" chromium_app_unsigned.tar.zst --repo "$GITHUB_REPOSITORY" --once
-}
-
-package_run() {
-  init_mac
-  mkdir -p "$MOUT"
-  pull_pinned "${LINK_REF:?}" "$STATE/link"
-  zstd -dc "$STATE/link/chromium_app_unsigned.tar.zst" | tar -C "$MOUT" -xf -
-  rm -rf "$STATE/link"
-  local extra=()
-  [ "${WITH_APP_GROUPS:-false}" = "true" ] && extra+=(--with-app-groups)
-  mkdir -p "$GITHUB_WORKSPACE/dist"
-  "$SCRIPTS/package_ipa.sh" --src-dir "$MWORK/src" --out-rel out/Release \
-    --output-ipa "$GITHUB_WORKSPACE/dist/Chromium-Blink-${CHROMIUM_VERSION}-arm64.ipa" ${extra[@]+"${extra[@]}"}
-}
-
 # --- Dispatch -------------------------------------------------------------------
 
-case "$stage:$step" in
-  plan:preflight)          oras_login; "$SCRIPTS/plan_pipeline.py" preflight ;;
-  plan:run)                oras_login; "$SCRIPTS/plan_pipeline.py" plan --with-app-groups "${WITH_APP_GROUPS:-false}" ;;
-  plan:refs)               oras_login; "$SCRIPTS/plan_pipeline.py" refs | tee -a "$GITHUB_ENV" ;;
-  sdk:run)                 sdk_run ;;
-  codegen:check)           check_done "${CODEGEN_REF:?}" ;;
-  codegen:init)            init_linux ;;
-  codegen:prepare)         codegen_prepare ;;
-  codegen:build)           codegen_build ;;
-  codegen:persist)         codegen_persist ;;
-  codegen:persist-cache)   rm -rf "$LWORK" || true; push_bucket "$CCACHE_REPO:$CHROMIUM_REV-codegen" ;;
-  apple:check)             check_done "${APPLE_REF:?}" ;;
-  apple:init)              init_mac ;;
-  apple:prepare)           apple_prepare ;;
-  apple:build)             apple_build ;;
-  apple:persist)           apple_persist ;;
-  compile:check)           check_done "$(shard_ref)" ;;
-  compile:init)            init_linux ;;
-  compile:prepare)         compile_prepare ;;
-  compile:build)           compile_build ;;
-  compile:persist)         compile_persist ;;
-  compile:persist-cache)   compile_persist_cache ;;
-  link:check)              check_done "${LINK_REF:?}" ;;
-  link:init)               init_linux ;;
-  link:prepare)            link_prepare ;;
-  link:build)              link_build ;;
-  link:persist)            link_persist ;;
-  package:run)             package_run ;;
-  diagnose:init)           init_linux ;;
-  diagnose:prepare)        prepare_linux diagnose ;;
-  *) echo "error: unknown stage/step '$stage $step'" >&2; exit 2 ;;
+case "$stage" in
+  plan)
+    oras_login
+    case "$step" in
+      preflight) "$SCRIPTS/plan_pipeline.py" preflight ;;
+      run)       "$SCRIPTS/plan_pipeline.py" plan --with-app-groups "${WITH_APP_GROUPS:-false}" ;;
+      refs)      "$SCRIPTS/plan_pipeline.py" refs | tee -a "$GITHUB_ENV" ;;
+      *) echo "error: unknown plan step '$step'" >&2; exit 2 ;;
+    esac
+    ;;
+  diagnose)
+    case "$step" in
+      init)    init_linux ;;
+      prepare) prepare_linux diagnose ;;
+      *) echo "error: unknown diagnose step '$step'" >&2; exit 2 ;;
+    esac
+    ;;
+  sdk|codegen|apple|compile|link|package)
+    # shellcheck source=/dev/null
+    source "$SCRIPTS/stages/$stage.sh"
+    fn="${stage}_${step//-/_}"
+    declare -F "$fn" >/dev/null || { echo "error: unknown step '$stage $step'" >&2; exit 2; }
+    "$fn"
+    ;;
+  *) echo "error: unknown stage '$stage'" >&2; exit 2 ;;
 esac

@@ -65,6 +65,7 @@ Each stage (and each compile partition) publishes one **write-once** checkpoint 
 | `scripts/apple_tool_wrapper.py` | Record/replay wrapper for `//build/toolchain/apple/apple_tool_wrapper.gni` |
 | `ci/` | Stage epochs, per-host GN args, `ccache` settings |
 | `scripts/stage.sh` | The one driver every job calls: `./scripts/stage.sh <stage> <step>` |
+| `scripts/stages/<stage>.sh` | Each stage's own steps; editing one re-keys only that stage and the ones after it |
 | `scripts/plan_pipeline.py` | Keys, checkpoint probes, and the run plan (missing compile partitions only) |
 | `scripts/ninja_graph.py` | Ninja graph model and the stage contract (what each stage may run) |
 | `scripts/plan_shards.py` | Target lists: `codegen`, `apple-prebuild`, `c-shard` partitions |
