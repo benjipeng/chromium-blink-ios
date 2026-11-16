@@ -7,7 +7,11 @@ the whole group gets SIGINT (ninja stops scheduling and reaps its children),
 then SIGKILL after a grace period, and the script returns 124 only after every
 process has exited. Output is streamed to stdout and to a log file.
 
-usage: run_with_budget.py <minutes> <log> -- <command> [args...]
+usage: run_with_budget.py [--minutes M] [--deadline-epoch E] --log FILE -- <command> [args...]
+
+The command stops at whichever comes first: M minutes from now, or the
+absolute deadline E (seconds since the epoch), which callers derive from the
+job's start, its timeout, and the time persisting needs afterwards.
 """
 
 from __future__ import annotations
@@ -32,14 +36,29 @@ def signal_group(pgid: int, sig: int) -> bool:
 
 
 def main() -> int:
-    if len(sys.argv) < 4:
+    argv = sys.argv[1:]
+    if "--" not in argv:
         print(__doc__, file=sys.stderr)
         return 2
-    budget = float(sys.argv[1]) * 60
-    log_path = sys.argv[2]
-    cmd = sys.argv[3:]
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
+    split = argv.index("--")
+    opts, cmd = argv[:split], argv[split + 1 :]
+    budget = float("inf")
+    log_path = ""
+    for i in range(0, len(opts) - 1, 2):
+        key, value = opts[i], opts[i + 1]
+        if key == "--minutes":
+            budget = min(budget, float(value) * 60)
+        elif key == "--deadline-epoch":
+            budget = min(budget, float(value) - time.time())
+        elif key == "--log":
+            log_path = value
+    if not cmd or not log_path or budget == float("inf"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if budget <= 0:
+        print("::error::No build time left before the job deadline", flush=True)
+        return 124
+    print(f"==> Build budget: {budget / 60:.0f} min", flush=True)
 
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
@@ -57,7 +76,7 @@ def main() -> int:
         try:
             proc.wait(timeout=budget)
         except subprocess.TimeoutExpired:
-            print(f"::warning::Build budget of {sys.argv[1]} min exhausted; stopping to persist progress",
+            print(f"::warning::Build budget of {budget / 60:.0f} min exhausted; stopping to persist progress",
                   flush=True)
             signal_group(proc.pid, signal.SIGINT)
             try:

@@ -10,9 +10,13 @@ shift || true
 usage() {
   cat >&2 <<EOF
 usage:
-  $0 exists <oci_ref>
-  $0 push   <oci_ref> <source_dir> <subpaths...> --repo <owner/repo>
-  $0 pull   <oci_ref> <dest_dir>
+  $0 setup                    install oras
+  $0 exists  <oci_ref>        exit 0 = exists, 1 = not found, 2 = registry/auth/network error
+  $0 resolve <oci_ref>        print the manifest digest; exits like 'exists'
+  $0 push    <oci_ref> <source_dir> <subpaths...> --repo <owner/repo> [--once]
+             --once: never overwrite; if the tag already exists, keep it and exit 0
+             After pushing, the remote digest is verified against the pushed one.
+  $0 pull    <oci_ref|repo@digest> <dest_dir>
 EOF
   exit 1
 }
@@ -44,16 +48,26 @@ ensure_oras() {
 ensure_oras
 
 case "$cmd" in
-  exists)
+  setup)
+    # Installs oras only (callers log in afterwards).
+    exit 0
+    ;;
+
+  exists|resolve)
     ref="${1:?missing oci_ref}"
     ref="$(echo "$ref" | tr '[:upper:]' '[:lower:]')"
-    if oras manifest fetch "$ref" >/dev/null 2>&1; then
-      echo "exists"
+    if out="$(oras resolve "$ref" 2>&1)"; then
+      [ "$cmd" = "resolve" ] && echo "$out" || echo "exists"
       exit 0
-    else
+    fi
+    # Only an explicit "not found" means missing; anything else (auth, rate
+    # limit, network) must not be mistaken for a cache miss.
+    if echo "$out" | grep -qiE '(: |^)not found$|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN'; then
       echo "missing"
       exit 1
     fi
+    echo "error: cannot query $ref: $out" >&2
+    exit 2
     ;;
 
   push)
@@ -62,14 +76,27 @@ case "$cmd" in
     shift 2
     ref="$(echo "$ref" | tr '[:upper:]' '[:lower:]')"
     gh_repo=""
+    once=0
     items=()
     while [ $# -gt 0 ]; do
       case "$1" in
         --repo) gh_repo="${2:?missing repo}"; shift 2 ;;
+        --once) once=1; shift ;;
         *) items+=("$1"); shift ;;
       esac
     done
     [ "${#items[@]}" -gt 0 ] || usage
+
+    if [ "$once" -eq 1 ]; then
+      state=0
+      existing="$("$0" resolve "$ref")" || state=$?
+      if [ "$state" -eq 0 ]; then
+        echo "==> $ref already exists ($existing); keeping it (completion tags are write-once)"
+        exit 0
+      elif [ "$state" -ne 1 ]; then
+        exit "$state"
+      fi
+    fi
 
     stage="$(mktemp -d)"
     trap 'rm -rf "$stage"' EXIT
@@ -90,8 +117,15 @@ case "$cmd" in
         ann_args+=(--annotation "org.opencontainers.image.source=https://github.com/${gh_repo}")
       fi
       echo "==> Pushing ${#layer_args[@]} layer(s) to $ref"
-      oras push "$ref" "${ann_args[@]}" "${layer_args[@]}"
+      oras push "$ref" ${ann_args[@]+"${ann_args[@]}"} "${layer_args[@]}" | tee "$stage/push.log"
     )
+    pushed="$(grep -oE 'sha256:[0-9a-f]{64}' "$stage/push.log" | tail -1)"
+    remote="$("$0" resolve "$ref")"
+    if [ -z "$pushed" ] || [ "$pushed" != "$remote" ]; then
+      echo "error: $ref resolves to '$remote', expected pushed digest '$pushed'" >&2
+      exit 1
+    fi
+    echo "==> Verified $ref -> $remote"
     ;;
 
   pull)

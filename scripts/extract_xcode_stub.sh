@@ -31,11 +31,15 @@ done
 [ -n "$out_enc" ] || { echo "usage: $0 --output-encrypted <file.tar.zst.enc> [--staging-dir <dir>]" >&2; exit 1; }
 [ -n "${CI_ARTIFACT_KEY:-}" ] || { echo "error: CI_ARTIFACT_KEY must be set in environment" >&2; exit 1; }
 
-xcode_root="$XCODE_APP"
-if [ ! -d "$xcode_root" ]; then
-  xcode_root="/Applications/Xcode.app"
-fi
+# The stub must come from exactly the pinned Xcode build; never fall back to
+# whatever /Applications/Xcode.app happens to be.
+xcode_root="${XCODE_ROOT:-$XCODE_APP}"
 [ -d "$xcode_root/Contents/Developer" ] || { echo "error: Xcode not found at $xcode_root" >&2; exit 1; }
+actual_build="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$xcode_root/Contents/version.plist")"
+if [ "$actual_build" != "$XCODE_BUILD" ]; then
+  echo "error: $xcode_root is Xcode build $actual_build, expected $XCODE_BUILD" >&2
+  exit 1
+fi
 
 cleanup_staging=0
 if [ -z "$plain_dir" ]; then
