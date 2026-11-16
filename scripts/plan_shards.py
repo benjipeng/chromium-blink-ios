@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import pathlib
 import re
@@ -141,6 +142,92 @@ def unquote_ninja_path(raw: str) -> str:
     return raw
 
 
+def _arg_chunks(items: list[str], limit: int = 256 * 1024) -> list[list[str]]:
+    chunks: list[list[str]] = [[]]
+    size = 0
+    for item in items:
+        if chunks[-1] and size + len(item) + 1 > limit:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(item)
+        size += len(item) + 1
+    return [c for c in chunks if c]
+
+
+_PHONY_INPUTS: dict[str, dict[str, list[str]]] = {}
+
+
+def load_phony_inputs(out_dir: pathlib.Path) -> dict[str, list[str]]:
+    """Maps every phony output to its direct inputs, read from the Ninja files.
+
+    Parsed directly rather than via `ninja -t query`, which also prints every
+    consumer of each node and would emit gigabytes on Chromium's graph.
+    """
+    cached = _PHONY_INPUTS.get(str(out_dir))
+    if cached is not None:
+        return cached
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import rewrite_ninja_graph as rng
+
+    result: dict[str, list[str]] = {}
+    queue = collections.deque([out_dir / "build.ninja"])
+    seen: set[pathlib.Path] = set()
+    while queue:
+        path = queue.popleft()
+        if path in seen:
+            continue
+        seen.add(path)
+        raw = path.read_text(encoding="utf-8").splitlines()
+        i, n = 0, len(raw)
+        while i < n:
+            logical = raw[i]
+            while rng._continues(logical) and i + 1 < n:
+                i += 1
+                logical = logical[:-1] + raw[i].lstrip(" ")
+            i += 1
+            if logical.startswith("build ") and ": phony" in logical:
+                edge = rng.Edge(0, 0, 0)
+                rng.parse_build(edge, logical[len("build ") :])
+                if edge.rule == "phony":
+                    deps = [rng.unescape(d) for d in edge.ins + edge.iins + edge.oins]
+                    for out in edge.outs + edge.iouts:
+                        result[rng.unescape(out)] = deps
+            elif logical.startswith(("subninja ", "include ")):
+                queue.append(out_dir / rng.unescape(logical.split(" ", 1)[1].strip()))
+    _PHONY_INPUTS[str(out_dir)] = result
+    return result
+
+
+def collect_closure(
+    ninja_bin: str,
+    out_dir: pathlib.Path,
+    roots: list[str],
+) -> list[str]:
+    """Returns every node the roots transitively depend on.
+
+    Ninja 1.12's `-t inputs` walks phony edges but never prints their direct
+    inputs. GN routes hard deps through phonies (`*.harddeps`), so header-only
+    generators such as buildflag headers would otherwise vanish from the
+    closure. Direct inputs of every reachable phony are added back here.
+    """
+    closure: set[str] = set()
+    for chunk in _arg_chunks(roots):
+        closure.update(unquote_ninja_path(x) for x in run_ninja_tool(ninja_bin, out_dir, "inputs", *chunk))
+    phony_inputs = load_phony_inputs(out_dir)
+    stack = [n for n in (*roots, *closure) if n in phony_inputs]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for dep in phony_inputs[node]:
+            closure.add(dep)
+            if dep in phony_inputs and dep not in seen:
+                stack.append(dep)
+    return sorted(closure)
+
+
 def collect_codegen_targets(
     ninja_bin: str,
     out_dir: pathlib.Path,
@@ -148,10 +235,7 @@ def collect_codegen_targets(
     declared: dict[str, str],
 ) -> list[str]:
     """Selects strictly transitive `chrome` inputs that produce `gen/**`, host tools, or Rust libs."""
-    closure = [
-        unquote_ninja_path(x)
-        for x in run_ninja_tool(ninja_bin, out_dir, "inputs", root_target)
-    ]
+    closure = collect_closure(ninja_bin, out_dir, [root_target])
     selected: list[str] = []
     seen: set[str] = set()
     skip_rules = {"phony", "stamp", "swift", "compile_xcassets"}
@@ -196,14 +280,8 @@ def collect_apple_input_targets(
     """
     if not apple_targets:
         return []
-    closure: set[str] = set()
-    for i in range(0, len(apple_targets), 500):
-        closure.update(
-            unquote_ninja_path(x)
-            for x in run_ninja_tool(ninja_bin, out_dir, "inputs", *apple_targets[i : i + 500])
-        )
     selected: list[str] = []
-    for item in sorted(closure):
+    for item in collect_closure(ninja_bin, out_dir, apple_targets):
         rule = declared.get(item)
         if not rule or rule in ("phony", "stamp") or rule.endswith("_stamp"):
             continue

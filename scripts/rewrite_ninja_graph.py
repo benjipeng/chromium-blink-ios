@@ -19,9 +19,12 @@ Modes:
               and an action keeps any dropped node whose path appears in its
               command (it reads that file).
   apple-only  Turns every edge that does not run `apple_tool_wrapper` into an
-              input-less phony, so `ninja <apple outputs>` executes exactly the
+              input-less phony, except phony/stamp groups, which keep their
+              inputs (as phonies) so Apple edges stay ordered among
+              themselves. `ninja <apple outputs>` then executes exactly the
               Swift / xcassets / ibtool / intents steps against a pre-populated
-              gen/ tree (used on macOS with Linux codegen outputs).
+              gen/ tree (used on macOS with Linux codegen outputs), after
+              reporting any generated input that tree lacks.
 
 The rewrite is deterministic and idempotent; every stage applies it right after
 `gn gen` so all stages agree on the same graph.
@@ -125,12 +128,14 @@ def parse_build(edge: Edge, body: str) -> None:
             section.append(t)
 
 
-def render_build(edge: Edge, ins: list[str], iins: list[str], oins: list[str], vins: list[str]) -> str:
+def render_build(
+    edge: Edge, ins: list[str], iins: list[str], oins: list[str], vins: list[str], rule: str | None = None
+) -> str:
     parts = ["build", *edge.outs]
     if edge.iouts:
         parts += ["|", *edge.iouts]
     head = " ".join(parts) + ":"
-    tail = [edge.rule, *ins]
+    tail = [rule or edge.rule, *ins]
     if iins:
         tail += ["|", *iins]
     if oins:
@@ -320,18 +325,70 @@ def prune(graph: Graph) -> dict[int, dict[int, tuple[int, str]]]:
 
 def apple_only(graph: Graph) -> dict[int, dict[int, tuple[int, str]]]:
     replacements: dict[int, dict[int, tuple[int, str]]] = collections.defaultdict(dict)
-    apple = 0
+    apple = grouping = 0
     for e in graph.edges:
         if graph.is_apple(e):
             apple += 1
             continue
-        if e.rule == "phony" and not (e.ins or e.iins or e.oins) and not e.binds:
-            continue
-        outs = " ".join(e.outs + e.iouts)
         bind_lines = e.binds.count("\n")
+        outs = " ".join(e.outs + e.iouts)
+        if e.rule == "phony" or _STAMP_RE.match(e.rule):
+            # Groups carry the ordering between Apple edges (a Swift module
+            # waits on its Swift deps through their target phonies), so they
+            # keep every input and merely stop touching stamp files.
+            grouping += 1
+            if e.rule != "phony" or e.binds:
+                text = render_build(e, e.ins, e.iins, e.oins, e.vins, rule="phony")
+                replacements[e.file][e.start] = (e.end + bind_lines, text)
+            continue
         replacements[e.file][e.start] = (e.end + bind_lines, f"build {outs}: phony\n")
-    print(f"==> apple-only: kept {apple} Apple tool edge(s); all other edges are input-less phonies")
+    print(
+        f"==> apple-only: kept {apple} Apple tool edge(s) and {grouping} grouping edge(s); "
+        "all other edges are input-less phonies"
+    )
+    report_missing_generated(graph)
     return replacements
+
+
+def report_missing_generated(graph: Graph) -> None:
+    """Lists generator outputs the Apple edges reach that are not on disk.
+
+    Those come from Linux codegen; a gap here otherwise surfaces as a puzzling
+    'file not found' deep inside swiftc or actool.
+    """
+    edges, producer = graph.edges, graph.producer
+    stack = [d for e in edges if graph.is_apple(e) for d in e.ins + e.iins + e.oins]
+    seen: set[str] = set()
+    missing: list[str] = []
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        idx = producer.get(node)
+        if idx is None:
+            continue
+        e = edges[idx]
+        rule = e.rule
+        if rule == "phony" or _STAMP_RE.match(rule):
+            stack.extend(e.ins + e.iins + e.oins)
+            continue
+        if graph.is_apple(e):
+            continue
+        builtin = not rule.startswith("__")
+        if builtin and (_COMPILE_RE.match(rule) or _UNTOUCHED_RE.match(rule) or rule.endswith("rust_rlib")):
+            continue  # Objects and binaries come from the Linux shards.
+        if node.startswith("clang_"):
+            continue  # This host's tools are never built here.
+        if not (graph.out_dir / unescape(node)).exists():
+            missing.append(unescape(node))
+    if missing:
+        missing.sort()
+        print(f"::warning::{len(missing)} generated input(s) of Apple edges are missing from codegen's tree")
+        for path in missing[:200]:
+            print(f"  missing: {path}")
+    else:
+        print("==> apple-only: every generated input of the Apple edges is present")
 
 
 def main() -> int:
