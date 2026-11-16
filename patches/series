@@ -40,4 +40,8 @@
 0048-ios-extensions-guard-test-support-chrome-buildflags.patch
 0049-ios-extensions-common-renderer-integration.patch
 0050-ios-extensions-platform-feature-gate.patch
+0051-ios-extensions-browser-profile-integration.patch
 0052-ios-extensions-bundled-probe.patch
+0053-ios-extensions-explicit-gn-roots.patch
+0054-ios-extensions-service-lifetime-order.patch
+0055-ios-extensions-include-boundaries.patch

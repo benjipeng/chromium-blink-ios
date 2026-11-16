@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: order context services after the extension system
+
+diff --git a/extensions/browser/process_manager_factory.cc b/extensions/browser/process_manager_factory.cc
+--- a/extensions/browser/process_manager_factory.cc
++++ b/extensions/browser/process_manager_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "extensions/browser/process_manager_factory.h"
++#include "build/build_config.h"
++#include "extensions/browser/extension_system_provider.h"
+ 
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+ #include "extensions/browser/extension_registry_factory.h"
+@@ -38,6 +40,9 @@
+     : BrowserContextKeyedServiceFactory(
+           "ProcessManager",
+           BrowserContextDependencyManager::GetInstance()) {
++#if BUILDFLAG(IS_IOS)
++  DependsOn(ExtensionsBrowserClient::Get()->GetExtensionSystemFactory());
++#endif
+   DependsOn(extensions::ExtensionRegistryFactory::GetInstance());
+   DependsOn(extensions::LazyBackgroundTaskQueueFactory::GetInstance());
+ }
+diff --git a/extensions/browser/extension_registrar_factory.cc b/extensions/browser/extension_registrar_factory.cc
+--- a/extensions/browser/extension_registrar_factory.cc
++++ b/extensions/browser/extension_registrar_factory.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "extensions/browser/extension_registrar_factory.h"
++#include "build/build_config.h"
++#include "extensions/browser/extension_system_provider.h"
+ 
+ #include "base/check.h"
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+@@ -34,6 +36,9 @@
+     : BrowserContextKeyedServiceFactory(
+           "ExtensionRegistrar",
+           BrowserContextDependencyManager::GetInstance()) {
++#if BUILDFLAG(IS_IOS)
++  DependsOn(ExtensionsBrowserClient::Get()->GetExtensionSystemFactory());
++#endif
+   DependsOn(ExtensionRegistryFactory::GetInstance());
+   DependsOn(ProcessManagerFactory::GetInstance());
+   DependsOn(ExtensionPrefsFactory::GetInstance());
+diff --git a/extensions/browser/renderer_startup_helper.cc b/extensions/browser/renderer_startup_helper.cc
+--- a/extensions/browser/renderer_startup_helper.cc
++++ b/extensions/browser/renderer_startup_helper.cc
+@@ -3,6 +3,8 @@
+ // found in the LICENSE file.
+ 
+ #include "extensions/browser/renderer_startup_helper.h"
++#include "build/build_config.h"
++#include "extensions/browser/extension_system_provider.h"
+ 
+ #include <ranges>
+ #include <string>
+@@ -795,7 +797,11 @@
+ RendererStartupHelperFactory::RendererStartupHelperFactory()
+     : BrowserContextKeyedServiceFactory(
+           "RendererStartupHelper",
++          BrowserContextDependencyManager::GetInstance()) {
++#if BUILDFLAG(IS_IOS)
++  DependsOn(ExtensionsBrowserClient::Get()->GetExtensionSystemFactory());
++#endif
++}
+-          BrowserContextDependencyManager::GetInstance()) {}
+ 
+ RendererStartupHelperFactory::~RendererStartupHelperFactory() = default;
+ 
+

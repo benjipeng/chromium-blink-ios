@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: declare embedder include boundaries
+
+diff --git a/ios/chrome/browser/profile/model/DEPS b/ios/chrome/browser/profile/model/DEPS
+--- a/ios/chrome/browser/profile/model/DEPS
++++ b/ios/chrome/browser/profile/model/DEPS
+@@ -1,4 +1,6 @@
+ include_rules = [
++  "+extensions/buildflags",
++  "+ios/chrome/browser/extensions/model",
+   # keep-sorted start
+   "+ios/chrome/browser/content_settings/model",
+   "+ios/chrome/browser/enterprise/client_certificates/cert_utils.h",
+diff --git a/ios/chrome/browser/web/model/DEPS b/ios/chrome/browser/web/model/DEPS
+--- a/ios/chrome/browser/web/model/DEPS
++++ b/ios/chrome/browser/web/model/DEPS
+@@ -1,4 +1,6 @@
+ include_rules = [
++  "+extensions/buildflags",
++  "+ios/chrome/browser/extensions/model",
+   # keep-sorted start
+   "+ios/chrome/browser/app_launcher/model",
+   "+ios/chrome/browser/application_context/model",
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -1,4 +1,7 @@
+ include_rules = [
++  "+extensions/browser",
++  "+extensions/buildflags",
++  "+extensions/common",
+   # keep-sorted start
+   "+components/crash/core/common",
+   "+components/download/public/common",
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -1,4 +1,6 @@
+ include_rules = [
++  "+mojo/public/cpp/bindings",
++  "+third_party/blink/public/common/associated_interfaces/associated_interface_registry.h",
+   # keep-sorted start
+   "+components/embedder_support",
+   "+components/error_page/common",
+

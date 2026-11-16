@@ -1,4 +1,3 @@
 # Generate the app and its production extension probe roots, not unrelated tests.
 --root-target=//ios/chrome/app
---root-pattern=//ios/chrome/app:chrome
---root-pattern=//extensions/browser:browser_sources
+--root-pattern=//ios/chrome/app:*

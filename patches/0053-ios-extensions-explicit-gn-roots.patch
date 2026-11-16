@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: name extension compile probe roots explicitly
+
+diff --git a/ios/chrome/app/BUILD.gn b/ios/chrome/app/BUILD.gn
+--- a/ios/chrome/app/BUILD.gn
++++ b/ios/chrome/app/BUILD.gn
+@@ -17,6 +17,7 @@
+ import("//ios/features.gni")
+ import("//ios/public/provider/chrome/browser/build_config.gni")
+ import("//rlz/buildflags/buildflags.gni")
++import("//extensions/buildflags/buildflags.gni")
+ 
+ declare_args() {
+   # Path to a PrivacyInfo.xcprivacy file to be included in the application.
+@@ -26,6 +27,14 @@
+   ios_chrome_orderfile = ""
+ }
+ 
++# These explicit production roots keep the narrow object probe available when
++# GN emits only this app directory and its transitive dependencies.
++if (enable_extensions_core) {
++  group("extension_core_probe") {
++    deps = [ "//extensions/browser:browser_sources" ]
++  }
++}
++
+ buildflag_header("background_mode_buildflags") {
+   header = "background_mode_buildflags.h"
+   flags = [
+

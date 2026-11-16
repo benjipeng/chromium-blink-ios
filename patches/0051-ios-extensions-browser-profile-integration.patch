@@ -1,0 +1,2207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: integrate ExtensionsBrowserClient and ProfileIOS lifecycle
+
+diff --git a/ios/chrome/browser/profile/model/BUILD.gn b/ios/chrome/browser/profile/model/BUILD.gn
+--- a/ios/chrome/browser/profile/model/BUILD.gn
++++ b/ios/chrome/browser/profile/model/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/build/chrome_build.gni")
+ 
+ source_set("model") {
+@@ -63,9 +64,13 @@
+     "//ios/chrome/browser/supervised_user/model:sync_settings_factory",
+     "//ios/components/cookie_util",
+     "//ios/net",
++    "//extensions/buildflags",
+     "//ios/web/public/thread",
+     "//net",
+   ]
++  if (enable_extensions_core) {
++    deps += [ "//ios/chrome/browser/extensions/model" ]
++  }
+ }
+ 
+ source_set("profile_ios_io_data") {
+diff --git a/ios/chrome/browser/profile/model/profile_ios_impl.mm b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+--- a/ios/chrome/browser/profile/model/profile_ios_impl.mm
++++ b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+@@ -34,7 +34,11 @@
+ #import "components/supervised_user/core/common/features.h"
+ #import "components/sync_preferences/pref_service_syncable.h"
+ #import "components/user_prefs/user_prefs.h"
++#import "extensions/buildflags/buildflags.h"
+ #import "ios/chrome/browser/content_settings/model/host_content_settings_map_factory.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#endif
+ #import "ios/chrome/browser/policy/model/browser_policy_connector_ios.h"
+ #import "ios/chrome/browser/policy/model/profile_policy_connector.h"
+ #import "ios/chrome/browser/policy/model/profile_policy_connector_factory.h"
+@@ -276,6 +280,9 @@
+   RegisterProfilePrefs(pref_registry_.get());
+   ProfileDependencyManagerIOS::GetInstance()->RegisterProfilePrefsForServices(
+       pref_registry_.get());
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  RegisterIOSExtensionPrefs(pref_registry_.get());
++#endif
+ 
+   // Create a SupervisedUserPrefStore and initialize it with empty data.
+   // The pref store will load Family Link Settings Service disk data after
+@@ -323,6 +330,9 @@
+     DestroyOffTheRecordProfile();
+   }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  ShutdownIOSExtensionsForProfile(this);
++#endif
+   ProfileDependencyManagerIOS::GetInstance()->DestroyProfileServices(this);
+   // Warning: the order for shutting down the Profile's objects is important
+   // because of interdependencies. Ideally the order for shutting down the
+@@ -515,6 +525,9 @@
+   // The initialisation of the ProfileIOS is now complete and the services
+   // can be safely created.
+   ProfileDependencyManagerIOS::GetInstance()->CreateProfileServices(this);
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsForProfile(this);
++#endif
+ 
+   if (delegate_) {
+     delegate_->OnProfileCreationFinished(this, init_info.creation_mode,
+diff --git a/ios/chrome/browser/web/model/BUILD.gn b/ios/chrome/browser/web/model/BUILD.gn
+--- a/ios/chrome/browser/web/model/BUILD.gn
++++ b/ios/chrome/browser/web/model/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//base/allocator/allocator.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/web/public/js_messaging/optimize_js.gni")
+ 
+ source_set("model") {
+@@ -256,6 +257,7 @@
+     ":model",
+     "//base/allocator:buildflags",
+     "//build:blink_buildflags",
++    "//extensions/buildflags",
+     "//components/application_locale_storage",
+     "//components/autofill/core/common:features",
+     "//components/autofill/ios/browser",
+@@ -406,6 +408,9 @@
+     "UIKit.framework",
+     "Foundation.framework",
+   ]
++  if (enable_extensions_core) {
++    deps += [ "//ios/chrome/browser/extensions/model" ]
++  }
+ }
+ 
+ source_set("unit_tests_internal") {
+diff --git a/ios/chrome/browser/web/model/chrome_main_parts.mm b/ios/chrome/browser/web/model/chrome_main_parts.mm
+--- a/ios/chrome/browser/web/model/chrome_main_parts.mm
++++ b/ios/chrome/browser/web/model/chrome_main_parts.mm
+@@ -27,6 +27,10 @@
+ #import "base/time/default_tick_clock.h"
+ #import "base/trace_event/named_trigger.h"
+ #import "build/blink_buildflags.h"
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#endif
+ #import "components/content_settings/core/common/content_settings_pattern.h"
+ #import "components/crash/core/common/crash_key.h"
+ #import "components/crash/core/common/crash_keys.h"
+@@ -328,6 +332,10 @@
+   base::trace_event::EmitNamedTrigger(
+       base::trace_event::kStartupTracingTriggerName);
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsBrowserClient();
++#endif
++
+   // Ensure that the KeyedService factories are registered.
+   EnsureProfileKeyedServiceFactoriesBuilt();
+   ProfileDependencyManagerIOS::GetInstance()
+@@ -380,6 +388,9 @@
+ }
+ 
+ void IOSChromeMainParts::PostMainMessageLoopRun() {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  StartTearDownIOSExtensionsBrowserClient();
++#endif
+   TranslateServiceIOS::Shutdown();
+ 
+   segmentation_platform::UkmDatabaseClientHolder::GetClientInstance(nullptr)
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/features.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/web/public/js_messaging/optimize_ts.gni")
+ import("//testing/test.gni")
+ 
+@@ -55,6 +56,7 @@
+     ":send_webkit_message_js",
+     "//base",
+     "//build:blink_buildflags",
++    "//extensions/buildflags",
+     "//components/download/public/common:public",
+     "//components/embedder_support:user_agent",
+     "//components/embedder_support/ios:web_contents_delegate",
+@@ -88,6 +90,12 @@
+     "//third_party/blink/public/common",
+     "//ui/base",
+   ]
++  if (enable_extensions_core) {
++    deps += [
++      "//extensions/browser",
++      "//extensions/common",
++    ]
++  }
+ }
+ 
+ source_set("threads") {
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -52,6 +52,10 @@
+     "//ui/native_theme",
+   ]
+   if (enable_extensions_core) {
+-    deps += [ "extensions:clients" ]
++    deps += [
++      "extensions:clients",
++      "//extensions/browser",
++      "//extensions/common",
++    ]
+   }
+ }
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -3,6 +3,31 @@
+ // found in the LICENSE file.
+ 
+ #include "ios/web/content/init/ios_content_browser_client.h"
++
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#include "base/functional/bind.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/security_principal.h"
++#include "content/public/browser/service_worker_version_base_info.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/common/child_process_id.h"
++#include "extensions/browser/api/web_request/extension_web_request_event_router.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_protocols.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_web_contents_observer.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/browser/process_map.h"
++#include "extensions/browser/renderer_startup_helper.h"
++#include "extensions/browser/service_worker/service_worker_host.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/mojom/event_router.mojom.h"
++#include "extensions/common/mojom/frame.mojom.h"
++#include "extensions/common/mojom/renderer_host.mojom.h"
++#include "extensions/common/mojom/service_worker_host.mojom.h"
++#include "extensions/common/mojom/web_request_host.mojom.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
++#endif
+ 
+ #import "base/memory/self_deleting.h"
+ #import "components/embedder_support/user_agent_utils.h"
+@@ -120,6 +145,9 @@
+       content::kChromeUIScheme,
+       content::kChromeUIUntrustedScheme,
+       content::kChromeDevToolsScheme,
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++      extensions::kExtensionScheme,
++#endif
+       url::kDataScheme,
+       url::kFileScheme,
+   };
+@@ -229,13 +257,19 @@
+ IOSContentBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
+     const std::string& scheme,
+     content::FrameTreeNodeId frame_tree_node_id) {
+-  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
+-  if (scheme != content::kChromeUIScheme) {
+-    return {};
+-  }
+   content::WebContents* web_contents =
+       content::WebContents::FromFrameTreeNodeId(frame_tree_node_id);
+   if (!web_contents) {
++    return {};
++  }
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (scheme == extensions::kExtensionScheme) {
++    return extensions::CreateExtensionNavigationURLLoaderFactory(
++        web_contents->GetBrowserContext(), /*is_web_view_request=*/false);
++  }
++#endif
++  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
++  if (scheme != content::kChromeUIScheme) {
+     return {};
+   }
+   return CreateWebUIURLLoaderFactory(web_contents->GetBrowserContext());
+@@ -246,6 +280,12 @@
+     int render_frame_id,
+     const std::optional<url::Origin>& request_initiator_origin,
+     NonNetworkURLLoaderFactoryMap* factories) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  factories->emplace(
++      extensions::kExtensionScheme,
++      extensions::CreateExtensionURLLoaderFactory(
++          content::ChildProcessId(render_process_id), render_frame_id));
++#endif
+   // [ios-blink-sideload] Only chrome:// pages load chrome:// resources, such
+   // as the shared ones under chrome://resources.
+   if (!request_initiator_origin ||
+@@ -262,4 +302,119 @@
+       CreateWebUIURLLoaderFactory(render_frame_host->GetBrowserContext()));
+ }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++void IOSContentBrowserClient::SiteInstanceGotProcessAndSite(
++    content::SiteInstance* site_instance) {
++  if (!site_instance || !site_instance->HasProcess()) {
++    return;
++  }
++  const content::SecurityPrincipal& principal =
++      site_instance->GetSecurityPrincipal();
++  if (!principal.SchemeIs(extensions::kExtensionScheme) ||
++      principal.IsSandboxed()) {
++    return;
++  }
++  content::BrowserContext* context =
++      site_instance->GetProcess()->GetBrowserContext();
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !client->IsValidContext(context)) {
++    return;
++  }
++  extensions::ExtensionRegistry* registry =
++      extensions::ExtensionRegistry::Get(context);
++  if (!registry) {
++    return;
++  }
++  const extensions::Extension* extension =
++      registry->enabled_extensions().GetByID(principal.GetHost());
++  if (!extension) {
++    return;
++  }
++  extensions::ProcessMap::Get(context)->Insert(
++      extension->id(), site_instance->GetProcess()->GetID());
++}
++
++void IOSContentBrowserClient::ExposeInterfacesToRenderer(
++    service_manager::BinderRegistry* registry,
++    blink::AssociatedInterfaceRegistry* associated_registry,
++    content::RenderProcessHost* render_process_host) {
++  associated_registry->AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          render_process_host->GetID()));
++  associated_registry->AddInterface<extensions::mojom::WebRequestHost>(
++      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
++                          render_process_host->GetID()));
++}
++
++void IOSContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
++    content::RenderFrameHost* render_frame_host,
++    mojo::BinderMapWithContext<content::RenderFrameHost*>* map) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !render_frame_host) {
++    return;
++  }
++  content::BrowserContext* context = render_frame_host->GetBrowserContext();
++  if (!client->IsValidContext(context)) {
++    return;
++  }
++  const extensions::Extension* extension = nullptr;
++  const content::SecurityPrincipal& principal =
++      render_frame_host->GetSiteInstance()->GetSecurityPrincipal();
++  if (principal.SchemeIs(extensions::kExtensionScheme)) {
++    if (auto* registry = extensions::ExtensionRegistry::Get(context)) {
++      extension = registry->enabled_extensions().GetByID(principal.GetHost());
++    }
++  }
++  client->RegisterBrowserInterfaceBindersForFrame(map, render_frame_host,
++                                                  extension);
++}
++
++void IOSContentBrowserClient::
++    RegisterAssociatedInterfaceBindersForRenderFrameHost(
++        content::RenderFrameHost& render_frame_host,
++        blink::AssociatedInterfaceRegistry& associated_registry) {
++  ContentBrowserClient::RegisterAssociatedInterfaceBindersForRenderFrameHost(
++      render_frame_host, associated_registry);
++  const content::ChildProcessId process_id =
++      render_frame_host.GetProcess()->GetID();
++  associated_registry.AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          process_id));
++  associated_registry.AddInterface<extensions::mojom::EventRouter>(
++      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
++                          process_id));
++  associated_registry.AddInterface<extensions::mojom::LocalFrameHost>(
++      base::BindRepeating(
++          [](content::RenderFrameHost* frame_host,
++             mojo::PendingAssociatedReceiver<extensions::mojom::LocalFrameHost>
++                 receiver) {
++            extensions::ExtensionWebContentsObserver::BindLocalFrameHost(
++                std::move(receiver), frame_host);
++          },
++          &render_frame_host));
++}
++
++void IOSContentBrowserClient::
++    RegisterAssociatedInterfaceBindersForServiceWorker(
++        const content::ServiceWorkerVersionBaseInfo&
++            service_worker_version_info,
++        blink::AssociatedInterfaceRegistry& associated_registry) {
++  if (!service_worker_version_info.process_id) {
++    return;
++  }
++  associated_registry.AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::ServiceWorkerHost>(
++      base::BindRepeating(&extensions::ServiceWorkerHost::BindReceiver,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::WebRequestHost>(
++      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::EventRouter>(
++      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
++                          service_worker_version_info.process_id));
++}
++#endif
++
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -7,6 +7,7 @@
+ 
+ #import "build/blink_buildflags.h"
+ #include "content/public/browser/content_browser_client.h"
++#include "extensions/buildflags/buildflags.h"
+ 
+ #if !BUILDFLAG(USE_BLINK)
+ #error File can only be included when USE_BLINK is true
+@@ -55,6 +56,23 @@
+       int render_frame_id,
+       const std::optional<url::Origin>& request_initiator_origin,
+       NonNetworkURLLoaderFactoryMap* factories) override;
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  void SiteInstanceGotProcessAndSite(
++      content::SiteInstance* site_instance) override;
++  void ExposeInterfacesToRenderer(
++      service_manager::BinderRegistry* registry,
++      blink::AssociatedInterfaceRegistry* associated_registry,
++      content::RenderProcessHost* render_process_host) override;
++  void RegisterBrowserInterfaceBindersForFrame(
++      content::RenderFrameHost* render_frame_host,
++      mojo::BinderMapWithContext<content::RenderFrameHost*>* map) override;
++  void RegisterAssociatedInterfaceBindersForRenderFrameHost(
++      content::RenderFrameHost& render_frame_host,
++      blink::AssociatedInterfaceRegistry& associated_registry) override;
++  void RegisterAssociatedInterfaceBindersForServiceWorker(
++      const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
++      blink::AssociatedInterfaceRegistry& associated_registry) override;
++#endif
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -27,6 +27,12 @@
+ #import "content/public/browser/visibility.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/common/url_constants.h"
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "extensions/browser/extensions_browser_client.h"
++#import "extensions/browser/view_type_utils.h"
++#import "extensions/common/mojom/view_type.mojom.h"
++#endif
+ #import "ios/web/content/content_browser_context.h"
+ #import "ios/web/content/navigation/content_navigation_context.h"
+ #import "ios/web/content/web_state/content_web_state_builder.h"
+@@ -189,6 +195,13 @@
+   }
+   web_contents_->SetDelegate(this);
+   WebContentsObserver::Observe(web_contents_.get());
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (auto* extensions_client = extensions::ExtensionsBrowserClient::Get()) {
++    extensions::SetViewType(web_contents_.get(),
++                            extensions::mojom::ViewType::kTabContents);
++    extensions_client->CreateExtensionWebContentsObserver(web_contents_.get());
++  }
++#endif
+   certificate_policy_cache_ =
+       std::make_unique<DummySessionCertificatePolicyCache>(
+           params.browser_state);
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -0,0 +1,53 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//extensions/buildflags/buildflags.gni")
++
++assert(enable_extensions_core)
++
++source_set("model") {
++  sources = [
++    "ios_extension_system.h",
++    "ios_extension_system.mm",
++    "ios_extension_system_factory.h",
++    "ios_extension_system_factory.mm",
++    "ios_extension_web_contents_observer.h",
++    "ios_extension_web_contents_observer.mm",
++    "ios_extensions_browser_client.h",
++    "ios_extensions_browser_client.mm",
++  ]
++
++  public_deps = [
++    "//base",
++    "//extensions/browser",
++  ]
++
++  deps = [
++    "//components/application_locale_storage",
++    "//components/crx_file",
++    "//components/keyed_service/content",
++    "//components/pref_registry",
++    "//components/prefs",
++    "//components/sync/model",
++    "//components/user_prefs",
++    "//components/value_store",
++    "//components/version_info",
++    "//content/public/browser",
++    "//content/public/common",
++    "//extensions/browser/updater",
++    "//extensions/buildflags",
++    "//extensions/common",
++    "//extensions/common/api",
++    "//ios/chrome/browser/shared/model/application_context",
++    "//ios/chrome/browser/shared/model/paths",
++    "//ios/chrome/browser/shared/model/profile",
++    "//ios/chrome/common",
++    "//ios/web/content",
++    "//services/network/public/mojom",
++    "//third_party/blink/public/common",
++    "//ui/base",
++    "//ui/base/mojom",
++    "//url",
++  ]
++}
+diff --git a/ios/chrome/browser/extensions/model/DEPS b/ios/chrome/browser/extensions/model/DEPS
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/DEPS
+@@ -0,0 +1,14 @@
++include_rules = [
++  "+components/crx_file",
++  "+components/keyed_service/content",
++  "+components/value_store",
++  "+content/public/browser",
++  "+content/public/common",
++  "+extensions/browser",
++  "+extensions/buildflags",
++  "+extensions/common",
++  "+ios/chrome/browser/extensions/model",
++  "+ios/web/content",
++  "+third_party/blink/public/common",
++  "+third_party/blink/public/mojom",
++]
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.h b/ios/chrome/browser/extensions/model/ios_extension_system.h
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.h
+@@ -0,0 +1,92 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_H_
++
++#include <memory>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/one_shot_event.h"
++#include "extensions/browser/extension_system.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace value_store {
++class ValueStoreFactoryImpl;
++}  // namespace value_store
++
++namespace extensions {
++
++class NullAppSorting;
++
++class IOSExtensionSystem final : public ExtensionSystem {
++ public:
++  explicit IOSExtensionSystem(content::BrowserContext* browser_context);
++  IOSExtensionSystem(const IOSExtensionSystem&) = delete;
++  IOSExtensionSystem& operator=(const IOSExtensionSystem&) = delete;
++  ~IOSExtensionSystem() override;
++
++  // KeyedService:
++  void Shutdown() override;
++
++  // ExtensionSystem:
++  void InitForRegularProfile(bool extensions_enabled) override;
++  ExtensionService* extension_service() override;
++  ManagementPolicy* management_policy() override;
++  ServiceWorkerManager* service_worker_manager() override;
++  UserScriptManager* user_script_manager() override;
++  StateStore* state_store() override;
++  StateStore* rules_store() override;
++  StateStore* dynamic_user_scripts_store() override;
++  scoped_refptr<value_store::ValueStoreFactory> store_factory() override;
++  QuotaService* quota_service() override;
++  AppSorting* app_sorting() override;
++  const base::OneShotEvent& ready() const override;
++  bool is_ready() const override;
++  ContentVerifier* content_verifier() override;
++  void InstallUpdate(const ExtensionId& extension_id,
++                     const std::string& public_key,
++                     const base::FilePath& unpacked_dir,
++                     bool install_immediately,
++                     InstallUpdateCallback install_update_callback) override;
++  void PerformActionBasedOnOmahaAttributes(
++      const ExtensionId& extension_id,
++      const base::DictValue& attributes) override;
++
++ private:
++  class BundledExtensionPolicyProvider;
++  class RegistrarDelegate;
++
++  void OnBundledExtensionPathResolved(
++      const base::FilePath& canonical_path,
++      const ExtensionId& expected_id);
++
++  raw_ptr<content::BrowserContext> browser_context_;
++  bool initialized_ = false;
++
++  scoped_refptr<value_store::ValueStoreFactoryImpl> store_factory_;
++  std::unique_ptr<StateStore> state_store_;
++  std::unique_ptr<StateStore> rules_store_;
++  std::unique_ptr<StateStore> dynamic_user_scripts_store_;
++  std::unique_ptr<QuotaService> quota_service_;
++  std::unique_ptr<NullAppSorting> app_sorting_;
++  std::unique_ptr<BundledExtensionPolicyProvider> policy_provider_;
++  std::unique_ptr<ManagementPolicy> management_policy_;
++  std::unique_ptr<ServiceWorkerManager> service_worker_manager_;
++  std::unique_ptr<UserScriptManager> user_script_manager_;
++  std::unique_ptr<RegistrarDelegate> registrar_delegate_;
++  base::OneShotEvent ready_;
++
++  base::WeakPtrFactory<IOSExtensionSystem> weak_factory_{this};
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+@@ -0,0 +1,352 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/extensions/model/ios_extension_system.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "components/crx_file/id_util.h"
++#include "components/sync/model/string_ordinal.h"
++#include "components/value_store/value_store_factory_impl.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
++#include "extensions/browser/extension_file_task_runner.h"
++#include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/install/crx_install_error.h"
++#include "extensions/browser/management_policy.h"
++#include "extensions/browser/null_app_sorting.h"
++#include "extensions/browser/permissions/permissions_updater.h"
++#include "extensions/browser/quota_service.h"
++#include "extensions/browser/service_worker_manager.h"
++#include "extensions/browser/state_store.h"
++#include "extensions/browser/unpacked_installer.h"
++#include "extensions/browser/user_script_manager.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/file_util.h"
++#include "extensions/common/manifest_constants.h"
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++
++namespace extensions {
++
++namespace {
++
++struct ResolvedBundledExtension {
++  base::FilePath canonical_path;
++  ExtensionId extension_id;
++};
++
++std::optional<ResolvedBundledExtension> ResolveBundledExtensionOnFileThread(
++    const base::FilePath& bundled_dir) {
++  if (bundled_dir.empty() || !base::DirectoryExists(bundled_dir)) {
++    return std::nullopt;
++  }
++  const base::FilePath canonical_path = base::MakeAbsoluteFilePath(bundled_dir);
++  if (canonical_path.empty() ||
++      !base::PathExists(canonical_path.Append(kManifestFilename))) {
++    return std::nullopt;
++  }
++
++  ExtensionId extension_id =
++      crx_file::id_util::GenerateIdForPath(canonical_path);
++  std::string error;
++  std::optional<base::DictValue> manifest =
++      file_util::LoadManifest(canonical_path, &error);
++  if (manifest) {
++    if (const std::string* manifest_key =
++            manifest->FindString(manifest_keys::kPublicKey)) {
++      std::string public_key_bytes;
++      if (Extension::ParsePEMKeyBytes(*manifest_key, &public_key_bytes)) {
++        extension_id = crx_file::id_util::GenerateId(public_key_bytes);
++      }
++    }
++  }
++  return ResolvedBundledExtension{canonical_path, extension_id};
++}
++
++}  // namespace
++
++class IOSExtensionSystem::BundledExtensionPolicyProvider final
++    : public ManagementPolicy::Provider {
++ public:
++  BundledExtensionPolicyProvider() = default;
++  ~BundledExtensionPolicyProvider() override = default;
++
++  std::string GetDebugPolicyProviderName() const override {
++#if DCHECK_IS_ON()
++    return "IOSBundledExtensionPolicyProvider";
++#else
++    return std::string();
++#endif
++  }
++
++  bool UserMayLoad(const Extension* extension,
++                   std::u16string* error) const override {
++    if (extension &&
++        IOSExtensionsBrowserClient::GetInstance()->IsAllowedBundledExtension(
++            *extension)) {
++      return true;
++    }
++    if (error) {
++      *error = u"Only the bundled unpacked content-script probe extension is "
++               u"permitted on iOS.";
++    }
++    return false;
++  }
++};
++
++class IOSExtensionSystem::RegistrarDelegate final
++    : public ExtensionRegistrar::Delegate {
++ public:
++  explicit RegistrarDelegate(content::BrowserContext* browser_context)
++      : browser_context_(browser_context) {}
++  ~RegistrarDelegate() override = default;
++
++  void PreAddExtension(const Extension* extension,
++                       const Extension* old_extension) override {}
++
++  void OnAddNewOrUpdatedExtension(const Extension* extension) override {
++    PermissionsUpdater updater(browser_context_);
++    updater.InitializePermissions(extension);
++    updater.GrantActivePermissions(extension);
++  }
++
++  void PostActivateExtension(
++      scoped_refptr<const Extension> extension) override {}
++
++  void PostDeactivateExtension(
++      scoped_refptr<const Extension> extension) override {}
++
++  void PreUninstallExtension(
++      scoped_refptr<const Extension> extension) override {}
++
++  void PostUninstallExtension(scoped_refptr<const Extension> extension,
++                              base::OnceClosure done_callback) override {
++    if (done_callback) {
++      std::move(done_callback).Run();
++    }
++  }
++
++  void LoadExtensionForReload(const ExtensionId& extension_id,
++                              const base::FilePath& path) override {}
++
++  void LoadExtensionForReloadWithQuietFailure(
++      const ExtensionId& extension_id,
++      const base::FilePath& path) override {}
++
++  void ShowExtensionDisabledError(const Extension* extension,
++                                  bool is_remote_install) override {}
++
++  bool CanEnableExtension(const Extension* extension) override {
++    return extension &&
++           IOSExtensionsBrowserClient::GetInstance()->IsAllowedBundledExtension(
++               *extension);
++  }
++
++  bool CanDisableExtension(const Extension* extension) override { return true; }
++
++  void GrantActivePermissions(const Extension* extension) override {
++    PermissionsUpdater(browser_context_).GrantActivePermissions(extension);
++  }
++
++  void UpdateExternalExtensionAlert() override {}
++
++  void OnExtensionInstalled(const Extension* extension,
++                            const syncer::StringOrdinal& page_ordinal,
++                            int install_flags,
++                            base::DictValue ruleset_install_prefs) override {
++    ExtensionRegistrar::Get(browser_context_)
++        ->AddNewOrUpdatedExtension(extension, install_flags, page_ordinal,
++                                   /*install_parameter=*/std::string(),
++                                   std::move(ruleset_install_prefs));
++  }
++
++ private:
++  raw_ptr<content::BrowserContext> browser_context_;
++};
++
++IOSExtensionSystem::IOSExtensionSystem(content::BrowserContext* browser_context)
++    : browser_context_(browser_context) {
++  CHECK(browser_context_);
++}
++
++IOSExtensionSystem::~IOSExtensionSystem() = default;
++
++void IOSExtensionSystem::Shutdown() {
++  weak_factory_.InvalidateWeakPtrs();
++  if (management_policy_ && policy_provider_) {
++    management_policy_->UnregisterProvider(policy_provider_.get());
++  }
++  user_script_manager_.reset();
++  service_worker_manager_.reset();
++  dynamic_user_scripts_store_.reset();
++  rules_store_.reset();
++  state_store_.reset();
++  quota_service_.reset();
++  management_policy_.reset();
++  policy_provider_.reset();
++  app_sorting_.reset();
++  registrar_delegate_.reset();
++  store_factory_.reset();
++}
++
++void IOSExtensionSystem::InitForRegularProfile(bool extensions_enabled) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (initialized_) {
++    return;
++  }
++  initialized_ = true;
++
++  store_factory_ = base::MakeRefCounted<value_store::ValueStoreFactoryImpl>(
++      browser_context_->GetPath());
++  state_store_ = std::make_unique<StateStore>(
++      browser_context_, store_factory_, StateStore::BackendType::STATE,
++      /*deferred_load=*/false);
++  rules_store_ = std::make_unique<StateStore>(
++      browser_context_, store_factory_, StateStore::BackendType::RULES,
++      /*deferred_load=*/false);
++  dynamic_user_scripts_store_ = std::make_unique<StateStore>(
++      browser_context_, store_factory_, StateStore::BackendType::SCRIPTS,
++      /*deferred_load=*/false);
++
++  quota_service_ = std::make_unique<QuotaService>();
++  app_sorting_ = std::make_unique<NullAppSorting>();
++  policy_provider_ = std::make_unique<BundledExtensionPolicyProvider>();
++  management_policy_ = std::make_unique<ManagementPolicy>();
++  management_policy_->RegisterProvider(policy_provider_.get());
++
++  service_worker_manager_ =
++      std::make_unique<ServiceWorkerManager>(browser_context_);
++  user_script_manager_ = std::make_unique<UserScriptManager>(browser_context_);
++
++  registrar_delegate_ = std::make_unique<RegistrarDelegate>(browser_context_);
++  const base::FilePath install_dir =
++      browser_context_->GetPath().Append(kInstallDirectoryName);
++  const base::FilePath unpacked_install_dir =
++      browser_context_->GetPath().Append(kUnpackedInstallDirectoryName);
++  ExtensionRegistrar::Get(browser_context_)
++      ->Init(registrar_delegate_.get(), extensions_enabled,
++             base::CommandLine::ForCurrentProcess(), install_dir,
++             unpacked_install_dir);
++
++  ready_.Signal();
++
++  if (!extensions_enabled) {
++    return;
++  }
++
++  const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
++  if (bundled_dir.empty()) {
++    return;
++  }
++
++  GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&ResolveBundledExtensionOnFileThread, bundled_dir),
++      base::BindOnce(
++          [](base::WeakPtr<IOSExtensionSystem> self,
++             std::optional<ResolvedBundledExtension> resolved) {
++            if (self && resolved) {
++              self->OnBundledExtensionPathResolved(resolved->canonical_path,
++                                                   resolved->extension_id);
++            }
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++void IOSExtensionSystem::OnBundledExtensionPathResolved(
++    const base::FilePath& canonical_path,
++    const ExtensionId& expected_id) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!browser_context_ ||
++      ExtensionsBrowserClient::Get()->IsShuttingDown()) {
++    return;
++  }
++  IOSExtensionsBrowserClient::GetInstance()->SetAllowedBundledExtension(
++      canonical_path, expected_id);
++
++  scoped_refptr<UnpackedInstaller> installer =
++      UnpackedInstaller::Create(browser_context_);
++  installer->set_be_noisy_on_failure(false);
++  installer->Load(canonical_path);
++}
++
++ExtensionService* IOSExtensionSystem::extension_service() {
++  return nullptr;
++}
++
++ManagementPolicy* IOSExtensionSystem::management_policy() {
++  return management_policy_.get();
++}
++
++ServiceWorkerManager* IOSExtensionSystem::service_worker_manager() {
++  return service_worker_manager_.get();
++}
++
++UserScriptManager* IOSExtensionSystem::user_script_manager() {
++  return user_script_manager_.get();
++}
++
++StateStore* IOSExtensionSystem::state_store() {
++  return state_store_.get();
++}
++
++StateStore* IOSExtensionSystem::rules_store() {
++  return rules_store_.get();
++}
++
++StateStore* IOSExtensionSystem::dynamic_user_scripts_store() {
++  return dynamic_user_scripts_store_.get();
++}
++
++scoped_refptr<value_store::ValueStoreFactory>
++IOSExtensionSystem::store_factory() {
++  return store_factory_;
++}
++
++QuotaService* IOSExtensionSystem::quota_service() {
++  return quota_service_.get();
++}
++
++AppSorting* IOSExtensionSystem::app_sorting() {
++  return app_sorting_.get();
++}
++
++const base::OneShotEvent& IOSExtensionSystem::ready() const {
++  return ready_;
++}
++
++bool IOSExtensionSystem::is_ready() const {
++  return ready_.is_signaled();
++}
++
++ContentVerifier* IOSExtensionSystem::content_verifier() {
++  return nullptr;
++}
++
++void IOSExtensionSystem::InstallUpdate(
++    const ExtensionId& extension_id,
++    const std::string& public_key,
++    const base::FilePath& unpacked_dir,
++    bool install_immediately,
++    InstallUpdateCallback install_update_callback) {
++  if (install_update_callback) {
++    std::move(install_update_callback)
++        .Run(CrxInstallError(
++            CrxInstallErrorType::OTHER,
++            CrxInstallErrorDetail::OFFSTORE_INSTALL_DISALLOWED,
++            u"Extension updates are not supported on iOS."));
++  }
++}
++
++void IOSExtensionSystem::PerformActionBasedOnOmahaAttributes(
++    const ExtensionId& extension_id,
++    const base::DictValue& attributes) {}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system_factory.h b/ios/chrome/browser/extensions/model/ios_extension_system_factory.h
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_system_factory.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_FACTORY_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "extensions/browser/extension_system_provider.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace extensions {
++
++class IOSExtensionSystemFactory final : public ExtensionSystemProvider {
++ public:
++  IOSExtensionSystemFactory(const IOSExtensionSystemFactory&) = delete;
++  IOSExtensionSystemFactory& operator=(const IOSExtensionSystemFactory&) =
++      delete;
++
++  static IOSExtensionSystemFactory* GetInstance();
++
++  // ExtensionSystemProvider:
++  ExtensionSystem* GetForBrowserContext(
++      content::BrowserContext* context) override;
++
++ private:
++  friend base::NoDestructor<IOSExtensionSystemFactory>;
++
++  IOSExtensionSystemFactory();
++  ~IOSExtensionSystemFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  content::BrowserContext* GetBrowserContextToUse(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_FACTORY_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm b/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
++
++#include "components/keyed_service/content/browser_context_dependency_manager.h"
++#include "extensions/browser/extension_prefs_factory.h"
++#include "extensions/browser/extension_registry_factory.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "ios/chrome/browser/extensions/model/ios_extension_system.h"
++
++namespace extensions {
++
++// static
++IOSExtensionSystemFactory* IOSExtensionSystemFactory::GetInstance() {
++  static base::NoDestructor<IOSExtensionSystemFactory> instance;
++  return instance.get();
++}
++
++ExtensionSystem* IOSExtensionSystemFactory::GetForBrowserContext(
++    content::BrowserContext* context) {
++  return static_cast<ExtensionSystem*>(
++      GetServiceForBrowserContext(context, /*create=*/true));
++}
++
++IOSExtensionSystemFactory::IOSExtensionSystemFactory()
++    : ExtensionSystemProvider("IOSExtensionSystem",
++                              BrowserContextDependencyManager::GetInstance()) {
++  // Consumers such as ProcessManager call ExtensionSystem::Get() in their
++  // constructors. They must depend on this system, never the reverse.
++  DependsOn(ExtensionPrefsFactory::GetInstance());
++  DependsOn(ExtensionRegistryFactory::GetInstance());
++}
++
++IOSExtensionSystemFactory::~IOSExtensionSystemFactory() = default;
++
++std::unique_ptr<KeyedService>
++IOSExtensionSystemFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<IOSExtensionSystem>(context);
++}
++
++content::BrowserContext* IOSExtensionSystemFactory::GetBrowserContextToUse(
++    content::BrowserContext* context) const {
++  return ExtensionsBrowserClient::Get()->GetContextForOriginalOnly(context);
++}
++
++bool IOSExtensionSystemFactory::ServiceIsCreatedWithBrowserContext() const {
++  return false;
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
++
++#include "content/public/browser/web_contents_user_data.h"
++#include "extensions/browser/extension_web_contents_observer.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace extensions {
++
++class IOSExtensionWebContentsObserver final
++    : public ExtensionWebContentsObserver,
++      public content::WebContentsUserData<IOSExtensionWebContentsObserver> {
++ public:
++  IOSExtensionWebContentsObserver(const IOSExtensionWebContentsObserver&) =
++      delete;
++  IOSExtensionWebContentsObserver& operator=(
++      const IOSExtensionWebContentsObserver&) = delete;
++  ~IOSExtensionWebContentsObserver() override;
++
++  static void CreateForWebContents(content::WebContents* web_contents);
++
++ private:
++  friend class content::WebContentsUserData<IOSExtensionWebContentsObserver>;
++
++  explicit IOSExtensionWebContentsObserver(content::WebContents* web_contents);
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
++
++namespace extensions {
++
++// static
++void IOSExtensionWebContentsObserver::CreateForWebContents(
++    content::WebContents* web_contents) {
++  if (!web_contents) {
++    return;
++  }
++  content::WebContentsUserData<
++      IOSExtensionWebContentsObserver>::CreateForWebContents(web_contents);
++  FromWebContents(web_contents)->Initialize();
++}
++
++IOSExtensionWebContentsObserver::IOSExtensionWebContentsObserver(
++    content::WebContents* web_contents)
++    : ExtensionWebContentsObserver(web_contents),
++      content::WebContentsUserData<IOSExtensionWebContentsObserver>(
++          *web_contents) {}
++
++IOSExtensionWebContentsObserver::~IOSExtensionWebContentsObserver() = default;
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(IOSExtensionWebContentsObserver);
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -0,0 +1,266 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_CLIENT_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_CLIENT_H_
++
++#include <atomic>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/containers/flat_map.h"
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "base/memory/raw_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++#include "extensions/browser/extension_management_client.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/browser/kiosk/kiosk_delegate.h"
++#include "extensions/browser/safe_browsing_delegate.h"
++#include "extensions/browser/updater/null_extension_cache.h"
++#include "extensions/buildflags/buildflags.h"
++#include "extensions/common/url_pattern_set.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++class ProfileIOS;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}  // namespace user_prefs
++
++// Initializes and registers the process-wide IOSExtensionsBrowserClient and
++// ensures all core/API BrowserContextKeyedServiceFactories are constructed.
++void InitializeIOSExtensionsBrowserClient();
++
++// Marks the IOSExtensionsBrowserClient as shutting down prior to profile
++// teardown while keeping the singleton alive until threads stop.
++void StartTearDownIOSExtensionsBrowserClient();
++
++// Registers ExtensionPrefs and BrowserContextKeyedServiceFactory preferences on
++// `registry`. Safe to call before or after InitializeIOSExtensionsBrowserClient.
++void RegisterIOSExtensionPrefs(user_prefs::PrefRegistrySyncable* registry);
++
++// Bridges `profile` to its `web::ContentBrowserContext`, binds `PrefService`,
++// builds extension BrowserContextKeyedServices, and starts IOSExtensionSystem.
++void InitializeIOSExtensionsForProfile(ProfileIOS* profile);
++
++// Destroys extension BrowserContextKeyedServices and unregisters the
++// `web::ContentBrowserContext` before `ProfileIOSImpl` tears down `prefs_`.
++void ShutdownIOSExtensionsForProfile(ProfileIOS* profile);
++
++// Returns the fixed framework bundle path (`base::DIR_ASSETS/Extensions/iOSProbe`)
++// from which the initial bundled unpacked content-script fixture is loaded.
++base::FilePath GetIOSBundledExtensionDirectory();
++
++namespace extensions {
++
++class ExtensionsAPIClient;
++
++class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
++ public:
++  IOSExtensionsBrowserClient();
++  IOSExtensionsBrowserClient(const IOSExtensionsBrowserClient&) = delete;
++  IOSExtensionsBrowserClient& operator=(const IOSExtensionsBrowserClient&) =
++      delete;
++  ~IOSExtensionsBrowserClient() override;
++
++  static IOSExtensionsBrowserClient* GetInstance();
++
++  // Explicit BrowserContext <-> ProfileIOS lifetime registry. Avoids calling
++  // ContentBrowserContext::FromBrowserState() inside IsValidContext(), which
++  // would lazily create contexts or miss profiles still in PrefsInitStage3.
++  void RegisterBrowserContext(content::BrowserContext* context,
++                              ProfileIOS* profile);
++  void UnregisterBrowserContext(content::BrowserContext* context);
++
++  // Records the canonicalized path and derived/manifest ID of the bundled
++  // unpacked fixture once verified on the extension file task runner.
++  void SetAllowedBundledExtension(const base::FilePath& canonical_path,
++                                  const ExtensionId& extension_id);
++  bool IsAllowedBundledExtension(const Extension& extension) const;
++  bool IsAllowedBundledExtensionId(const ExtensionId& extension_id) const;
++
++  // ExtensionsBrowserClient implementation:
++  void Init() override;
++  void StartTearDown() override;
++  bool IsShuttingDown() override;
++  bool AreExtensionsDisabled(const base::CommandLine& command_line,
++                             content::BrowserContext* context) override;
++  bool IsValidContext(void* context) override;
++  bool IsSameContext(content::BrowserContext* first,
++                     content::BrowserContext* second) override;
++  bool HasOffTheRecordContext(content::BrowserContext* context) override;
++  content::BrowserContext* GetOffTheRecordContext(
++      content::BrowserContext* context) override;
++  content::BrowserContext* GetOriginalContext(
++      content::BrowserContext* context) override;
++  content::BrowserContext* GetContextRedirectedToOriginal(
++      content::BrowserContext* context) override;
++  content::BrowserContext* GetContextRedirectedToOriginalWithoutAshInternals(
++      content::BrowserContext* context) override;
++  content::BrowserContext* GetContextOwnInstance(
++      content::BrowserContext* context) override;
++  content::BrowserContext* GetContextForOriginalOnly(
++      content::BrowserContext* context) override;
++  bool AreExtensionsDisabledForContext(
++      content::BrowserContext* context) override;
++  bool IsGuestSession(content::BrowserContext* context) const override;
++  bool IsExtensionIncognitoEnabled(
++      const ExtensionId& extension_id,
++      content::BrowserContext* context) const override;
++  bool IsExtensionIncognitoEnabled(
++      const Extension* extension,
++      content::BrowserContext* context) const override;
++  bool CanExtensionCrossIncognito(
++      const Extension* extension,
++      content::BrowserContext* context) const override;
++  BrowserContextLifetimeTracker* GetBrowserContextLifetimeTracker() override;
++  base::FilePath GetBundleResourcePath(
++      const network::ResourceRequest& request,
++      const base::FilePath& extension_resources_path,
++      int* resource_id) const override;
++  void LoadResourceFromResourceBundle(
++      const network::ResourceRequest& request,
++      mojo::PendingReceiver<network::mojom::URLLoader> loader,
++      const base::FilePath& resource_relative_path,
++      int resource_id,
++      scoped_refptr<net::HttpResponseHeaders> headers,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      content::BrowserContext* browser_context) override;
++  bool AllowCrossRendererResourceLoad(
++      const network::ResourceRequest& request,
++      network::mojom::RequestDestination destination,
++      ui::PageTransition page_transition,
++      content::ChildProcessId child_id,
++      bool is_incognito,
++      const Extension* extension,
++      const ExtensionSet& extensions,
++      const ProcessMap& process_map,
++      const GURL& upstream_url) override;
++  void GetEarlyExtensionPrefsObservers(
++      content::BrowserContext* context,
++      std::vector<EarlyExtensionPrefsObserver*>* observers) const override;
++  ProcessManagerDelegate* GetProcessManagerDelegate() const override;
++  mojo::PendingRemote<network::mojom::URLLoaderFactory>
++  GetControlledFrameEmbedderURLLoader(
++      const url::Origin& app_origin,
++      content::FrameTreeNodeId frame_tree_node_id,
++      content::BrowserContext* browser_context) override;
++  std::unique_ptr<ExtensionHostDelegate> CreateExtensionHostDelegate() override;
++  bool DidVersionUpdate(content::BrowserContext* context) override;
++  void PermitExternalProtocolHandler() override;
++  bool IsInDemoMode() override;
++  bool IsScreensaverInDemoMode(const std::string& app_id) override;
++  bool IsRunningInForcedAppMode() override;
++  bool IsAppModeForcedForApp(const ExtensionId& id) override;
++  bool IsLoggedInAsPublicAccount() override;
++  ExtensionSystemProvider* GetExtensionSystemFactory() override;
++  void RegisterBrowserInterfaceBindersForFrame(
++      mojo::BinderMapWithContext<content::RenderFrameHost*>* binder_map,
++      content::RenderFrameHost* render_frame_host,
++      const Extension* extension) const override;
++  std::unique_ptr<RuntimeAPIDelegate> CreateRuntimeAPIDelegate(
++      content::BrowserContext* context) const override;
++  const ComponentExtensionResourceManager*
++  GetComponentExtensionResourceManager() override;
++  void BroadcastEventToRenderers(
++      events::HistogramValue histogram_value,
++      const std::string& event_name,
++      scoped_refptr<const EventArgs> args,
++      bool dispatch_to_off_the_record_profiles) override;
++  ExtensionCache* GetExtensionCache() override;
++  bool IsBackgroundUpdateAllowed() override;
++  bool IsMinBrowserVersionSupported(const std::string& min_version) override;
++  void CreateExtensionWebContentsObserver(
++      content::WebContents* web_contents) override;
++  ExtensionWebContentsObserver* GetExtensionWebContentsObserver(
++      content::WebContents* web_contents) override;
++  KioskDelegate* GetKioskDelegate() override;
++  SafeBrowsingDelegate* GetSafeBrowsingDelegate() override;
++  std::string GetApplicationLocale() override;
++  bool IsExtensionEnabled(const ExtensionId& extension_id,
++                          content::BrowserContext* context) const override;
++  network::mojom::NetworkContext* GetSystemNetworkContext() override;
++  ExtensionManagementClient* GetExtensionManagementClient(
++      content::BrowserContext* context) override;
++  base::FilePath GetUserDataDir() override;
++  bool CanUseNonComponentExtensions(content::BrowserContext* context) override;
++  void CanInstallExtensionByPolicy(
++      content::BrowserContext* context,
++      const ExtensionId& extension_id,
++      const base::Version& extension_version,
++      base::OnceCallback<void(bool, std::u16string)> callback) override;
++
++ private:
++  class IOSKioskDelegate final : public KioskDelegate {
++   public:
++    bool IsAutoLaunchedKioskApp(const ExtensionId& id) const override;
++  };
++
++  class IOSExtensionManagementClient final : public ExtensionManagementClient {
++   public:
++    explicit IOSExtensionManagementClient(
++        const IOSExtensionsBrowserClient* owner);
++    ~IOSExtensionManagementClient() override;
++
++    bool UpdatesFromWebstore(const Extension& extension) override;
++    bool IsInstallationExplicitlyAllowed(const ExtensionId& id) override;
++    bool IsForceInstalledInLowTrustEnvironment(
++        const Extension& extension) override;
++    const URLPatternSet& GetPolicyBlockedHosts(
++        const Extension* extension) override;
++    const URLPatternSet& GetPolicyAllowedHosts(
++        const Extension* extension) override;
++    bool UsesDefaultPolicyHostRestrictions(const Extension* extension) override;
++    bool BlocklistedByDefault() const override;
++    GURL GetEffectiveUpdateURL(const Extension& extension) override;
++    bool IsAllowedManifestType(Manifest::Type manifest_type,
++                               const std::string& extension_id) const override;
++    ManagedInstallationMode GetInstallationMode(
++        const Extension* extension) override;
++    ManagedInstallationMode GetInstallationMode(
++        const ExtensionId& extension_id,
++        const std::string& update_url) override;
++    bool IsInstallationExplicitlyBlocked(const ExtensionId& id) override;
++    const std::string BlockedInstallMessage(const ExtensionId& id) override;
++    bool IsPermissionSetAllowed(const Extension* extension,
++                                const PermissionSet& perms) override;
++    bool IsPermissionSetAllowed(const ExtensionId& extension_id,
++                                const std::string& update_url,
++                                const PermissionSet& perms) override;
++
++   private:
++    const raw_ptr<const IOSExtensionsBrowserClient> owner_;
++    const URLPatternSet empty_host_patterns_;
++  };
++
++  std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
++
++  std::atomic<bool> is_shutting_down_{false};
++  bool initialized_ = false;
++
++  mutable base::Lock context_lock_;
++  base::flat_map<content::BrowserContext*, raw_ptr<ProfileIOS>>
++      registered_contexts_ GUARDED_BY(context_lock_);
++
++  mutable base::Lock bundled_allowlist_lock_;
++  base::flat_set<base::FilePath> allowed_bundled_paths_
++      GUARDED_BY(bundled_allowlist_lock_);
++  base::flat_set<ExtensionId> allowed_bundled_ids_
++      GUARDED_BY(bundled_allowlist_lock_);
++
++  std::unique_ptr<ExtensionsAPIClient> api_client_;
++  NullExtensionCache extension_cache_;
++  IOSKioskDelegate kiosk_delegate_;
++  SafeBrowsingDelegate safe_browsing_delegate_;
++  IOSExtensionManagementClient management_client_{this};
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_CLIENT_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -0,0 +1,761 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++
++#include <utility>
++
++#include "base/base_paths.h"
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/version.h"
++#include "components/application_locale_storage/application_locale_storage.h"
++#include "components/crx_file/id_util.h"
++#include "components/keyed_service/content/browser_context_dependency_manager.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++#include "components/user_prefs/user_prefs.h"
++#include "components/version_info/version_info.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_delegate.h"
++#include "extensions/browser/api/core_extensions_browser_api_provider.h"
++#include "extensions/browser/api/extensions_api_client.h"
++#include "extensions/browser/api/runtime/runtime_api_delegate.h"
++#include "extensions/browser/browser_context_keyed_service_factories.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_host_delegate.h"
++#include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_system.h"
++#include "extensions/browser/extensions_browser_interface_binders.h"
++#include "extensions/browser/load_error_reporter.h"
++#include "extensions/browser/pref_names.h"
++#include "extensions/browser/url_request_util.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/features/feature_channel.h"
++#include "extensions/common/manifest_handlers/background_info.h"
++#include "extensions/common/manifest_handlers/manifest_url_handler.h"
++#include "extensions/common/mojom/manifest.mojom-shared.h"
++#include "extensions/common/switches.h"
++#include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
++#include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
++#include "ios/chrome/browser/shared/model/application_context/application_context.h"
++#include "ios/chrome/browser/shared/model/paths/paths.h"
++#include "ios/chrome/browser/shared/model/profile/profile_ios.h"
++#include "ios/chrome/common/channel_info.h"
++#include "ios/web/content/content_browser_context.h"
++#include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
++#include "url/gurl.h"
++
++namespace {
++
++void EnsureIOSExtensionFactoriesBuilt() {
++  static const bool factories_built = [] {
++    extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
++    extensions::IOSExtensionSystemFactory::GetInstance();
++    return true;
++  }();
++  (void)factories_built;
++}
++
++class IOSExtensionHostDelegate final : public extensions::ExtensionHostDelegate {
++ public:
++  IOSExtensionHostDelegate() = default;
++  ~IOSExtensionHostDelegate() override = default;
++
++  void OnExtensionHostCreated(content::WebContents* web_contents) override {}
++
++  void CreateTab(std::unique_ptr<content::WebContents> web_contents,
++                 const GURL& target_url,
++                 const extensions::ExtensionId& extension_id,
++                 ui::mojom::WindowOpenDisposition disposition,
++                 const blink::mojom::WindowFeatures& window_features,
++                 bool user_gesture) override {}
++
++  void ProcessMediaAccessRequest(
++      content::WebContents* web_contents,
++      const content::MediaStreamRequest& request,
++      content::MediaResponseCallback callback,
++      const extensions::Extension* extension) override {
++    std::move(callback).Run(
++        blink::mojom::StreamDevicesSet(),
++        blink::mojom::MediaStreamRequestResult::NOT_SUPPORTED, nullptr);
++  }
++
++  bool CheckMediaAccessPermission(
++      content::RenderFrameHost* render_frame_host,
++      const url::Origin& security_origin,
++      blink::mojom::MediaStreamType type,
++      const extensions::Extension* extension) override {
++    return false;
++  }
++
++  content::PictureInPictureResult EnterPictureInPicture(
++      content::WebContents* web_contents) override {
++    return content::PictureInPictureResult::kNotSupported;
++  }
++
++  void ExitPictureInPicture() override {}
++};
++
++class IOSRuntimeAPIDelegate final : public extensions::RuntimeAPIDelegate {
++ public:
++  explicit IOSRuntimeAPIDelegate(content::BrowserContext* browser_context)
++      : browser_context_(browser_context) {}
++  ~IOSRuntimeAPIDelegate() override = default;
++
++  void AddUpdateObserver(extensions::UpdateObserver* observer) override {}
++  void RemoveUpdateObserver(extensions::UpdateObserver* observer) override {}
++
++  void ReloadExtension(const extensions::ExtensionId& extension_id) override {
++    (void)browser_context_;
++  }
++
++  bool CheckForUpdates(const extensions::ExtensionId& extension_id,
++                       UpdateCheckCallback callback) override {
++    return false;
++  }
++
++  void OpenURL(const GURL& uninstall_url) override {}
++
++  bool GetPlatformInfo(extensions::api::runtime::PlatformInfo* info) override {
++    // runtime.PlatformOs currently has no `ios` enumerator upstream.
++    return false;
++  }
++
++  bool RestartDevice(std::string* error_message) override {
++    if (error_message) {
++      *error_message = "Restart is not supported on iOS.";
++    }
++    return false;
++  }
++
++ private:
++  raw_ptr<content::BrowserContext> browser_context_;
++};
++
++}  // namespace
++
++base::FilePath GetIOSBundledExtensionDirectory() {
++  base::FilePath assets_dir;
++  if (!base::PathService::Get(base::DIR_ASSETS, &assets_dir)) {
++    return base::FilePath();
++  }
++  return assets_dir.AppendASCII("Extensions").AppendASCII("iOSProbe");
++}
++
++void InitializeIOSExtensionsBrowserClient() {
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  if (extensions::ExtensionsBrowserClient::Get() != client) {
++    extensions::ExtensionsBrowserClient::Set(client);
++  }
++  client->Init();
++  EnsureIOSExtensionFactoriesBuilt();
++}
++
++void StartTearDownIOSExtensionsBrowserClient() {
++  if (auto* client = extensions::ExtensionsBrowserClient::Get()) {
++    client->StartTearDown();
++  }
++}
++
++void RegisterIOSExtensionPrefs(user_prefs::PrefRegistrySyncable* registry) {
++  CHECK(registry);
++  EnsureIOSExtensionFactoriesBuilt();
++  extensions::ExtensionPrefs::RegisterProfilePrefs(registry);
++  BrowserContextDependencyManager::GetInstance()
++      ->RegisterProfilePrefsForServices(registry);
++}
++
++void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
++  CHECK(profile);
++  if (profile->IsOffTheRecord()) {
++    return;
++  }
++  InitializeIOSExtensionsBrowserClient();
++
++  content::BrowserContext* browser_context =
++      web::ContentBrowserContext::FromBrowserState(profile);
++  CHECK(browser_context);
++
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  client->RegisterBrowserContext(browser_context, profile);
++
++  BrowserContextDependencyManager::GetInstance()->MarkBrowserContextLive(
++      browser_context);
++  if (!user_prefs::UserPrefs::Get(browser_context)) {
++    user_prefs::UserPrefs::Set(browser_context, profile->GetPrefs());
++  }
++  BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
++      browser_context);
++  extensions::ExtensionSystem::Get(browser_context)
++      ->InitForRegularProfile(/*extensions_enabled=*/true);
++}
++
++void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
++  if (!profile || profile->IsOffTheRecord()) {
++    return;
++  }
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  content::BrowserContext* browser_context =
++      web::ContentBrowserContext::FromBrowserState(profile);
++  if (!client->IsValidContext(browser_context)) {
++    return;
++  }
++  BrowserContextDependencyManager::GetInstance()->DestroyBrowserContextServices(
++      browser_context);
++  client->UnregisterBrowserContext(browser_context);
++}
++
++namespace extensions {
++
++// static
++IOSExtensionsBrowserClient* IOSExtensionsBrowserClient::GetInstance() {
++  static base::NoDestructor<IOSExtensionsBrowserClient> instance;
++  return instance.get();
++}
++
++IOSExtensionsBrowserClient::IOSExtensionsBrowserClient()
++    : api_client_(std::make_unique<ExtensionsAPIClient>()) {
++  AddAPIProvider(std::make_unique<CoreExtensionsBrowserAPIProvider>());
++  SetCurrentChannel(::GetChannel());
++
++  const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
++  if (!bundled_dir.empty()) {
++    SetAllowedBundledExtension(bundled_dir,
++                               crx_file::id_util::GenerateIdForPath(bundled_dir));
++  }
++}
++
++IOSExtensionsBrowserClient::~IOSExtensionsBrowserClient() = default;
++
++void IOSExtensionsBrowserClient::RegisterBrowserContext(
++    content::BrowserContext* context,
++    ProfileIOS* profile) {
++  CHECK(context);
++  CHECK(profile);
++  base::AutoLock lock(context_lock_);
++  registered_contexts_[context] = profile;
++}
++
++void IOSExtensionsBrowserClient::UnregisterBrowserContext(
++    content::BrowserContext* context) {
++  base::AutoLock lock(context_lock_);
++  registered_contexts_.erase(context);
++}
++
++void IOSExtensionsBrowserClient::SetAllowedBundledExtension(
++    const base::FilePath& canonical_path,
++    const ExtensionId& extension_id) {
++  base::AutoLock lock(bundled_allowlist_lock_);
++  if (!canonical_path.empty()) {
++    allowed_bundled_paths_.insert(canonical_path);
++  }
++  if (!extension_id.empty()) {
++    allowed_bundled_ids_.insert(extension_id);
++  }
++}
++
++bool IOSExtensionsBrowserClient::IsAllowedBundledExtension(
++    const Extension& extension) const {
++  if (extension.location() != mojom::ManifestLocation::kUnpacked ||
++      !extension.is_extension()) {
++    return false;
++  }
++  // MV3 service workers and background hosts require context-aware ProcessMap
++  // adaptation under single-process Blink; restrict the initial bundled
++  // fixture strictly to content scripts.
++  if (BackgroundInfo::HasBackgroundPage(&extension) ||
++      BackgroundInfo::IsServiceWorkerBased(&extension)) {
++    return false;
++  }
++  base::AutoLock lock(bundled_allowlist_lock_);
++  return allowed_bundled_paths_.contains(extension.path()) &&
++         allowed_bundled_ids_.contains(extension.id());
++}
++
++bool IOSExtensionsBrowserClient::IsAllowedBundledExtensionId(
++    const ExtensionId& extension_id) const {
++  base::AutoLock lock(bundled_allowlist_lock_);
++  return allowed_bundled_ids_.contains(extension_id);
++}
++
++void IOSExtensionsBrowserClient::Init() {
++  if (initialized_) {
++    return;
++  }
++  initialized_ = true;
++  LoadErrorReporter::Init(/*enable_noisy_errors=*/false);
++}
++
++void IOSExtensionsBrowserClient::StartTearDown() {
++  is_shutting_down_.store(true, std::memory_order_relaxed);
++}
++
++bool IOSExtensionsBrowserClient::IsShuttingDown() {
++  return is_shutting_down_.load(std::memory_order_relaxed);
++}
++
++bool IOSExtensionsBrowserClient::AreExtensionsDisabled(
++    const base::CommandLine& command_line,
++    content::BrowserContext* context) {
++  return command_line.HasSwitch(switches::kDisableExtensions) ||
++         AreExtensionsDisabledForContext(context);
++}
++
++bool IOSExtensionsBrowserClient::IsValidContext(void* context) {
++  if (!context) {
++    return false;
++  }
++  base::AutoLock lock(context_lock_);
++  return registered_contexts_.contains(
++      static_cast<content::BrowserContext*>(context));
++}
++
++bool IOSExtensionsBrowserClient::IsSameContext(content::BrowserContext* first,
++                                               content::BrowserContext* second) {
++  return first && first == second;
++}
++
++bool IOSExtensionsBrowserClient::HasOffTheRecordContext(
++    content::BrowserContext* context) {
++  return false;
++}
++
++content::BrowserContext* IOSExtensionsBrowserClient::GetOffTheRecordContext(
++    content::BrowserContext* context) {
++  return nullptr;
++}
++
++content::BrowserContext* IOSExtensionsBrowserClient::GetOriginalContext(
++    content::BrowserContext* context) {
++  return context;
++}
++
++content::BrowserContext*
++IOSExtensionsBrowserClient::GetContextRedirectedToOriginal(
++    content::BrowserContext* context) {
++  return (!context || context->IsOffTheRecord()) ? nullptr : context;
++}
++
++content::BrowserContext*
++IOSExtensionsBrowserClient::GetContextRedirectedToOriginalWithoutAshInternals(
++    content::BrowserContext* context) {
++  return GetContextRedirectedToOriginal(context);
++}
++
++content::BrowserContext* IOSExtensionsBrowserClient::GetContextOwnInstance(
++    content::BrowserContext* context) {
++  return (!context || context->IsOffTheRecord()) ? nullptr : context;
++}
++
++content::BrowserContext* IOSExtensionsBrowserClient::GetContextForOriginalOnly(
++    content::BrowserContext* context) {
++  return (!context || context->IsOffTheRecord()) ? nullptr : context;
++}
++
++bool IOSExtensionsBrowserClient::AreExtensionsDisabledForContext(
++    content::BrowserContext* context) {
++  return !context || context->IsOffTheRecord() || !IsValidContext(context);
++}
++
++bool IOSExtensionsBrowserClient::IsGuestSession(
++    content::BrowserContext* context) const {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsExtensionIncognitoEnabled(
++    const ExtensionId& extension_id,
++    content::BrowserContext* context) const {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsExtensionIncognitoEnabled(
++    const Extension* extension,
++    content::BrowserContext* context) const {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::CanExtensionCrossIncognito(
++    const Extension* extension,
++    content::BrowserContext* context) const {
++  return false;
++}
++
++BrowserContextLifetimeTracker*
++IOSExtensionsBrowserClient::GetBrowserContextLifetimeTracker() {
++  return nullptr;
++}
++
++base::FilePath IOSExtensionsBrowserClient::GetBundleResourcePath(
++    const network::ResourceRequest& request,
++    const base::FilePath& extension_resources_path,
++    int* resource_id) const {
++  if (resource_id) {
++    *resource_id = 0;
++  }
++  return base::FilePath();
++}
++
++void IOSExtensionsBrowserClient::LoadResourceFromResourceBundle(
++    const network::ResourceRequest& request,
++    mojo::PendingReceiver<network::mojom::URLLoader> loader,
++    const base::FilePath& resource_relative_path,
++    int resource_id,
++    scoped_refptr<net::HttpResponseHeaders> headers,
++    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++    content::BrowserContext* browser_context) {}
++
++bool IOSExtensionsBrowserClient::AllowCrossRendererResourceLoad(
++    const network::ResourceRequest& request,
++    network::mojom::RequestDestination destination,
++    ui::PageTransition page_transition,
++    content::ChildProcessId child_id,
++    bool is_incognito,
++    const Extension* extension,
++    const ExtensionSet& extensions,
++    const ProcessMap& process_map,
++    const GURL& upstream_url) {
++  bool allowed = false;
++  if (url_request_util::AllowCrossRendererResourceLoad(
++          request, destination, page_transition, child_id, is_incognito,
++          extension, extensions, process_map, upstream_url, &allowed)) {
++    return allowed;
++  }
++  return false;
++}
++
++void IOSExtensionsBrowserClient::GetEarlyExtensionPrefsObservers(
++    content::BrowserContext* context,
++    std::vector<EarlyExtensionPrefsObserver*>* observers) const {}
++
++ProcessManagerDelegate*
++IOSExtensionsBrowserClient::GetProcessManagerDelegate() const {
++  return nullptr;
++}
++
++mojo::PendingRemote<network::mojom::URLLoaderFactory>
++IOSExtensionsBrowserClient::GetControlledFrameEmbedderURLLoader(
++    const url::Origin& app_origin,
++    content::FrameTreeNodeId frame_tree_node_id,
++    content::BrowserContext* browser_context) {
++  return {};
++}
++
++std::unique_ptr<ExtensionHostDelegate>
++IOSExtensionsBrowserClient::CreateExtensionHostDelegate() {
++  return std::make_unique<IOSExtensionHostDelegate>();
++}
++
++bool IOSExtensionsBrowserClient::DidVersionUpdate(
++    content::BrowserContext* context) {
++  ExtensionPrefs* extension_prefs = ExtensionPrefs::Get(context);
++  if (!extension_prefs) {
++    return false;
++  }
++  PrefService* pref_service = extension_prefs->pref_service();
++  base::Version last_version;
++  if (pref_service->HasPrefPath(pref_names::kLastChromeVersion)) {
++    last_version =
++        base::Version(pref_service->GetString(pref_names::kLastChromeVersion));
++  }
++  const std::string current_version_str(version_info::GetVersionNumber());
++  const base::Version& current_version = version_info::GetVersion();
++  pref_service->SetString(pref_names::kLastChromeVersion, current_version_str);
++  if (!last_version.IsValid()) {
++    return true;
++  }
++  if (!current_version.IsValid()) {
++    return false;
++  }
++  return last_version < current_version;
++}
++
++void IOSExtensionsBrowserClient::PermitExternalProtocolHandler() {}
++
++bool IOSExtensionsBrowserClient::IsInDemoMode() {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsScreensaverInDemoMode(
++    const std::string& app_id) {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsRunningInForcedAppMode() {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsAppModeForcedForApp(const ExtensionId& id) {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsLoggedInAsPublicAccount() {
++  return false;
++}
++
++ExtensionSystemProvider*
++IOSExtensionsBrowserClient::GetExtensionSystemFactory() {
++  return IOSExtensionSystemFactory::GetInstance();
++}
++
++void IOSExtensionsBrowserClient::RegisterBrowserInterfaceBindersForFrame(
++    mojo::BinderMapWithContext<content::RenderFrameHost*>* binder_map,
++    content::RenderFrameHost* render_frame_host,
++    const Extension* extension) const {
++  PopulateExtensionFrameBinders(binder_map, render_frame_host, extension);
++}
++
++std::unique_ptr<RuntimeAPIDelegate>
++IOSExtensionsBrowserClient::CreateRuntimeAPIDelegate(
++    content::BrowserContext* context) const {
++  return std::make_unique<IOSRuntimeAPIDelegate>(context);
++}
++
++const ComponentExtensionResourceManager*
++IOSExtensionsBrowserClient::GetComponentExtensionResourceManager() {
++  return nullptr;
++}
++
++void IOSExtensionsBrowserClient::BroadcastEventToRenderers(
++    events::HistogramValue histogram_value,
++    const std::string& event_name,
++    scoped_refptr<const EventArgs> args,
++    bool dispatch_to_off_the_record_profiles) {
++  if (!content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE,
++        base::BindOnce(&IOSExtensionsBrowserClient::BroadcastEventToRenderers,
++                       base::Unretained(this), histogram_value, event_name,
++                       std::move(args), dispatch_to_off_the_record_profiles));
++    return;
++  }
++  if (IsShuttingDown()) {
++    return;
++  }
++  for (content::BrowserContext* context : GetRegisteredContextsSnapshot()) {
++    if (EventRouter* event_router = EventRouter::Get(context)) {
++      event_router->BroadcastEvent(
++          std::make_unique<Event>(histogram_value, event_name, args));
++    }
++  }
++}
++
++ExtensionCache* IOSExtensionsBrowserClient::GetExtensionCache() {
++  return &extension_cache_;
++}
++
++bool IOSExtensionsBrowserClient::IsBackgroundUpdateAllowed() {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IsMinBrowserVersionSupported(
++    const std::string& min_version) {
++  const base::Version& browser_version = version_info::GetVersion();
++  const base::Version min_parsed(min_version);
++  return !browser_version.IsValid() || !min_parsed.IsValid() ||
++         min_parsed.CompareTo(browser_version) <= 0;
++}
++
++void IOSExtensionsBrowserClient::CreateExtensionWebContentsObserver(
++    content::WebContents* web_contents) {
++  IOSExtensionWebContentsObserver::CreateForWebContents(web_contents);
++}
++
++ExtensionWebContentsObserver*
++IOSExtensionsBrowserClient::GetExtensionWebContentsObserver(
++    content::WebContents* web_contents) {
++  return IOSExtensionWebContentsObserver::FromWebContents(web_contents);
++}
++
++KioskDelegate* IOSExtensionsBrowserClient::GetKioskDelegate() {
++  return &kiosk_delegate_;
++}
++
++SafeBrowsingDelegate* IOSExtensionsBrowserClient::GetSafeBrowsingDelegate() {
++  return &safe_browsing_delegate_;
++}
++
++std::string IOSExtensionsBrowserClient::GetApplicationLocale() {
++  ApplicationContext* app_context = GetApplicationContext();
++  if (app_context && app_context->GetApplicationLocaleStorage()) {
++    return app_context->GetApplicationLocaleStorage()->Get();
++  }
++  return "en-US";
++}
++
++bool IOSExtensionsBrowserClient::IsExtensionEnabled(
++    const ExtensionId& extension_id,
++    content::BrowserContext* context) const {
++  if (!context) {
++    return false;
++  }
++  if (auto* registrar = ExtensionRegistrar::Get(context);
++      registrar && registrar->IsInitialized()) {
++    return registrar->IsExtensionEnabled(extension_id);
++  }
++  if (auto* registry = ExtensionRegistry::Get(context)) {
++    return registry->enabled_extensions().Contains(extension_id);
++  }
++  return false;
++}
++
++network::mojom::NetworkContext*
++IOSExtensionsBrowserClient::GetSystemNetworkContext() {
++  ApplicationContext* app_context = GetApplicationContext();
++  return app_context ? app_context->GetSystemNetworkContext() : nullptr;
++}
++
++ExtensionManagementClient*
++IOSExtensionsBrowserClient::GetExtensionManagementClient(
++    content::BrowserContext* context) {
++  return &management_client_;
++}
++
++base::FilePath IOSExtensionsBrowserClient::GetUserDataDir() {
++  base::FilePath user_data_dir;
++  base::PathService::Get(ios::DIR_USER_DATA, &user_data_dir);
++  return user_data_dir;
++}
++
++bool IOSExtensionsBrowserClient::CanUseNonComponentExtensions(
++    content::BrowserContext* context) {
++  return context && !context->IsOffTheRecord() && IsValidContext(context);
++}
++
++void IOSExtensionsBrowserClient::CanInstallExtensionByPolicy(
++    content::BrowserContext* context,
++    const ExtensionId& extension_id,
++    const base::Version& extension_version,
++    base::OnceCallback<void(bool, std::u16string)> callback) {
++  const bool allowed = IsAllowedBundledExtensionId(extension_id);
++  std::move(callback).Run(
++      allowed, allowed ? std::u16string()
++                       : u"Only the bundled iOS probe extension is permitted.");
++}
++
++std::vector<content::BrowserContext*>
++IOSExtensionsBrowserClient::GetRegisteredContextsSnapshot() const {
++  base::AutoLock lock(context_lock_);
++  std::vector<content::BrowserContext*> contexts;
++  contexts.reserve(registered_contexts_.size());
++  for (const auto& [context, _] : registered_contexts_) {
++    contexts.push_back(context);
++  }
++  return contexts;
++}
++
++bool IOSExtensionsBrowserClient::IOSKioskDelegate::IsAutoLaunchedKioskApp(
++    const ExtensionId& id) const {
++  return false;
++}
++
++IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IOSExtensionManagementClient(const IOSExtensionsBrowserClient* owner)
++    : owner_(owner) {}
++
++IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    ~IOSExtensionManagementClient() = default;
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    UpdatesFromWebstore(const Extension& extension) {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsInstallationExplicitlyAllowed(const ExtensionId& id) {
++  return owner_->IsAllowedBundledExtensionId(id);
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsForceInstalledInLowTrustEnvironment(const Extension& extension) {
++  return false;
++}
++
++const URLPatternSet&
++IOSExtensionsBrowserClient::IOSExtensionManagementClient::GetPolicyBlockedHosts(
++    const Extension* extension) {
++  return empty_host_patterns_;
++}
++
++const URLPatternSet&
++IOSExtensionsBrowserClient::IOSExtensionManagementClient::GetPolicyAllowedHosts(
++    const Extension* extension) {
++  return empty_host_patterns_;
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    UsesDefaultPolicyHostRestrictions(const Extension* extension) {
++  return false;
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    BlocklistedByDefault() const {
++  return false;
++}
++
++GURL IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    GetEffectiveUpdateURL(const Extension& extension) {
++  return ManifestURL::GetUpdateURL(&extension);
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsAllowedManifestType(Manifest::Type manifest_type,
++                          const std::string& extension_id) const {
++  return manifest_type == Manifest::Type::kExtension &&
++         owner_->IsAllowedBundledExtensionId(extension_id);
++}
++
++ManagedInstallationMode IOSExtensionsBrowserClient::
++    IOSExtensionManagementClient::GetInstallationMode(
++        const Extension* extension) {
++  return (extension && owner_->IsAllowedBundledExtension(*extension))
++             ? ManagedInstallationMode::kAllowed
++             : ManagedInstallationMode::kBlocked;
++}
++
++ManagedInstallationMode IOSExtensionsBrowserClient::
++    IOSExtensionManagementClient::GetInstallationMode(
++        const ExtensionId& extension_id,
++        const std::string& update_url) {
++  return owner_->IsAllowedBundledExtensionId(extension_id)
++             ? ManagedInstallationMode::kAllowed
++             : ManagedInstallationMode::kBlocked;
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsInstallationExplicitlyBlocked(const ExtensionId& id) {
++  return !owner_->IsAllowedBundledExtensionId(id);
++}
++
++const std::string IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    BlockedInstallMessage(const ExtensionId& id) {
++  return owner_->IsAllowedBundledExtensionId(id)
++             ? std::string()
++             : "Only the bundled iOS probe extension is permitted.";
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsPermissionSetAllowed(const Extension* extension,
++                           const PermissionSet& perms) {
++  return extension && owner_->IsAllowedBundledExtension(*extension);
++}
++
++bool IOSExtensionsBrowserClient::IOSExtensionManagementClient::
++    IsPermissionSetAllowed(const ExtensionId& extension_id,
++                           const std::string& update_url,
++                           const PermissionSet& perms) {
++  return owner_->IsAllowedBundledExtensionId(extension_id);
++}
++
++}  // namespace extensions

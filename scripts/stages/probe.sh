@@ -24,6 +24,10 @@ obj/extensions/browser/browser_sources/process_manager.o
 obj/extensions/renderer/renderer/dispatcher.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_renderer_client.o
+obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
+obj/ios/chrome/browser/extensions/model/model/ios_extension_system_factory.o
+obj/ios/chrome/browser/extensions/model/model/ios_extension_web_contents_observer.o
+obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_client.o
 EOF
   python3 - <<'PY'
 import os
