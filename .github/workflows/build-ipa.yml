@@ -640,11 +640,22 @@ jobs:
 
           # Linux codegen's generated tree, minus host binaries and Linux ninja
           # state. Extracted before `gn gen` so this host's ninja files win.
-          zstd -dc "$RUNNER_TEMP/s2a/codegen_gen.tar.zst" \
+          # GNU tar stores Chromium's hard-linked copies as links (e.g.
+          # icudtl.dat -> clang_x64/icudtl.dat); links into the excluded host
+          # trees cannot resolve here and are skipped. check_inputs below
+          # still fails the job if an Apple edge needed one of them.
+          tar_err="$RUNNER_TEMP/s2a_tar.err"
+          if ! zstd -dc "$RUNNER_TEMP/s2a/codegen_gen.tar.zst" \
             | tar -C "$out_dir" \
                 --exclude 'clang_x64*' --exclude 'local_rustc_sysroot' \
                 --exclude '.ninja_log' --exclude '.ninja_deps' --exclude '*.ninja' \
-                -xf -
+                -xf - 2> "$tar_err"; then
+            if grep -vE "Hard-link target '(clang_x64|local_rustc_sysroot)|Error exit delayed" "$tar_err"; then
+              echo "::error::Unexpected errors while extracting s2a"
+              exit 1
+            fi
+          fi
+          echo "==> Skipped $(grep -c 'Hard-link target' "$tar_err" || true) hard links into excluded host trees"
           rm -rf "$RUNNER_TEMP/s2a"
 
           (cd "$work/src" && "$work/src/buildtools/mac/gn" gen out/Release)
@@ -750,6 +761,9 @@ jobs:
           ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s1_ref }}" "$RUNNER_TEMP/s1"
           ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s2a_ref }}" "$RUNNER_TEMP/s2a"
           ./scripts/apply_patches.sh --src-dir "$work/src"
+          # Pruned compile edges still order-depend on codegen's host tools,
+          # whose recorded inputs include these Linux-only deps.
+          ./scripts/overlay_linux_host_deps.py --work-dir "$work"
 
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -pass env:CI_ARTIFACT_KEY \
