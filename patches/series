@@ -37,3 +37,4 @@
 0038-ios-sideload-one-resize-per-turn.patch
 0046-ios-sideload-google-services-off-by-default.patch
 0047-ios-extensions-guard-renderer-chrome-resources.patch
+0048-ios-extensions-guard-test-support-chrome-buildflags.patch

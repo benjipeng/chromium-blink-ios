@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions probe: guard //chrome/common:buildflags in //extensions:test_support
+
+diff --git a/extensions/BUILD.gn b/extensions/BUILD.gn
+index 46d4571..cad3203 100644
+--- a/extensions/BUILD.gn
++++ b/extensions/BUILD.gn
+@@ -156,7 +156,6 @@ static_library("test_support") {
+     ":extensions_resources",
+     "//base",
+     "//build:chromeos_buildflags",
+-    "//chrome/common:buildflags",
+     "//components/crx_file",
+     "//components/keyed_service/content",
+     "//components/pref_registry",
+@@ -186,6 +185,10 @@ static_library("test_support") {
+     "//third_party/zlib/google:zip",
+   ]
+ 
++  if (!is_ios) {
++    deps += [ "//chrome/common:buildflags" ]
++  }
++
+   if (enable_platform_apps) {
+     sources += [
+       "browser/app_window/test_app_window_contents.cc",
