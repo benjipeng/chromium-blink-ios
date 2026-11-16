@@ -20,11 +20,12 @@ Modes:
               command (it reads that file).
   apple-only  Turns every edge that does not run `apple_tool_wrapper` into an
               input-less phony, except phony/stamp groups, which keep their
-              inputs (as phonies) so Apple edges stay ordered among
-              themselves. `ninja <apple outputs>` then executes exactly the
-              Swift / xcassets / ibtool / intents steps against a pre-populated
-              gen/ tree (used on macOS with Linux codegen outputs), after
-              reporting any generated input that tree lacks.
+              inputs so Apple edges stay ordered among themselves. Fails first
+              if a generated file the Apple edges read is missing from the
+              codegen tree (used on macOS).
+  link-only   Turns the compile edges of objects imported from the shards into
+              input-less phonies, so `ninja chrome` archives, links and
+              assembles the bundle without compiling anything.
 
 The rewrite is deterministic and idempotent; every stage applies it right after
 `gn gen` so all stages agree on the same graph.
@@ -39,188 +40,17 @@ import re
 import sys
 import threading
 
-COMPILE_TOOLS = ("cc", "cxx", "objc", "objcxx", "asm", "alink")
-UNTOUCHED_TOOLS = (
-    "link",
-    "solink",
-    "solink_module",
-    "rust_bin",
-    "rust_cdylib",
-    "rust_dylib",
-    "rust_macro",
-    "rust_staticlib",
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from ninja_graph import (  # noqa: E402
+    _COMPILE_RE,
+    _STAMP_RE,
+    _UNTOUCHED_RE,
+    Contract,
+    Graph,
+    is_target_object,
+    render_build,
+    unescape,
 )
-_COMPILE_RE = re.compile(r"^(?:.+_)?(?:%s)$" % "|".join(COMPILE_TOOLS))
-_UNTOUCHED_RE = re.compile(r"^(?:.+_)?(?:%s)$" % "|".join(UNTOUCHED_TOOLS))
-_STAMP_RE = re.compile(r"^(?:.+_)?stamp$")
-
-
-class Edge:
-    __slots__ = ("file", "start", "end", "outs", "iouts", "rule", "ins", "iins", "oins", "vins", "binds")
-
-    def __init__(self, file: int, start: int, end: int) -> None:
-        self.file = file
-        self.start = start
-        self.end = end
-        self.outs: list[str] = []
-        self.iouts: list[str] = []
-        self.rule = ""
-        self.ins: list[str] = []
-        self.iins: list[str] = []
-        self.oins: list[str] = []
-        self.vins: list[str] = []
-        self.binds = ""
-
-
-def tokenize(text: str) -> list[str]:
-    """Splits a build statement body on unescaped spaces and colons."""
-    toks: list[str] = []
-    cur: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "$" and i + 1 < n:
-            cur.append(text[i : i + 2])
-            i += 2
-        elif c == " ":
-            if cur:
-                toks.append("".join(cur))
-                cur = []
-            i += 1
-        elif c == ":":
-            if cur:
-                toks.append("".join(cur))
-                cur = []
-            toks.append(":")
-            i += 1
-        else:
-            cur.append(c)
-            i += 1
-    if cur:
-        toks.append("".join(cur))
-    return toks
-
-
-def unescape(tok: str) -> str:
-    return re.sub(r"\$(.)", r"\1", tok)
-
-
-def parse_build(edge: Edge, body: str) -> None:
-    toks = tokenize(body)
-    colon = toks.index(":")
-    section = edge.outs
-    for t in toks[:colon]:
-        if t == "|":
-            section = edge.iouts
-        else:
-            section.append(t)
-    rest = toks[colon + 1 :]
-    edge.rule = rest[0]
-    section = edge.ins
-    for t in rest[1:]:
-        if t == "|":
-            section = edge.iins
-        elif t == "||":
-            section = edge.oins
-        elif t == "|@":
-            section = edge.vins
-        else:
-            section.append(t)
-
-
-def render_build(
-    edge: Edge, ins: list[str], iins: list[str], oins: list[str], vins: list[str], rule: str | None = None
-) -> str:
-    parts = ["build", *edge.outs]
-    if edge.iouts:
-        parts += ["|", *edge.iouts]
-    head = " ".join(parts) + ":"
-    tail = [rule or edge.rule, *ins]
-    if iins:
-        tail += ["|", *iins]
-    if oins:
-        tail += ["||", *oins]
-    if vins:
-        tail += ["|@", *vins]
-    return head + " " + " ".join(tail) + "\n"
-
-
-class Graph:
-    def __init__(self, out_dir: pathlib.Path) -> None:
-        self.out_dir = out_dir
-        self.files: list[pathlib.Path] = []
-        self.lines: list[list[str]] = []
-        self.edges: list[Edge] = []
-        self.rules: dict[str, str] = {}
-        self.producer: dict[str, int] = {}
-        self._load(out_dir / "build.ninja")
-
-    def _load(self, root: pathlib.Path) -> None:
-        queue = collections.deque([root])
-        seen: set[pathlib.Path] = set()
-        while queue:
-            path = queue.popleft()
-            if path in seen:
-                continue
-            seen.add(path)
-            file_idx = len(self.files)
-            self.files.append(path)
-            raw = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            self.lines.append(raw)
-            i, n = 0, len(raw)
-            while i < n:
-                start = i
-                logical = raw[i].rstrip("\n")
-                while _continues(logical) and i + 1 < n:
-                    i += 1
-                    logical = logical[:-1] + raw[i].rstrip("\n").lstrip(" ")
-                i += 1
-                if logical.startswith("build "):
-                    edge = Edge(file_idx, start, i)
-                    parse_build(edge, logical[len("build ") :])
-                    binds: list[str] = []
-                    while i < n and raw[i].startswith((" ", "\t")) and raw[i].strip():
-                        binds.append(raw[i])
-                        i += 1
-                    edge.binds = "".join(binds)
-                    idx = len(self.edges)
-                    self.edges.append(edge)
-                    for o in edge.outs + edge.iouts:
-                        self.producer[o] = idx
-                elif logical.startswith("rule "):
-                    name = logical[len("rule ") :].strip()
-                    body: list[str] = []
-                    while i < n and raw[i].startswith((" ", "\t")) and raw[i].strip():
-                        body.append(raw[i])
-                        i += 1
-                    self.rules[name] = "".join(body)
-                elif logical.startswith(("subninja ", "include ")):
-                    rel = unescape(logical.split(" ", 1)[1].strip())
-                    queue.append(self.out_dir / rel)
-
-    def is_apple(self, edge: Edge) -> bool:
-        return "apple_tool_wrapper" in self.rules.get(edge.rule, "") or "apple_tool_wrapper" in edge.binds
-
-    def write(self, replacements: dict[int, dict[int, tuple[int, str]]]) -> int:
-        for file_idx, repl in replacements.items():
-            raw = self.lines[file_idx]
-            out: list[str] = []
-            i = 0
-            while i < len(raw):
-                if i in repl:
-                    end, text = repl[i]
-                    out.append(text)
-                    i = end
-                else:
-                    out.append(raw[i])
-                    i += 1
-            self.files[file_idx].write_text("".join(out), encoding="utf-8")
-        return len(replacements)
-
-
-def _continues(line: str) -> bool:
-    stripped = line.rstrip("$")
-    return (len(line) - len(stripped)) % 2 == 1
 
 
 def prune(graph: Graph) -> dict[int, dict[int, tuple[int, str]]]:
@@ -331,7 +161,6 @@ def apple_only(graph: Graph) -> dict[int, dict[int, tuple[int, str]]]:
             apple += 1
             continue
         bind_lines = e.binds.count("\n")
-        outs = " ".join(e.outs + e.iouts)
         if e.rule == "phony" or _STAMP_RE.match(e.rule):
             # Groups carry the ordering between Apple edges (a Swift module
             # waits on its Swift deps through their target phonies), so they
@@ -341,66 +170,83 @@ def apple_only(graph: Graph) -> dict[int, dict[int, tuple[int, str]]]:
                 text = render_build(e, e.ins, e.iins, e.oins, e.vins, rule="phony")
                 replacements[e.file][e.start] = (e.end + bind_lines, text)
             continue
-        replacements[e.file][e.start] = (e.end + bind_lines, f"build {outs}: phony\n")
+        replacements[e.file][e.start] = (e.end + bind_lines, f"build {' '.join(e.outs + e.iouts)}: phony\n")
     print(
         f"==> apple-only: kept {apple} Apple tool edge(s) and {grouping} grouping edge(s); "
         "all other edges are input-less phonies"
     )
-    report_missing_generated(graph)
     return replacements
 
 
-def report_missing_generated(graph: Graph) -> None:
-    """Lists generator outputs the Apple edges reach that are not on disk.
-
-    Those come from Linux codegen; a gap here otherwise surfaces as a puzzling
-    'file not found' deep inside swiftc or actool.
-    """
-    edges, producer = graph.edges, graph.producer
-    stack = [d for e in edges if graph.is_apple(e) for d in e.ins + e.iins + e.oins]
-    seen: set[str] = set()
-    missing: list[str] = []
-    while stack:
-        node = stack.pop()
-        if node in seen:
-            continue
-        seen.add(node)
-        idx = producer.get(node)
-        if idx is None:
-            continue
-        e = edges[idx]
-        rule = e.rule
-        if rule == "phony" or _STAMP_RE.match(rule):
-            stack.extend(e.ins + e.iins + e.oins)
-            continue
-        if graph.is_apple(e):
-            continue
-        builtin = not rule.startswith("__")
-        if builtin and (_COMPILE_RE.match(rule) or _UNTOUCHED_RE.match(rule) or rule.endswith("rust_rlib")):
-            continue  # Objects and binaries come from the Linux shards.
-        if node.startswith("clang_"):
-            continue  # This host's tools are never built here.
-        if not (graph.out_dir / unescape(node)).exists():
-            missing.append(unescape(node))
+def check_apple_inputs(graph: Graph, root: str) -> int:
+    """Fails when a generated file an Apple edge needs is not on disk."""
+    contract = Contract(graph)
+    _, order = contract.closure([contract.raw_of.get(root, root)])
+    required, ordering = contract.apple_inputs(contract.apple_edges(order))
+    missing = sorted(unescape(n) for n in required if not (graph.out_dir / unescape(n)).exists())
+    print(f"==> apple-only: {len(required)} generated input(s) required, "
+          f"{len(ordering)} bundle-ordering-only (produced after linking, not read)")
     if missing:
-        missing.sort()
-        print(f"::warning::{len(missing)} generated input(s) of Apple edges are missing from codegen's tree")
+        print(f"::error::{len(missing)} generated input(s) of Apple edges are missing from codegen's tree")
         for path in missing[:200]:
-            print(f"  missing: {path}")
-    else:
-        print("==> apple-only: every generated input of the Apple edges is present")
+            print(f"  missing: {path}  [{contract.edge(contract.raw_of[path]).rule}]")
+        return 1
+    return 0
+
+
+def link_only(graph: Graph, imported: set[str]) -> dict[int, dict[int, tuple[int, str]]]:
+    """Turns the compile edges of imported objects into input-less phonies.
+
+    Only target object compiles are replaced, and only when every output of
+    the edge was imported; archives, links, Swift replays and bundle steps
+    still run normally.
+    """
+    replacements: dict[int, dict[int, tuple[int, str]]] = collections.defaultdict(dict)
+    covered: set[str] = set()
+    for e in graph.edges:
+        outs = [unescape(o) for o in e.outs + e.iouts]
+        if not any(o in imported for o in outs):
+            continue
+        if not is_target_object(e):
+            raise ValueError(f"imported {outs[0]} is produced by rule {e.rule}, not a target compile")
+        partial = [o for o in outs if o not in imported]
+        if partial:
+            raise ValueError(f"compile edge for {outs[0]} also outputs {partial}, which were not imported")
+        covered.update(outs)
+        replacements[e.file][e.start] = (e.end + e.binds.count("\n"), f"build {' '.join(e.outs + e.iouts)}: phony\n")
+    unknown = sorted(imported - covered)
+    if unknown:
+        raise ValueError(f"{len(unknown)} imported file(s) have no compile edge, e.g. {unknown[:5]}")
+    print(f"==> link-only: {len(covered)} imported object(s) replace their compile edges")
+    return replacements
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out-dir", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("prune", "apple-only"), required=True)
+    parser.add_argument("--mode", choices=("prune", "apple-only", "link-only"), required=True)
+    parser.add_argument("--root", default="chrome", help="apple-only: app target whose Apple inputs are checked")
+    parser.add_argument("--imported-file", type=pathlib.Path, help="link-only: objects restored from the shards")
     args = parser.parse_args()
 
     out_dir = args.out_dir.resolve()
     graph = Graph(out_dir)
     print(f"==> Loaded {len(graph.edges)} build edges from {len(graph.files)} ninja files")
-    replacements = prune(graph) if args.mode == "prune" else apple_only(graph)
+    if args.mode == "prune":
+        replacements = prune(graph)
+    elif args.mode == "apple-only":
+        if check_apple_inputs(graph, args.root):
+            return 1
+        replacements = apple_only(graph)
+    else:
+        if not args.imported_file:
+            parser.error("--imported-file is required for link-only")
+        imported = {l.strip() for l in args.imported_file.read_text().splitlines() if l.strip()}
+        try:
+            replacements = link_only(graph, imported)
+        except ValueError as err:
+            print(f"::error::{err}")
+            return 1
     written = graph.write(replacements)
     print(f"==> Rewrote {written} ninja file(s) in {out_dir}")
     return 0

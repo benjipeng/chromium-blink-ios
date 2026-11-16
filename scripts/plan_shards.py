@@ -4,12 +4,12 @@
   - `apple-prebuild`: pre-link `swift`, `compile_xcassets`, `compile_ib_files`,
     and `intentbuilderc` targets (resolving directory outputs like `.storyboardc`
     to their declared inner Ninja file targets).
-  - `codegen`: generated sources/headers/snapshots (`gen/**`, including V8's
-    `embedded.S`), host executables (`clang_x64*/**`), and Rust `.rlib`/`.rmeta`
-    inside `chrome`'s true `ninja -t inputs` closure so parallel C++ shards
-    never re-run host tools or codegen, plus every other generated input of
-    the Apple tool edges (e.g. unzipped `obj/**/*.xcassets`) for Stage 1.
-  - `c-shard`: round-robin slice of target iOS `.o` object compilations.
+  - `codegen`: on the real graph, generated files (`gen/**`), host tools
+    (`clang_x64*/**`), Rust libs, and every generated input of the Apple edges
+    (e.g. unzipped `obj/**/*.xcassets`), minus any candidate whose build would
+    run target compile/link/Swift or Apple tools (those belong to later stages).
+  - `c-shard`: SHA-1 slice of the target object compiles (cc/cxx/objc/objcxx/asm)
+    in `chrome`; with --shard-count 1 it lists every object the link imports.
 """
 
 from __future__ import annotations
@@ -116,6 +116,9 @@ def collect_apple_prebuild_targets(
 _OBJ_OUT_RE = re.compile(r"(?:^|\s)-o\s+(?:'([^']+\.o)'|([^\s;&\"']+\.o))(?:\s|$)")
 
 
+_TARGET_OBJECT_RULE_RE = re.compile(r"^(?!__)(?:.+_)?(?:cc|cxx|objc|objcxx|asm)$")
+
+
 def collect_compile_object_targets(commands: list[str]) -> list[str]:
     objs: list[str] = []
     seen: set[str] = set()
@@ -135,162 +138,38 @@ def collect_compile_object_targets(commands: list[str]) -> list[str]:
     return objs
 
 
-def unquote_ninja_path(raw: str) -> str:
-    """Strips POSIX single-quote shell escaping emitted by Ninja 1.11+ `-t inputs`."""
-    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
-        return raw[1:-1].replace("'\\''", "'")
-    return raw
+def collect_codegen_targets(out_dir: pathlib.Path, root_target: str) -> tuple[list[str], list[str]]:
+    """Plans codegen on the real graph: generated files, host tools, Rust libs,
+    and every generated input of the Apple edges, minus any candidate whose
+    build would run target compile/link/Swift or Apple tools.
 
-
-def _arg_chunks(items: list[str], limit: int = 256 * 1024) -> list[list[str]]:
-    chunks: list[list[str]] = [[]]
-    size = 0
-    for item in items:
-        if chunks[-1] and size + len(item) + 1 > limit:
-            chunks.append([])
-            size = 0
-        chunks[-1].append(item)
-        size += len(item) + 1
-    return [c for c in chunks if c]
-
-
-_PHONY_INPUTS: dict[str, dict[str, list[str]]] = {}
-
-
-def load_phony_inputs(out_dir: pathlib.Path) -> dict[str, list[str]]:
-    """Maps every phony output to its direct inputs, read from the Ninja files.
-
-    Parsed directly rather than via `ninja -t query`, which also prints every
-    consumer of each node and would emit gigabytes on Chromium's graph.
+    Returns (planned, dropped); dropped candidates belong to later stages.
     """
-    cached = _PHONY_INPUTS.get(str(out_dir))
-    if cached is not None:
-        return cached
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    import rewrite_ninja_graph as rng
+    from ninja_graph import Contract, Graph, is_grouping, unescape
 
-    result: dict[str, list[str]] = {}
-    queue = collections.deque([out_dir / "build.ninja"])
-    seen: set[pathlib.Path] = set()
-    while queue:
-        path = queue.popleft()
-        if path in seen:
+    contract = Contract(Graph(out_dir))
+    _, order = contract.closure([contract.raw_of.get(root_target, root_target)])
+    apple_required, _ = contract.apple_inputs(contract.apple_edges(order))
+
+    planned: list[str] = []
+    dropped: list[str] = []
+    for node in order:
+        e = contract.edge(node)
+        if e is None or is_grouping(e):
             continue
-        seen.add(path)
-        raw = path.read_text(encoding="utf-8").splitlines()
-        i, n = 0, len(raw)
-        while i < n:
-            logical = raw[i]
-            while rng._continues(logical) and i + 1 < n:
-                i += 1
-                logical = logical[:-1] + raw[i].lstrip(" ")
-            i += 1
-            if logical.startswith("build ") and ": phony" in logical:
-                edge = rng.Edge(0, 0, 0)
-                rng.parse_build(edge, logical[len("build ") :])
-                if edge.rule == "phony":
-                    deps = [rng.unescape(d) for d in edge.ins + edge.iins + edge.oins]
-                    for out in edge.outs + edge.iouts:
-                        result[rng.unescape(out)] = deps
-            elif logical.startswith(("subninja ", "include ")):
-                queue.append(out_dir / rng.unescape(logical.split(" ", 1)[1].strip()))
-    _PHONY_INPUTS[str(out_dir)] = result
-    return result
-
-
-def collect_closure(
-    ninja_bin: str,
-    out_dir: pathlib.Path,
-    roots: list[str],
-) -> list[str]:
-    """Returns every node the roots transitively depend on.
-
-    Ninja 1.12's `-t inputs` walks phony edges but never prints their direct
-    inputs. GN routes hard deps through phonies (`*.harddeps`), so header-only
-    generators such as buildflag headers would otherwise vanish from the
-    closure. Direct inputs of every reachable phony are added back here.
-    """
-    closure: set[str] = set()
-    for chunk in _arg_chunks(roots):
-        closure.update(unquote_ninja_path(x) for x in run_ninja_tool(ninja_bin, out_dir, "inputs", *chunk))
-    phony_inputs = load_phony_inputs(out_dir)
-    stack = [n for n in (*roots, *closure) if n in phony_inputs]
-    seen: set[str] = set()
-    while stack:
-        node = stack.pop()
-        if node in seen:
-            continue
-        seen.add(node)
-        for dep in phony_inputs[node]:
-            closure.add(dep)
-            if dep in phony_inputs and dep not in seen:
-                stack.append(dep)
-    return sorted(closure)
-
-
-def collect_codegen_targets(
-    ninja_bin: str,
-    out_dir: pathlib.Path,
-    root_target: str,
-    declared: dict[str, str],
-) -> list[str]:
-    """Selects strictly transitive `chrome` inputs that produce `gen/**`, host tools, or Rust libs."""
-    closure = collect_closure(ninja_bin, out_dir, [root_target])
-    selected: list[str] = []
-    seen: set[str] = set()
-    skip_rules = {"phony", "stamp", "swift", "compile_xcassets"}
-
-    for item in closure:
-        rule = declared.get(item)
-        if not rule or rule in skip_rules:
-            continue
-        # Exclude post-link metadata extraction from pre-C++ codegen.
-        if "metadata" in item and item.endswith((".actionsdata", "version.json")):
-            continue
-        is_gen = item.startswith("gen/")
-        is_rust = item.startswith("local_rustc_sysroot/") or item.endswith((".rlib", ".rmeta"))
+        path = unescape(node)
+        is_gen = path.startswith("gen/")
+        is_rust = path.startswith("local_rustc_sysroot/") or path.endswith((".rlib", ".rmeta"))
         is_host_bin = (
-            item.startswith("clang_x64")
-            and "/" in item
-            and "/obj/" not in item
-            and not item.endswith((".o", ".a", ".d", ".stamp"))
+            path.startswith("clang_x64")
+            and "/obj/" not in path
+            and not path.endswith((".o", ".a", ".d", ".stamp"))
         )
-        if (is_gen or is_rust or is_host_bin) and item not in seen:
-            seen.add(item)
-            selected.append(item)
-    return selected
-
-
-_COMPILED_RULE_RE = re.compile(
-    r"^(?:.+_)?(?:cc|cxx|objc|objcxx|asm|alink|link|solink|solink_module|swift|compile_xcassets)$"
-)
-
-
-def collect_apple_input_targets(
-    ninja_bin: str,
-    out_dir: pathlib.Path,
-    apple_targets: list[str],
-    declared: dict[str, str],
-) -> list[str]:
-    """Selects generated inputs of the Apple tool edges that live outside gen/.
-
-    Stage 1 runs only the Apple edges on macOS against codegen's tree, so every
-    non-Apple file they read must come from codegen (e.g. the asset catalogs
-    that actions unzip into obj/**/*_zip/*.xcassets).
-    """
-    if not apple_targets:
-        return []
-    selected: list[str] = []
-    for item in collect_closure(ninja_bin, out_dir, apple_targets):
-        rule = declared.get(item)
-        if not rule or rule in ("phony", "stamp") or rule.endswith("_stamp"):
+        if not (is_gen or is_rust or is_host_bin or node in apple_required):
             continue
-        if _COMPILED_RULE_RE.match(rule) and not rule.startswith("__"):
-            continue
-        if item.startswith(("gen/", "clang_x64", "local_rustc_sysroot/")):
-            continue  # Already covered by the codegen selection.
-        selected.append(item)
-    return selected
+        (dropped if contract.reaches_off_limits(node) else planned).append(path)
+    return sorted(planned), sorted(dropped)
 
 
 def main() -> int:
@@ -305,6 +184,8 @@ def main() -> int:
     )
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--split-dir", type=pathlib.Path,
+                        help="c-shard: also write every shard's list to DIR/shard-<i>.txt")
     args = parser.parse_args()
 
     if args.mode == "apple-prebuild":
@@ -312,25 +193,26 @@ def main() -> int:
         declared = get_declared_targets(args.ninja, args.out_dir)
         targets = collect_apple_prebuild_targets(commands, declared)
     elif args.mode == "codegen":
-        declared = get_declared_targets(args.ninja, args.out_dir)
-        targets = collect_codegen_targets(args.ninja, args.out_dir, args.root_target, declared)
-        commands = run_ninja_tool(args.ninja, args.out_dir, "commands", args.root_target)
-        apple_targets = collect_apple_prebuild_targets(commands, declared)
-        extra = collect_apple_input_targets(args.ninja, args.out_dir, apple_targets, declared)
-        print(f"plan_shards: +{len(extra)} non-gen inputs of {len(apple_targets)} Apple targets", file=sys.stderr)
-        known = set(targets)
-        targets += [t for t in extra if t not in known]
+        targets, dropped = collect_codegen_targets(args.out_dir, args.root_target)
+        print(f"plan_shards: {len(targets)} codegen targets; {len(dropped)} candidates left to later "
+              f"stages (they need target or Apple work), e.g. {dropped[:3]}", file=sys.stderr)
     else:
         if not (0 <= args.shard_index < args.shard_count):
             raise ValueError("Invalid --shard-index / --shard-count")
         commands = run_ninja_tool(args.ninja, args.out_dir, "commands", args.root_target)
-        all_objs = collect_compile_object_targets(commands)
-        targets = [
-            obj
-            for obj in all_objs
-            if int(hashlib.sha1(obj.encode("utf-8")).hexdigest(), 16) % args.shard_count
-            == args.shard_index
-        ]
+        declared = get_declared_targets(args.ninja, args.out_dir)
+        # Only plain target compiles: these are exactly the edges the link
+        # stage replaces with imported objects (Swift objects come from Stage 1).
+        all_objs = [o for o in collect_compile_object_targets(commands) if _TARGET_OBJECT_RULE_RE.match(declared.get(o, ""))]
+        def shard_of(obj: str) -> int:
+            return int(hashlib.sha1(obj.encode("utf-8")).hexdigest(), 16) % args.shard_count
+
+        targets = [obj for obj in all_objs if shard_of(obj) == args.shard_index]
+        if args.split_dir:
+            args.split_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(args.shard_count):
+                (args.split_dir / f"shard-{i}.txt").write_text("".join(o + "\n" for o in all_objs if shard_of(o) == i))
+            (args.split_dir / "all.txt").write_text("".join(o + "\n" for o in all_objs))
 
     for t in targets:
         print(t)
