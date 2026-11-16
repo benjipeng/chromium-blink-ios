@@ -217,6 +217,7 @@ diff --git a/ios/chrome/app/resources/ios_chrome_repack.gni b/ios/chrome/app/res
  
      if (enable_builtin_search_provider_assets) {
 diff --git a/ios/web/content/init/extensions/ios_extensions_client.h b/ios/web/content/init/extensions/ios_extensions_client.h
+new file mode 100644
 --- /dev/null
 +++ b/ios/web/content/init/extensions/ios_extensions_client.h
 @@ -0,0 +1,25 @@
@@ -246,6 +247,7 @@ diff --git a/ios/web/content/init/extensions/ios_extensions_client.h b/ios/web/c
 +
 +#endif  // IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_CLIENT_H_
 diff --git a/ios/web/content/init/extensions/ios_extensions_client.cc b/ios/web/content/init/extensions/ios_extensions_client.cc
+new file mode 100644
 --- /dev/null
 +++ b/ios/web/content/init/extensions/ios_extensions_client.cc
 @@ -0,0 +1,136 @@
@@ -386,6 +388,7 @@ diff --git a/ios/web/content/init/extensions/ios_extensions_client.cc b/ios/web/
 +
 +}  // namespace web
 diff --git a/ios/web/content/init/extensions/ios_extensions_renderer_client.cc b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
+new file mode 100644
 --- /dev/null
 +++ b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
 @@ -0,0 +1,94 @@
@@ -484,6 +487,7 @@ diff --git a/ios/web/content/init/extensions/ios_extensions_renderer_client.cc b
 +
 +}  // namespace web
 diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+new file mode 100644
 --- /dev/null
 +++ b/ios/web/content/init/extensions/BUILD.gn
 @@ -0,0 +1,25 @@
