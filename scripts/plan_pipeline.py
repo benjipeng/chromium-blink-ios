@@ -59,6 +59,7 @@ NON_OUTPUT = {
     "ci/epochs.json",  # read per stage below
     "ci/ccache.env",
     "scripts/check_inputs.py",
+    "scripts/check_remote_patches.py",
     "scripts/compare_graphs.py",
     "scripts/diagnose_graph.py",
     "scripts/extract_xcode_stub.sh",

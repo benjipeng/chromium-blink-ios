@@ -1,5 +1,5 @@
 name: Probe Chromium build graph
-run-name: ${{ inputs.compile_extensions && 'Extension object probe' || 'GN probe' }} · ${{ github.ref_name }} · ${{ inputs.extra_gn_args || 'baseline' }}
+run-name: ${{ inputs.compile_extensions && 'Extension object probe' || 'GN probe' }} · ${{ github.ref_name }} · ${{ inputs.extra_gn_args || 'repository config' }}
 
 # Prepares the Linux tree exactly as the codegen stage does (scripts/stage.sh),
 # then plans codegen without compiling and audits the stage contract.
@@ -51,6 +51,8 @@ jobs:
       PERSIST_RESERVE_MIN: 10
     steps:
       - uses: actions/checkout@v5
+      - name: Check patches against pinned files before source preparation
+        run: python3 scripts/check_remote_patches.py
       - run: ./scripts/stage.sh plan refs
       - name: Record probe identity
         id: identity

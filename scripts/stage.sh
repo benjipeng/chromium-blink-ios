@@ -75,7 +75,16 @@ inject() {
 
 init_linux() {
   export_env JOB_START "$(date +%s)"
-  "$SCRIPTS/reclaim_disk_linux.sh"
+  local available_kb
+  available_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+  # The measured source snapshot is 22G + 1.2G depot_tools. Narrow probes
+  # reserve 70G for its download, SDK, ccache and generated prerequisites.
+  # Production builds still reclaim space for their much larger object trees.
+  if [ "$stage" = diagnose ] && [ "$available_kb" -ge 73400320 ]; then
+    log "Probe has at least 70 GiB free; skipping full runner cleanup"
+  else
+    "$SCRIPTS/reclaim_disk_linux.sh"
+  fi
   sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache
   oras_login
 }
