@@ -62,6 +62,20 @@ recorded 785 hits out of 794 cacheable calls, and saved its cache on failure.
 The next validation is the real staged IPA workflow, which also verifies the
 remaining production objects, libraries, resources, and final link.
 
+[Full IPA run 43974478096](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43974478096)
+completed production codegen with **6,715/6,715 compiler-cache hits** and verified
+its immutable GHCR checkpoint remotely. A parallel source audit then found two
+runtime blockers before the expensive device compilation: packaging deletes the
+reserved `Extensions/` directory, and frame permission checks dereference an
+`ExtensionWebViewHelper` created by the missing `WebViewCreated` hook. The run
+was cancelled while preparing Apple tools. The fixture now lives under
+`bundled_extensions/ios_probe`, packaging checks that both resources survive
+cleanup, and `IOSContentRendererClient` forwards `WebViewCreated` to the generic
+extension renderer client. These are source-verified fixes awaiting the next
+full build and runtime validation. Existing checkpoints and compiler caches
+remain retained; the conservative all-patches identity re-keys stages for these
+source changes. Narrowing that invalidation remains a later efficiency task.
+
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.

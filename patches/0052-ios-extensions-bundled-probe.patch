@@ -21,7 +21,7 @@ diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.
 +      "extensions/ios_probe/manifest.json",
 +    ]
 +    outputs = [
-+      "{{bundle_resources_dir}}/Extensions/iOSProbe/{{source_file_part}}",
++      "{{bundle_resources_dir}}/bundled_extensions/ios_probe/{{source_file_part}}",
 +    ]
 +  }
 +}

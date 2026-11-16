@@ -128,6 +128,16 @@ for sub in PlugIns Extensions; do
 done
 find "$bundle" -type d -name _CodeSignature -prune -exec rm -rf {} +
 
+if grep -Eq '^enable_extensions_core[[:space:]]*=[[:space:]]*true' "$REPO_ROOT/args/device.gn"; then
+  for resource in manifest.json content.js; do
+    [ -s "$bundle/bundled_extensions/ios_probe/$resource" ] || {
+      echo "error: bundled extension probe resource missing after packaging cleanup: $resource" >&2
+      exit 1
+    }
+  done
+  echo "==> Verified bundled extension probe resources after .appex cleanup"
+fi
+
 if [ "$with_app_groups" -eq 1 ]; then
   cat > "$work/entitlements.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

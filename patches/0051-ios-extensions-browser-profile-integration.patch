@@ -1597,7 +1597,7 @@ new file mode 100644
 +  if (!base::PathService::Get(base::DIR_ASSETS, &assets_dir)) {
 +    return base::FilePath();
 +  }
-+  return assets_dir.AppendASCII("Extensions").AppendASCII("iOSProbe");
++  return assets_dir.AppendASCII("bundled_extensions").AppendASCII("ios_probe");
 +}
 +
 +void InitializeIOSExtensionsBrowserClient() {
