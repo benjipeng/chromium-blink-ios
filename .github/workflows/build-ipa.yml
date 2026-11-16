@@ -9,6 +9,9 @@ name: Build Chromium Blink iOS IPA
 # Finished stages and shards are reused across runs; a new run only does the
 # work whose checkpoint is missing. To rebuild a stage on purpose, bump its
 # epoch in ci/epochs.json.
+#
+# Only a stage's build and checkpoint steps decide its outcome; ccache uploads
+# and summaries are best-effort and never block the stages after it.
 
 on:
   workflow_dispatch:
@@ -126,9 +129,11 @@ jobs:
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh codegen persist
       - name: Persist ccache bucket
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: ./scripts/stage.sh codegen persist-cache
       - name: Summary
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: >-
           ./scripts/write_job_summary.py --title "1 Codegen (Linux)"
@@ -164,6 +169,7 @@ jobs:
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh apple persist
       - name: Summary
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: >-
           ./scripts/write_job_summary.py --title "2 Apple tools (Mac)"
@@ -212,9 +218,11 @@ jobs:
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh compile persist
       - name: Persist ccache bucket
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: ./scripts/stage.sh compile persist-cache
       - name: Summary
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: >-
           ./scripts/write_job_summary.py --title "3 Compile shard ${{ matrix.shard }}"
@@ -257,6 +265,7 @@ jobs:
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh link persist
       - name: Summary
+        continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: >-
           ./scripts/write_job_summary.py --title "4 Link (Linux)"
