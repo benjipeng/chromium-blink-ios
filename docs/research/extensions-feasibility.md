@@ -8,6 +8,37 @@
 
 ## Executive Summary
 
+### Implementation checkpoint (`59d5919`, November 16)
+
+The experimental branch now contains actual common, renderer, browser, profile,
+and resource integration. This code is **under remote validation**; the latest
+completed C++ evidence remains the three-object probe below. It must not be
+described as a working extension-enabled IPA yet.
+
+- Extension flags live in shared, hashed `args/device.gn` for Linux and Mac.
+- Common API/permission providers, renderer dispatcher/frame hooks, extension
+  schemes, resource packs, and localized extension strings are wired in.
+- The browser client registers real profile prefs, context services,
+  `ExtensionRegistrar`, script management, and WebContents/Mojo bindings.
+- The extension system depends on prefs/registry; iOS process-manager,
+  registrar, and renderer-startup services depend on the system. This avoids
+  constructor reentrancy and keeps registrar delegates alive during teardown.
+- A bundled MV3 content-script fixture targets only `https://example.com/*`.
+  It requires `chrome.runtime.id` and `getManifest()` before adding its DOM
+  marker. Background hosts and MV3 workers remain rejected until the shared
+  process-identity checks are adapted and tested.
+- GN roots are shared by both hosts and hashed. The app-directory root pattern
+  keeps production app and explicit object-probe targets without disabling
+  `components_unittests`' extension dependency assertions.
+- GitHub checks the full patch series against pinned file slices before
+  downloading the source snapshot. Narrow object probes save compiler progress
+  with `actions/cache`, including after failure; formal stages still use
+  immutable GHCR checkpoints and verified shard object packages.
+
+The previous next-step architecture notes remain useful as background; this
+checkpoint is the current implementation state. No device validation or local
+Chromium compilation has been performed during this implementation round.
+
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.
