@@ -79,6 +79,26 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
   count=$((count + 1))
 done < "$series_file"
 
+if [ "$check_only" -eq 0 ]; then
+  # Pin patched files to a fixed mtime so every job sees identical timestamps:
+  # outputs restored from an earlier stage stay up to date instead of every
+  # job re-running the generators that read patched files.
+  python3 - "$REPO_ROOT/patches" "$series_file" "$src_dir" <<'PY'
+import os, pathlib, re, sys
+patches_dir, series_file, src_dir = map(pathlib.Path, sys.argv[1:4])
+epoch = 946684800  # 2000-01-01T00:00:00Z
+for raw in series_file.read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    text = (patches_dir / line).read_text(encoding="utf-8", errors="replace")
+    for m in re.finditer(r"^\+\+\+ b/(.+)$", text, flags=re.M):
+        path = src_dir / m.group(1).strip()
+        if path.is_file():
+            os.utime(path, (epoch, epoch))
+PY
+fi
+
 mode_label="applied"
 [ "$check_only" -eq 1 ] && mode_label="check-only"
 echo "==> Processed $count patches ($mode_label ok)."
