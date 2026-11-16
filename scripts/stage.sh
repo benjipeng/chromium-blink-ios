@@ -118,6 +118,17 @@ write_args() {
   fi
 }
 
+# The same production roots are used on Linux and Mac and enter every key.
+generate_graph() {
+  local source_dir="$1" gn_binary="$2" argument
+  local flags=()
+  while IFS= read -r argument || [ -n "$argument" ]; do
+    case "$argument" in ''|\#*) continue ;; esac
+    flags+=("$argument")
+  done < "$REPO_ROOT/ci/gn_gen.flags"
+  (cd "$source_dir" && "$gn_binary" gen out/Release "${flags[@]}")
+}
+
 decrypt_stub() {
   oci pull "${STUB_REF:?}" "$STATE/stub"
   openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass env:CI_ARTIFACT_KEY \
@@ -189,7 +200,7 @@ prepare_linux() {
     mkdir -p "$RUNNER_TEMP/graph-diagnosis"
     cp "$LOUT/args.gn" "$RUNNER_TEMP/graph-diagnosis/args.gn"
     set +e
-    (cd "$LWORK/src" && gn gen out/Release) > "$RUNNER_TEMP/graph-diagnosis/gn_gen.log" 2>&1
+    generate_graph "$LWORK/src" gn > "$RUNNER_TEMP/graph-diagnosis/gn_gen.log" 2>&1
     local gn_rc=$?
     set -e
     cat "$RUNNER_TEMP/graph-diagnosis/gn_gen.log"
@@ -200,7 +211,7 @@ prepare_linux() {
     fi
     snapshot_graph graph-raw
   else
-    (cd "$LWORK/src" && gn gen out/Release)
+    generate_graph "$LWORK/src" gn
   fi
   "$SCRIPTS/rewrite_ninja_graph.py" --out-dir "$LOUT" --mode prune
   [ "$role" = diagnose ] && snapshot_graph graph-pruned

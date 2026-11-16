@@ -32,7 +32,7 @@ apple_prepare() {
   log "Skipped $(grep -c 'Hard-link target' "$err" || true) hard links into excluded host trees"
   rm -rf "$STATE/codegen"
   export PATH="$MWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  (cd "$MWORK/src" && "$MWORK/src/buildtools/mac/gn" gen out/Release)
+  generate_graph "$MWORK/src" "$MWORK/src/buildtools/mac/gn"
   # Plan on the full graph, then reduce it to the Apple edges (which also
   # verifies every generated input they read came from codegen).
   "$SCRIPTS/plan_shards.py" --ninja "$MWORK/src/third_party/ninja/ninja" --out-dir "$MOUT" \

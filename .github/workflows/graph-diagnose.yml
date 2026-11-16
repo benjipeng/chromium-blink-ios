@@ -108,6 +108,7 @@ jobs:
       - name: Restore probe compiler cache
         if: inputs.compile_extensions
         id: probe_cache
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache

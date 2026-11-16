@@ -516,4 +516,19 @@ new file mode 100644
 +    "//url",
 +  ]
 +}
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -7,6 +7,11 @@
+   "+content/public/browser",
+   "+content/public/common",
+   "+content/public/renderer",
++  "+extensions/browser",
++  "+extensions/buildflags",
++  "+extensions/common",
++  "+extensions/renderer",
++  "+services/service_manager/public/cpp",
+   "+third_party/blink/public/common/switches.h",
+   # keep-sorted end
+ ]
 

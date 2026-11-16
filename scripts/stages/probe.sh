@@ -10,12 +10,12 @@ probe_compile() {
   export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/no-apple-outputs"
   mkdir -p "$CCACHE_DIR" "$APPLE_TOOL_CACHE_DIR"
   if [ "${PROBE_CACHE_RESTORED:-false}" != true ]; then
-    if pull_bucket "ghcr.io/${GITHUB_REPOSITORY,,}/chromium-ios-ccache:$CHROMIUM_REV-codegen"; then
+    if (pull_bucket "ghcr.io/${GITHUB_REPOSITORY,,}/chromium-ios-ccache:$CHROMIUM_REV-codegen"); then
       # Reuse the normal shard seed policy: retain only entries this probe reads.
       find "$CCACHE_DIR" -type f -exec touch -t 200001010000 {} +
       touch "$STATE/probe_cache_seeded"
     else
-      log "No warm codegen ccache bucket; continuing"
+      log "No usable warm codegen ccache bucket; continuing with compiler verification"
     fi
   fi
   cat > "$art/compile_targets.txt" <<'EOF'
