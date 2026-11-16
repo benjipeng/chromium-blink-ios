@@ -518,6 +518,11 @@ jobs:
             for hd in clang_x64*; do
               [ -d "$hd" ] && pack_items+=("$hd")
             done
+            # Generated Apple tool inputs that live outside the packed trees.
+            while IFS= read -r t; do
+              case "$t" in gen/*|obj/*|clang_x64*|local_rustc_sysroot/*) continue ;; esac
+              [ -e "$t" ] && pack_items+=("$t")
+            done < "$RUNNER_TEMP/codegen_targets.txt"
             tar -cf - "${pack_items[@]}" | zstd -T0 -4 -o "$RUNNER_TEMP/s2a_out/codegen_gen.tar.zst"
           )
           rm -rf /tmp/cb_work
@@ -678,8 +683,9 @@ jobs:
 
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting ninja on pre-link Apple targets"
           if [ -s "$RUNNER_TEMP/apple_targets.txt" ]; then
+            # -k 0: surface every failing Apple step in a single run.
             tr '\n' '\0' < "$RUNNER_TEMP/apple_targets.txt" \
-              | xargs -0 "$work/src/third_party/ninja/ninja" -C "$out_dir" \
+              | xargs -0 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
               2>&1 | tee "$RUNNER_TEMP/ninja.log"
           fi
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Finished pre-link Apple targets"

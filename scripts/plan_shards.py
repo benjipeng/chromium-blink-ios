@@ -7,7 +7,8 @@
   - `codegen`: generated sources/headers/snapshots (`gen/**`, including V8's
     `embedded.S`), host executables (`clang_x64*/**`), and Rust `.rlib`/`.rmeta`
     inside `chrome`'s true `ninja -t inputs` closure so parallel C++ shards
-    never re-run host tools or codegen.
+    never re-run host tools or codegen, plus every other generated input of
+    the Apple tool edges (e.g. unzipped `obj/**/*.xcassets`) for Stage 1.
   - `c-shard`: round-robin slice of target iOS `.o` object compilations.
 """
 
@@ -176,6 +177,44 @@ def collect_codegen_targets(
     return selected
 
 
+_COMPILED_RULE_RE = re.compile(
+    r"^(?:.+_)?(?:cc|cxx|objc|objcxx|asm|alink|link|solink|solink_module|swift|compile_xcassets)$"
+)
+
+
+def collect_apple_input_targets(
+    ninja_bin: str,
+    out_dir: pathlib.Path,
+    apple_targets: list[str],
+    declared: dict[str, str],
+) -> list[str]:
+    """Selects generated inputs of the Apple tool edges that live outside gen/.
+
+    Stage 1 runs only the Apple edges on macOS against codegen's tree, so every
+    non-Apple file they read must come from codegen (e.g. the asset catalogs
+    that actions unzip into obj/**/*_zip/*.xcassets).
+    """
+    if not apple_targets:
+        return []
+    closure: set[str] = set()
+    for i in range(0, len(apple_targets), 500):
+        closure.update(
+            unquote_ninja_path(x)
+            for x in run_ninja_tool(ninja_bin, out_dir, "inputs", *apple_targets[i : i + 500])
+        )
+    selected: list[str] = []
+    for item in sorted(closure):
+        rule = declared.get(item)
+        if not rule or rule in ("phony", "stamp") or rule.endswith("_stamp"):
+            continue
+        if _COMPILED_RULE_RE.match(rule) and not rule.startswith("__"):
+            continue
+        if item.startswith(("gen/", "clang_x64", "local_rustc_sysroot/")):
+            continue  # Already covered by the codegen selection.
+        selected.append(item)
+    return selected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ninja", default="ninja", help="Path to ninja binary")
@@ -197,6 +236,12 @@ def main() -> int:
     elif args.mode == "codegen":
         declared = get_declared_targets(args.ninja, args.out_dir)
         targets = collect_codegen_targets(args.ninja, args.out_dir, args.root_target, declared)
+        commands = run_ninja_tool(args.ninja, args.out_dir, "commands", args.root_target)
+        apple_targets = collect_apple_prebuild_targets(commands, declared)
+        extra = collect_apple_input_targets(args.ninja, args.out_dir, apple_targets, declared)
+        print(f"plan_shards: +{len(extra)} non-gen inputs of {len(apple_targets)} Apple targets", file=sys.stderr)
+        known = set(targets)
+        targets += [t for t in extra if t not in known]
     else:
         if not (0 <= args.shard_index < args.shard_count):
             raise ValueError("Invalid --shard-index / --shard-count")
