@@ -112,6 +112,10 @@ write_args() {
   mkdir -p "$out"
   cp "$REPO_ROOT/args/device.gn" "$out/args.gn"
   sed "s|@BUNDLE_ID_PREFIX@|$BUNDLE_ID_PREFIX|" "$REPO_ROOT/ci/gn_args.$host" >> "$out/args.gn"
+  if [ -n "${EXTRA_GN_ARGS:-}" ]; then
+    printf '\n# Extra GN args\n' >> "$out/args.gn"
+    printf '%s\n' "$EXTRA_GN_ARGS" | tr ';' '\n' >> "$out/args.gn"
+  fi
 }
 
 decrypt_stub() {
@@ -181,8 +185,23 @@ prepare_linux() {
     restore_apple_cache
   fi
   export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
-  (cd "$LWORK/src" && gn gen out/Release)
-  [ "$role" = diagnose ] && snapshot_graph graph-raw
+  if [ "$role" = diagnose ]; then
+    mkdir -p "$RUNNER_TEMP/graph-diagnosis"
+    cp "$LOUT/args.gn" "$RUNNER_TEMP/graph-diagnosis/args.gn"
+    set +e
+    (cd "$LWORK/src" && gn gen out/Release) > "$RUNNER_TEMP/graph-diagnosis/gn_gen.log" 2>&1
+    local gn_rc=$?
+    set -e
+    cat "$RUNNER_TEMP/graph-diagnosis/gn_gen.log"
+    { echo "### gn gen (exit $gn_rc)"; echo '```text'; tail -c 60000 "$RUNNER_TEMP/graph-diagnosis/gn_gen.log"; echo '```'; } \
+      >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    if [ "$gn_rc" -ne 0 ]; then
+      return "$gn_rc"
+    fi
+    snapshot_graph graph-raw
+  else
+    (cd "$LWORK/src" && gn gen out/Release)
+  fi
   "$SCRIPTS/rewrite_ninja_graph.py" --out-dir "$LOUT" --mode prune
   [ "$role" = diagnose ] && snapshot_graph graph-pruned
   return 0

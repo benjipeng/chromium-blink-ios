@@ -12,6 +12,10 @@ on:
         description: Run ID of an earlier diagnosis whose artifact is the comparison baseline (blank to skip)
         default: "43868838103"
         type: string
+      extra_gn_args:
+        description: Extra GN args appended to args.gn (newline or semicolon separated)
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -30,6 +34,7 @@ jobs:
     env:
       CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
       BASELINE_RUN: ${{ inputs.baseline_run }}
+      EXTRA_GN_ARGS: ${{ inputs.extra_gn_args }}
     steps:
       - uses: actions/checkout@v5
       - run: ./scripts/stage.sh plan refs
@@ -50,7 +55,7 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compare with baseline
-        if: always() && inputs.baseline_run != ''
+        if: success() && inputs.baseline_run != ''
         run: |
           gh run download "$BASELINE_RUN" -R "$GITHUB_REPOSITORY" -n graph-diagnosis -D "$RUNNER_TEMP/baseline"
           ./scripts/compare_graphs.py --baseline "$RUNNER_TEMP/baseline" --current "$RUNNER_TEMP/graph-diagnosis" \
