@@ -1,0 +1,4 @@
+ios_app_bundle_id_prefix = "@BUNDLE_ID_PREFIX@"
+ios_sdk_developer_dir = "//xcode_stub"
+apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
+cc_wrapper = "ccache"

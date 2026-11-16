@@ -1,41 +1,35 @@
 name: Build Chromium Blink iOS IPA
 
+# Orchestration only: every stage runs scripts/stage.sh, and its checkpoint key
+# comes from scripts/plan_pipeline.py (inputs by content, never this YAML).
+#
+#   0 SDK stub (Mac) -> 1 Codegen (Linux) -> 2 Apple tools (Mac)
+#     -> 3 Compile x 18 (Linux, parallel) -> 4 Link (Linux) -> 5 Package (Mac)
+#
+# Finished stages and shards are reused across runs; a new run only does the
+# work whose checkpoint is missing. To rebuild a stage on purpose, bump its
+# epoch in ci/epochs.json.
+
 on:
   workflow_dispatch:
     inputs:
-      build_mode:
-        description: "Compile strategy: 'auto' runs the parallel shard farm on warm per-shard ccache; 'incremental' compiles inside the link job from the merged ccache"
-        required: false
-        type: choice
-        options:
-          - auto
-          - incremental
-        default: auto
-      force_from:
-        description: "Ignore stage checkpoints from this stage onward"
-        required: false
-        type: choice
-        options:
-          - none
-          - codegen
-          - stage1
-          - shards
-          - link
-          - package
-        default: none
       with_app_groups:
         description: "Ad-hoc sign IPA with App Group entitlements"
-        required: false
         type: boolean
         default: false
       publish_release:
         description: "Publish built IPA to GitHub Releases"
-        required: false
         type: boolean
         default: false
+      inject_failure:
+        description: "Recovery test: fail on purpose (shard 0 before/after its checkpoint, or link before linking)"
+        type: choice
+        options: [none, shard-before-commit, shard-after-commit, link]
+        default: none
 
+# Every workflow that writes GHCR checkpoints shares this group.
 concurrency:
-  group: build-ipa
+  group: ghcr-writes
   cancel-in-progress: false
 
 permissions:
@@ -44,1124 +38,256 @@ permissions:
   actions: read
 
 env:
-  # Free plan: 20 concurrent jobs. 18 shards leave headroom for other runs.
-  SHARD_COUNT: "18"
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ORAS_USER: ${{ github.actor }}
 
 jobs:
+  preflight:
+    name: Preflight - source & SDK
+    runs-on: ubuntu-24.04
+    outputs:
+      stub_tag: ${{ steps.preflight.outputs.stub_tag }}
+      need_sdk: ${{ steps.preflight.outputs.need_sdk }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: preflight
+        run: ./scripts/stage.sh plan preflight
+
+  sdk:
+    name: 0 SDK stub (Mac)
+    needs: preflight
+    if: needs.preflight.outputs.need_sdk == 'true'
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      STUB_TAG: ${{ needs.preflight.outputs.stub_tag }}
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/stage.sh sdk run
+
   plan:
-    name: Resolve Checkpoints & Execution Plan
+    name: Plan
+    needs: [preflight, sdk]
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-24.04
     outputs:
       chromium_rev: ${{ steps.plan.outputs.chromium_rev }}
       chromium_version: ${{ steps.plan.outputs.chromium_version }}
       src_ref: ${{ steps.plan.outputs.src_ref }}
       stub_ref: ${{ steps.plan.outputs.stub_ref }}
-      s1_ref: ${{ steps.plan.outputs.s1_ref }}
-      s2a_ref: ${{ steps.plan.outputs.s2a_ref }}
-      shards_ref: ${{ steps.plan.outputs.shards_ref }}
-      s3_ref: ${{ steps.plan.outputs.s3_ref }}
+      codegen_ref: ${{ steps.plan.outputs.codegen_ref }}
+      apple_ref: ${{ steps.plan.outputs.apple_ref }}
+      compile_prefix: ${{ steps.plan.outputs.compile_prefix }}
+      link_ref: ${{ steps.plan.outputs.link_ref }}
       ccache_repo: ${{ steps.plan.outputs.ccache_repo }}
-      merged_ccache_ref: ${{ steps.plan.outputs.merged_ccache_ref }}
-      k1: ${{ steps.plan.outputs.k1 }}
-      k2: ${{ steps.plan.outputs.k2 }}
-      k3: ${{ steps.plan.outputs.k3 }}
-      k4: ${{ steps.plan.outputs.k4 }}
-      has_stub: ${{ steps.plan.outputs.has_stub }}
-      has_merged_ccache: ${{ steps.plan.outputs.has_merged_ccache }}
-      incremental_link: ${{ steps.plan.outputs.incremental_link }}
-      run_stub: ${{ steps.plan.outputs.run_stub }}
-      run_stage1: ${{ steps.plan.outputs.run_stage1 }}
-      run_codegen: ${{ steps.plan.outputs.run_codegen }}
-      run_shards: ${{ steps.plan.outputs.run_shards }}
-      run_link: ${{ steps.plan.outputs.run_link }}
-      run_package: ${{ steps.plan.outputs.run_package }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
       shards_json: ${{ steps.plan.outputs.shards_json }}
+      run_codegen: ${{ steps.plan.outputs.run_codegen }}
+      run_apple: ${{ steps.plan.outputs.run_apple }}
+      run_compile: ${{ steps.plan.outputs.run_compile }}
+      run_link: ${{ steps.plan.outputs.run_link }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Compute chained stage keys, probe GHCR checkpoints, and plan resume
-        id: plan
-        run: |
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          python3 - \
-            "${{ github.repository }}" \
-            "${{ inputs.build_mode }}" \
-            "${{ inputs.force_from }}" \
-            "${{ inputs.with_app_groups }}" \
-            "${SHARD_COUNT}" \
-            "$GITHUB_OUTPUT" <<'PY'
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import re
-          import subprocess
-          import sys
-
-          repo, build_mode, force_from, with_app_groups, shard_count, gh_out = sys.argv[1:7]
-          repo_lc = repo.lower()
-
-          lock: dict[str, str] = {}
-          for raw in pathlib.Path("version.lock").read_text(encoding="utf-8").splitlines():
-              line = raw.split("#", 1)[0].strip()
-              if "=" in line:
-                  k, v = line.split("=", 1)
-                  lock[k.strip()] = v.strip()
-
-          chromium_rev = lock["CHROMIUM_REV"]
-          chromium_version = lock["CHROMIUM_VERSION"]
-          xcode_build = lock["XCODE_BUILD"]
-          bundle_prefix = lock["BUNDLE_ID_PREFIX"]
-
-          def hash_items(*parts: str | pathlib.Path) -> str:
-              h = hashlib.sha256()
-              for item in parts:
-                  if isinstance(item, pathlib.Path):
-                      if item.is_dir():
-                          for sub in sorted(item.rglob("*")):
-                              if sub.is_file():
-                                  h.update(sub.as_posix().encode())
-                                  h.update(b"\0")
-                                  h.update(sub.read_bytes())
-                                  h.update(b"\0")
-                      elif item.is_file():
-                          h.update(item.as_posix().encode())
-                          h.update(b"\0")
-                          h.update(item.read_bytes())
-                          h.update(b"\0")
-                  else:
-                      h.update(str(item).encode())
-                      h.update(b"\0")
-              return h.hexdigest()[:20]
-
-          stub_hash = hash_items(pathlib.Path("scripts/extract_xcode_stub.sh"))[:12]
-          stub_tag = f"{xcode_build}-{stub_hash}"
-
-          # Each stage key also hashes the YAML of the job(s) producing it, so
-          # inline config (args.gn overlays, packing lists, ninja targets)
-          # invalidates exactly the stages it affects and nothing upstream.
-          workflow_lines = pathlib.Path(".github/workflows/build-ipa.yml").read_text(
-              encoding="utf-8"
-          ).splitlines(keepends=True)
-
-          def job_yaml(job_id: str) -> str:
-              start = None
-              for i, line in enumerate(workflow_lines):
-                  if start is None:
-                      if line.rstrip() == f"  {job_id}:":
-                          start = i
-                  elif re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
-                      return "".join(workflow_lines[start:i])
-              if start is None:
-                  sys.exit(f"::error::job '{job_id}' not found in build-ipa.yml")
-              return "".join(workflow_lines[start:])
-
-          # Codegen (Linux) is the root of the build graph: host tools, Rust,
-          # and every generated source/header, on the pruned Ninja graph.
-          k2 = hash_items(
-              "codegen-v3",
-              chromium_rev,
-              stub_tag,
-              bundle_prefix,
-              pathlib.Path("patches"),
-              pathlib.Path("args"),
-              pathlib.Path("scripts/apply_patches.sh"),
-              pathlib.Path("scripts/apple_tool_wrapper.py"),
-              pathlib.Path("scripts/plan_shards.py"),
-              pathlib.Path("scripts/rewrite_ninja_graph.py"),
-              pathlib.Path("scripts/overlay_linux_host_deps.py"),
-              job_yaml("codegen"),
-          )
-          # Stage 1 (Mac) runs only the Apple tool edges against codegen's
-          # gen/ tree, so it chains on K2.
-          k1 = hash_items(
-              "stage1-v2",
-              k2,
-              xcode_build,
-              pathlib.Path("scripts/bootstrap_macos_host_tools.sh"),
-              job_yaml("apple-prebuild"),
-          )
-          # KS marks a fully compiled shard farm (merged ccache complete), so a
-          # link-only failure resumes at link instead of re-running the shards.
-          ks = hash_items("shards-v2", k1, k2, shard_count, job_yaml("compile-shards"))
-          k3 = hash_items("link-v3", ks, job_yaml("link"))
-          k4 = hash_items(
-              "package-v1",
-              k3,
-              with_app_groups,
-              pathlib.Path("scripts/package_ipa.sh"),
-              job_yaml("apple-package"),
-          )
-
-          src_ref = f"ghcr.io/{repo_lc}/chromium-ios-src:{chromium_rev}"
-          stub_ref = f"ghcr.io/{repo_lc}/xcode-stub:{stub_tag}"
-          s1_ref = f"ghcr.io/{repo_lc}/stage-cache:stage1-{k1}"
-          s2a_ref = f"ghcr.io/{repo_lc}/stage-cache:codegen-{k2}"
-          shards_ref = f"ghcr.io/{repo_lc}/stage-cache:shards-{ks}"
-          s3_ref = f"ghcr.io/{repo_lc}/stage-cache:link-{k3}"
-          ccache_repo = f"ghcr.io/{repo_lc}/chromium-ios-ccache"
-          merged_ccache_ref = f"{ccache_repo}:{chromium_rev}"
-
-          def oci_exists(ref: str) -> bool:
-              r = subprocess.run(
-                  ["./scripts/oci_artifacts.sh", "exists", ref],
-                  stdout=subprocess.DEVNULL,
-                  stderr=subprocess.DEVNULL,
-              )
-              return r.returncode == 0
-
-          if not oci_exists(src_ref):
-              print(f"::error::Source snapshot {src_ref} not found. Run 'Sync Pruned Source to GHCR' first.", file=sys.stderr)
-              sys.exit(1)
-
-          raw_has_stub = oci_exists(stub_ref)
-          raw_has_s1 = oci_exists(s1_ref)
-          raw_has_s2a = oci_exists(s2a_ref)
-          raw_has_s3 = oci_exists(s3_ref)
-          has_merged_ccache = oci_exists(merged_ccache_ref)
-          raw_has_shards = has_merged_ccache and oci_exists(shards_ref)
-
-          eff_s1 = raw_has_s1
-          eff_s2a = raw_has_s2a
-          eff_shards = raw_has_shards
-          eff_s3 = raw_has_s3
-          force_shards = False
-
-          if force_from == "codegen":
-              eff_s2a = eff_s1 = eff_shards = eff_s3 = False
-              force_shards = True
-          elif force_from == "stage1":
-              eff_s1 = eff_shards = eff_s3 = False
-              force_shards = True
-          elif force_from == "shards":
-              eff_shards = eff_s3 = False
-              force_shards = True
-          elif force_from == "link":
-              eff_s3 = False
-          elif force_from == "package":
-              pass
-
-          if build_mode == "incremental" and not has_merged_ccache:
-              print(f"::warning::Requested 'incremental' but {merged_ccache_ref} is missing; falling back to 'auto'.")
-              build_mode = "auto"
-
-          run_package = True
-          if eff_s3:
-              run_link = False
-              run_shards = False
-              run_codegen = False
-              run_stage1 = False
-          else:
-              run_link = True
-              run_stage1 = not eff_s1
-              # Warm per-shard buckets recompile only changed TUs across the
-              # farm, so wall-clock stays bounded regardless of change size.
-              # 'incremental' (serial, inside the link job) is opt-in only.
-              if force_shards:
-                  run_shards = True
-              else:
-                  run_shards = build_mode != "incremental" and not eff_shards
-              # Stage 1, the shards, and the link all consume codegen's tree.
-              run_codegen = not eff_s2a
-
-          run_stub = run_link and not raw_has_stub
-          # Only a link job that compiles real misses needs to refresh the
-          # merged cache afterwards; a completed shard farm already pushed it.
-          incremental_link = run_link and not run_shards and not eff_shards
-
-          def bstr(v: bool) -> str:
-              return "true" if v else "false"
-
-          outputs = {
-              "chromium_rev": chromium_rev,
-              "chromium_version": chromium_version,
-              "src_ref": src_ref,
-              "stub_ref": stub_ref,
-              "s1_ref": s1_ref,
-              "s2a_ref": s2a_ref,
-              "shards_ref": shards_ref,
-              "s3_ref": s3_ref,
-              "ccache_repo": ccache_repo,
-              "merged_ccache_ref": merged_ccache_ref,
-              "k1": k1,
-              "k2": k2,
-              "k3": k3,
-              "k4": k4,
-              "has_stub": bstr(raw_has_stub),
-              "has_merged_ccache": bstr(has_merged_ccache),
-              "incremental_link": bstr(incremental_link),
-              "run_stub": bstr(run_stub),
-              "run_stage1": bstr(run_stage1),
-              "run_codegen": bstr(run_codegen),
-              "run_shards": bstr(run_shards),
-              "run_link": bstr(run_link),
-              "run_package": bstr(run_package),
-              "shards_json": json.dumps(list(range(int(shard_count)))),
-          }
-
-          with open(gh_out, "a", encoding="utf-8") as f:
-              for k, v in outputs.items():
-                  f.write(f"{k}={v}\n")
-
-          summary = [
-              "## Pipeline Checkpoint & Resume Plan",
-              "",
-              f"- **Chromium Revision**: `{chromium_rev[:12]}` (`{chromium_version}`)",
-              f"- **Inputs**: `build_mode={build_mode}`, `force_from={force_from}`, `with_app_groups={with_app_groups}`",
-              f"- **Warm Merged ccache (`{merged_ccache_ref}`)**: `{'HIT' if has_merged_ccache else 'MISS'}`",
-              f"- **Xcode SDK Stub (`{stub_tag}`)**: `{'HIT' if raw_has_stub else 'MISS'}`",
-              "",
-              "| Stage | Key | GHCR Checkpoint | Action |",
-              "| :--- | :--- | :--- | :--- |",
-              f"| Stage 0 (`xcode-stub`, Mac) | `{stub_tag}` | `{'HIT' if raw_has_stub else 'MISS'}` | **{'RUN' if run_stub else 'SKIP (reuse)'}** |",
-              f"| Stage 2a (`codegen`, Linux) | `{k2}` | `{'HIT' if raw_has_s2a else 'MISS'}` | **{'RUN' if run_codegen else 'SKIP (reuse)'}** |",
-              f"| Stage 1 (`apple-prebuild`, Mac, Apple tools only) | `{k1}` | `{'HIT' if raw_has_s1 else 'MISS'}` | **{'RUN' if run_stage1 else 'SKIP (reuse)'}** |",
-              f"| Stage 2b (`compile-shards` × {shard_count}) | `{ks}` | `{'COMPLETE' if raw_has_shards else 'per-shard ccache'}` | **{'RUN' if run_shards else 'SKIP (merged ccache)'}** |",
-              f"| Stage 3 (`link`) | `{k3}` | `{'HIT' if raw_has_s3 else 'MISS'}` | **{'RUN' if run_link else 'SKIP (reuse)'}** |",
-              f"| Stage 4 (`apple-package`) | `{k4}` | `final IPA` | **{'RUN' if run_package else 'SKIP'}** |",
-              "",
-          ]
-          summary_txt = "\n".join(summary)
-          print(summary_txt)
-          sf_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if sf_path:
-              with open(sf_path, "a", encoding="utf-8") as sf:
-                  sf.write(summary_txt + "\n")
-          PY
-
-  xcode-stub:
-    name: Stage 0 - Extract Encrypted Xcode 27 SDK Stub
-    needs: plan
-    if: needs.plan.outputs.run_stub == 'true'
-    runs-on: xcode-27
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Extract the SDK stub and persist it to GHCR
+      - id: plan
         env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-        run: |
-          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
-          command -v zstd >/dev/null 2>&1 || brew install zstd
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          mkdir -p "$RUNNER_TEMP/stub_out"
-          ./scripts/extract_xcode_stub.sh --output-encrypted "$RUNNER_TEMP/stub_out/xcode_stub.tar.zst.enc"
-          ./scripts/oci_artifacts.sh push \
-            "${{ needs.plan.outputs.stub_ref }}" \
-            "$RUNNER_TEMP/stub_out" \
-            xcode_stub.tar.zst.enc \
-            --repo "${{ github.repository }}"
+          WITH_APP_GROUPS: ${{ inputs.with_app_groups }}
+        run: ./scripts/stage.sh plan run
 
   codegen:
-    # Root of the build: host tools, Rust, and every generated source/header
-    # on the pruned Ninja graph (no target C++). Apple tool edges fail fast as
-    # replay misses and are produced by Stage 1, which consumes this tree.
-    name: Stage 2a - Host Tools, Rust Stdlib & Shared Codegen
-    needs: [plan, xcode-stub]
+    name: 1 Codegen (Linux)
+    needs: plan
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_codegen == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 165
+    env:
+      JOB_TIMEOUT_MIN: 165
+      PERSIST_RESERVE_MIN: 15
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      STUB_REF: ${{ needs.plan.outputs.stub_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      CCACHE_REPO: ${{ needs.plan.outputs.ccache_repo }}
+      CHROMIUM_REV: ${{ needs.plan.outputs.chromium_rev }}
     steps:
       - uses: actions/checkout@v5
+      - id: check
+        run: ./scripts/stage.sh codegen check
+      - if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh codegen init
+      - name: Prepare tree, plan & audit
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh codegen prepare
+      - id: build
+        name: Build host tools, Rust & generated files
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh codegen build
+      - name: Persist checkpoint
+        if: steps.build.outcome == 'success'
+        run: ./scripts/stage.sh codegen persist
+      - name: Persist ccache bucket
+        if: always() && steps.check.outputs.done == 'false'
+        run: ./scripts/stage.sh codegen persist-cache
+      - name: Summary
+        if: always() && steps.check.outputs.done == 'false'
+        run: >-
+          ./scripts/write_job_summary.py --title "1 Codegen (Linux)"
+          --checkpoint "$CODEGEN_REF" --key "${CODEGEN_REF##*:}" --outcome "${{ steps.build.outcome }}"
+          --start-epoch "${JOB_START:-0}" --ccache-dir "$RUNNER_TEMP/ccache" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
-      - name: Reclaim disk & install tools
-        id: init
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Pull source & SDK stub, overlay Linux host deps, warm ccache, gn gen, prune graph, & verify inputs
-        env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-        run: |
-          source ./version.lock
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/stub"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-          ./scripts/overlay_linux_host_deps.py --work-dir "$work"
-
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.stub_ref }}" "$RUNNER_TEMP/stub"
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/stub/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-          rm -rf "$RUNNER_TEMP/stub"
-
-          cg_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-codegen"
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          mkdir -p "$CCACHE_DIR"
-          if ./scripts/oci_artifacts.sh exists "$cg_ccache_ref"; then
-            echo "==> Pulling warm codegen ccache from $cg_ccache_ref"
-            ./scripts/oci_artifacts.sh pull "$cg_ccache_ref" "$RUNNER_TEMP"
-          fi
-          ccache -M 0
-          ccache -z
-
-          mkdir -p "$work/src/ci" "$work/src/out/Release"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          touch -t 200001010000 "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$work/src/out/Release/args.gn"
-          cat >> "$work/src/out/Release/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          ios_sdk_developer_dir = "//xcode_stub"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          cc_wrapper = "ccache"
-          EOF
-
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          (cd "$work/src" && gn gen out/Release)
-          ./scripts/rewrite_ninja_graph.py --out-dir "$work/src/out/Release" --mode prune
-
-          ./scripts/check_inputs.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$work/src/out/Release" \
-            --targets chrome
-
-          ./scripts/plan_shards.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$work/src/out/Release" \
-            --mode codegen > "$RUNNER_TEMP/codegen_targets.txt"
-          echo "==> Planned $(wc -l < "$RUNNER_TEMP/codegen_targets.txt") host/Rust/codegen targets"
-
-          # Contract gate: no device compile/link/Swift in the plan, and every
-          # generated input of the Apple edges planned. Fails before compiling.
-          ./scripts/diagnose_graph.py --out-dir "$work/src/out/Release" \
-            --roots-file "$RUNNER_TEMP/codegen_targets.txt" \
-            --report "$RUNNER_TEMP/plan_audit.txt" \
-            --expect gen/ios/chrome/browser/shared/ui/buildflags.h \
-            --check
-
-          # Show what the pruned closure really contains before spending hours on it.
-          tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
-            | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$work/src/out/Release" -n \
-            | awk '/^\[/ { tc = ($3 ~ /^clang_/) ? substr($3, 1, index($3, "/") - 1) : ($3 ~ /^\/\//) ? "action" : "target"; n[$2 " " tc]++ }
-                   END { for (k in n) printf "%7d  %s\n", n[k], k }' \
-            | sort -rn | tee "$RUNNER_TEMP/closure.txt"
-          { echo "### Codegen closure (pruned graph)"; echo '```text'; cat "$RUNNER_TEMP/closure.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build host tools, Rust stdlib, V8 snapshot, & generated headers
-        id: compile
-        timeout-minutes: 135
-        run: |
-          set -o pipefail
-          work="/tmp/cb_work"
-          out_dir="$work/src/out/Release"
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          # Stage 1 runs after codegen, so no Apple tool outputs exist yet. The
-          # few targets downstream of Swift/xcassets/ibtool (e.g. merged
-          # Info.plists) fail fast as replay misses and are built later by the
-          # shards/link, which restore Stage 1's recordings.
-          export APPLE_TOOL_MODE=replay
-          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache_empty"
-          mkdir -p "$APPLE_TOOL_CACHE_DIR"
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          export CCACHE_BASEDIR="$work"
-          export CCACHE_NOHASHDIR="true"
-          export CCACHE_CPP2="true"
-          export CCACHE_COMPILERCHECK="content"
-          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
-          export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="0"
-
-          rc=0
-          if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
-            # Stops 15 min before the step timeout so the ccache still persists.
-            ./scripts/run_with_budget.py 120 "$RUNNER_TEMP/ninja.log" -- bash -c \
-              'tr "\n" "\0" < "$0" | xargs -0 -r -s 1048576 "$1" -C "$2" -k 0' \
-              "$RUNNER_TEMP/codegen_targets.txt" "$work/src/third_party/ninja/ninja" "$out_dir" || rc=$?
-          fi
-          if [ "$rc" -eq 124 ]; then
-            echo "::error::Codegen exceeded its build budget; progress is kept in the ccache bucket"
-            exit 1
-          fi
-
-          if [ "$rc" -ne 0 ]; then
-            # Accept the run only if every failed edge is a deferred Apple tool.
-            python3 - "$RUNNER_TEMP/ninja.log" <<'PY'
-          import sys
-
-          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-          deferred, real = [], []
-          for i, line in enumerate(lines):
-              if line.startswith("FAILED: "):
-                  cmd = lines[i + 1] if i + 1 < len(lines) else ""
-                  (deferred if "apple_tool_wrapper" in cmd else real).append(line[len("FAILED: "):])
-          print(f"==> {len(deferred)} Apple tool edge(s) deferred to Stage 1")
-          for item in deferred[:40]:
-              print(f"  deferred: {item}")
-          if real or not deferred:
-              print(f"::error::{len(real)} non-Apple codegen failure(s); see FAILED blocks above", file=sys.stderr)
-              sys.exit(1)
-          PY
-          fi
-
-          pending="$(tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
-            | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -n 2>/dev/null \
-            | grep -c '^\[' || true)"
-          echo "==> ${pending} codegen edge(s) left for shards/link (downstream of Apple outputs)" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Persist Stage 2a codegen checkpoint to GHCR
-        if: steps.compile.outcome == 'success'
-        run: |
-          out_dir="/tmp/cb_work/src/out/Release"
-          mkdir -p "$RUNNER_TEMP/s2a_out"
-          (
-            cd "$out_dir"
-            pack_items=(gen .ninja_deps .ninja_log)
-            [ -d obj ] && pack_items+=(obj)
-            [ -d local_rustc_sysroot ] && pack_items+=(local_rustc_sysroot)
-            for hd in clang_x64*; do
-              [ -d "$hd" ] && pack_items+=("$hd")
-            done
-            # Generated Apple tool inputs that live outside the packed trees.
-            while IFS= read -r t; do
-              case "$t" in gen/*|obj/*|clang_x64*|local_rustc_sysroot/*) continue ;; esac
-              [ -e "$t" ] && pack_items+=("$t")
-            done < "$RUNNER_TEMP/codegen_targets.txt"
-            tar -cf - "${pack_items[@]}" | zstd -T0 -4 -o "$RUNNER_TEMP/s2a_out/codegen_gen.tar.zst"
-          )
-          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
-          ./scripts/oci_artifacts.sh push \
-            "${{ needs.plan.outputs.s2a_ref }}" \
-            "$RUNNER_TEMP/s2a_out" \
-            codegen_gen.tar.zst \
-            --repo "${{ github.repository }}"
-          rm -rf "$RUNNER_TEMP/s2a_out"
-
-      - name: Always persist codegen ccache bucket to GHCR
-        if: always()
-        run: |
-          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
-          if [ -d "$RUNNER_TEMP/ccache" ]; then
-            echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-            cg_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-codegen"
-            ./scripts/oci_artifacts.sh push \
-              "$cg_ccache_ref" \
-              "$RUNNER_TEMP" \
-              ccache \
-              --repo "${{ github.repository }}"
-          fi
-
-      - name: Write Stage 2a summary
-        if: always()
-        run: |
-          ./scripts/write_job_summary.py \
-            --title "Stage 2a — Host Tools, Rust Stdlib & Shared Codegen" \
-            --key "${{ needs.plan.outputs.k2 }}" \
-            --checkpoint "${{ needs.plan.outputs.s2a_ref }}" \
-            --outcome "${{ steps.compile.outcome }}" \
-            --start-epoch "${{ steps.init.outputs.start_epoch }}" \
-            --ccache-dir "$RUNNER_TEMP/ccache" \
-            --ninja-log "$RUNNER_TEMP/ninja.log"
-
-  apple-prebuild:
-    # Runs only the Apple tool edges (Swift, xcassets, ibtool, intents) against
-    # codegen's gen/ tree; every other edge is an input-less phony, so the Mac
-    # never compiles host tools or C++.
-    name: Stage 1 - Pre-Link Apple Targets on Xcode 27
-    needs: [plan, xcode-stub, codegen]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_stage1 == 'true' }}
+  apple:
+    name: 2 Apple tools (Mac)
+    needs: [plan, codegen]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_apple == 'true' }}
     runs-on: xcode-27
     timeout-minutes: 120
+    env:
+      JOB_TIMEOUT_MIN: 120
+      PERSIST_RESERVE_MIN: 10
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
     steps:
       - uses: actions/checkout@v5
+      - id: check
+        run: ./scripts/stage.sh apple check
+      - if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh apple init
+      - name: Prepare tree & reduce graph to Apple edges
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh apple prepare
+      - id: build
+        name: Run & record Apple tools
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh apple build
+      - name: Persist checkpoint
+        if: steps.build.outcome == 'success'
+        run: ./scripts/stage.sh apple persist
+      - name: Summary
+        if: always() && steps.check.outputs.done == 'false'
+        run: >-
+          ./scripts/write_job_summary.py --title "2 Apple tools (Mac)"
+          --checkpoint "$APPLE_REF" --key "${APPLE_REF##*:}" --outcome "${{ steps.build.outcome }}"
+          --start-epoch "${JOB_START:-0}" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
-      - name: Reclaim macOS runner disk space & install ORAS/zstd
-        id: init
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          source ./version.lock
-          df -h /
-          target_app="$XCODE_APP"
-          [ -e "$target_app" ] || target_app="/Applications/Xcode.app"
-          keep_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target_app")"
-          actual_build="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["ProductBuildVersion"])' "$keep_real/Contents/version.plist")"
-          echo "Keeping Xcode at: $keep_real (ProductBuildVersion=$actual_build, expected=$XCODE_BUILD)"
-          if [ "$actual_build" != "$XCODE_BUILD" ]; then
-            echo "::warning::Runner Xcode build ($actual_build) differs from version.lock XCODE_BUILD ($XCODE_BUILD)"
-          fi
-          for app in /Applications/Xcode*; do
-            [ -e "$app" ] || [ -L "$app" ] || continue
-            app_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")"
-            if [ "$app" = "$keep_real" ] || [ "$app" = "$target_app" ]; then
-              continue
-            fi
-            if [ "$app_real" = "$keep_real" ] && [ -L "$app" ]; then
-              continue
-            fi
-            sudo rm -rf "$app" || true
-          done
-          sudo rm -rf /Library/Developer/CoreSimulator /Users/runner/Library/Android || true
-          df -h /
-
-          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
-          command -v zstd >/dev/null 2>&1 || brew install zstd
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Pull source, SDK stub & codegen tree, gn gen, and reduce the graph to Apple tool edges
-        run: |
-          source ./version.lock
-          work="$RUNNER_TEMP/work"
-          out_dir="$work/src/out/Release"
-          mkdir -p "$RUNNER_TEMP/s1_out" "$RUNNER_TEMP/s2a"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.stub_ref }}" "$RUNNER_TEMP/s1_out"
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling source snapshot"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s2a_ref }}" "$RUNNER_TEMP/s2a"
-          df -h /
-
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Bootstrapping mac-arm64 host tools from src/DEPS"
-          ./scripts/bootstrap_macos_host_tools.sh --work-dir "$work"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-
-          xcode_root="$XCODE_APP"
-          [ -d "$xcode_root" ] || xcode_root="/Applications/Xcode.app"
-          export DEVELOPER_DIR="$xcode_root/Contents/Developer"
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-
-          mkdir -p "$work/src/ci" "$out_dir"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          touch -t 200001010000 "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$out_dir/args.gn"
-          cat >> "$out_dir/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          EOF
-
-          # Linux codegen's generated tree, minus host binaries and Linux ninja
-          # state. Extracted before `gn gen` so this host's ninja files win.
-          # GNU tar stores Chromium's hard-linked copies as links (e.g.
-          # icudtl.dat -> clang_x64/icudtl.dat); links into the excluded host
-          # trees cannot resolve here and are skipped. check_inputs below
-          # still fails the job if an Apple edge needed one of them.
-          tar_err="$RUNNER_TEMP/s2a_tar.err"
-          if ! zstd -dc "$RUNNER_TEMP/s2a/codegen_gen.tar.zst" \
-            | tar -C "$out_dir" \
-                --exclude 'clang_x64*' --exclude 'local_rustc_sysroot' \
-                --exclude '.ninja_log' --exclude '.ninja_deps' --exclude '*.ninja' \
-                -xf - 2> "$tar_err"; then
-            if grep -vE "Hard-link target '(clang_x64|local_rustc_sysroot)|Error exit delayed" "$tar_err"; then
-              echo "::error::Unexpected errors while extracting s2a"
-              exit 1
-            fi
-          fi
-          echo "==> Skipped $(grep -c 'Hard-link target' "$tar_err" || true) hard links into excluded host trees"
-          rm -rf "$RUNNER_TEMP/s2a"
-
-          (cd "$work/src" && "$work/src/buildtools/mac/gn" gen out/Release)
-
-          # Discover Apple targets on the full graph, then reduce it to them.
-          targets_file="$RUNNER_TEMP/apple_targets.txt"
-          ./scripts/plan_shards.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$out_dir" \
-            --mode apple-prebuild > "$targets_file"
-          echo "==> Planned $(wc -l < "$targets_file") pre-link Apple targets"
-          ./scripts/rewrite_ninja_graph.py --out-dir "$out_dir" --mode apple-only
-          df -h /
-
-          ./scripts/check_inputs.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$out_dir" \
-            --targets-file "$targets_file"
-
-      - name: Compile & record pre-link Apple targets
-        id: compile
-        timeout-minutes: 90
-        run: |
-          set -o pipefail
-          source ./version.lock
-          work="$RUNNER_TEMP/work"
-          out_dir="$work/src/out/Release"
-          xcode_root="$XCODE_APP"
-          [ -d "$xcode_root" ] || xcode_root="/Applications/Xcode.app"
-          export DEVELOPER_DIR="$xcode_root/Contents/Developer"
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          export APPLE_TOOL_MODE=record
-          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-          mkdir -p "$APPLE_TOOL_CACHE_DIR"
-
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting ninja on pre-link Apple targets"
-          if [ -s "$RUNNER_TEMP/apple_targets.txt" ]; then
-            # -k 0: surface every failing Apple step in a single run.
-            tr '\n' '\0' < "$RUNNER_TEMP/apple_targets.txt" \
-              | xargs -0 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
-              2>&1 | tee "$RUNNER_TEMP/ninja.log"
-          fi
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Finished pre-link Apple targets"
-
-      - name: Persist Stage 1 checkpoint to GHCR
-        if: steps.compile.outcome == 'success'
-        run: |
-          tar -C "$RUNNER_TEMP" -cf - apple_tool_cache \
-            | zstd -T0 -5 -o "$RUNNER_TEMP/s1_out/apple_tool_cache.tar.zst"
-          rm -rf "$RUNNER_TEMP/work"
-          ./scripts/oci_artifacts.sh push \
-            "${{ needs.plan.outputs.s1_ref }}" \
-            "$RUNNER_TEMP/s1_out" \
-            xcode_stub.tar.zst.enc \
-            apple_tool_cache.tar.zst \
-            --repo "${{ github.repository }}"
-
-      - name: Write Stage 1 summary
-        if: always()
-        run: |
-          ./scripts/write_job_summary.py \
-            --title "Stage 1 — Xcode 27 Pre-Link Apple Targets" \
-            --key "${{ needs.plan.outputs.k1 }}" \
-            --checkpoint "${{ needs.plan.outputs.s1_ref }}" \
-            --outcome "${{ steps.compile.outcome }}" \
-            --start-epoch "${{ steps.init.outputs.start_epoch }}" \
-            --ninja-log "$RUNNER_TEMP/ninja.log"
-
-  compile-shards:
-    name: Stage 2b - C/C++/ObjC++ Shard ${{ matrix.shard }}
-    needs: [plan, xcode-stub, codegen, apple-prebuild]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_shards == 'true' }}
+  compile:
+    name: 3 Compile shard ${{ matrix.shard }} (Linux)
+    needs: [plan, codegen, apple]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_compile == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 185
     strategy:
       fail-fast: false
+      max-parallel: 18
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards_json) }}
+    env:
+      JOB_TIMEOUT_MIN: 185
+      PERSIST_RESERVE_MIN: 20
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      STUB_REF: ${{ needs.plan.outputs.stub_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+      COMPILE_PREFIX: ${{ needs.plan.outputs.compile_prefix }}
+      CCACHE_REPO: ${{ needs.plan.outputs.ccache_repo }}
+      CHROMIUM_REV: ${{ needs.plan.outputs.chromium_rev }}
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+      SHARD_INDEX: ${{ matrix.shard }}
+      INJECT_FAILURE: ${{ inputs.inject_failure }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Reclaim disk & install tools
-        id: init
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Pull source, Stage 1 & Stage 2a checkpoints, & warm shard ccache
-        env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-        run: |
-          source ./version.lock
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/s1" "$RUNNER_TEMP/s2a"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s1_ref }}" "$RUNNER_TEMP/s1"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s2a_ref }}" "$RUNNER_TEMP/s2a"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-          # Pruned compile edges still order-depend on codegen's host tools,
-          # whose recorded inputs include these Linux-only deps.
-          ./scripts/overlay_linux_host_deps.py --work-dir "$work"
-
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/s1/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/s1/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
-          rm -rf "$RUNNER_TEMP/s1"
-
-          shard_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-shard-${{ matrix.shard }}"
-          cg_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-codegen"
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          mkdir -p "$CCACHE_DIR"
-          if ./scripts/oci_artifacts.sh exists "$shard_ccache_ref"; then
-            echo "==> Pulling warm shard ccache from $shard_ccache_ref"
-            ./scripts/oci_artifacts.sh pull "$shard_ccache_ref" "$RUNNER_TEMP"
-          elif ./scripts/oci_artifacts.sh exists "$cg_ccache_ref"; then
-            # First run of this shard: seed from codegen's bucket, which may
-            # already hold target objects. Seeds are back-dated so entries this
-            # shard never touches are evicted before its bucket is pushed.
-            echo "==> Seeding shard ccache from $cg_ccache_ref"
-            ./scripts/oci_artifacts.sh pull "$cg_ccache_ref" "$RUNNER_TEMP"
-            find "$CCACHE_DIR" -type f -exec touch -t 200001010000 {} +
-            touch "$RUNNER_TEMP/ccache_seeded"
-          fi
-          ccache -M 0
-          ccache -z
-
-          mkdir -p "$work/src/ci" "$work/src/out/Release"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          touch -t 200001010000 "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$work/src/out/Release/args.gn"
-          cat >> "$work/src/out/Release/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          ios_sdk_developer_dir = "//xcode_stub"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          cc_wrapper = "ccache"
-          EOF
-
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          zstd -dc "$RUNNER_TEMP/s2a/codegen_gen.tar.zst" | tar -C "$work/src/out/Release" -xf -
-          rm -rf "$RUNNER_TEMP/s2a"
-          (cd "$work/src" && gn gen out/Release)
-          ./scripts/rewrite_ninja_graph.py --out-dir "$work/src/out/Release" --mode prune
-
-          ./scripts/plan_shards.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$work/src/out/Release" \
-            --mode c-shard \
-            --shard-count "${SHARD_COUNT}" \
-            --shard-index "${{ matrix.shard }}" > "$RUNNER_TEMP/shard_targets.txt"
-          echo "==> Planned $(wc -l < "$RUNNER_TEMP/shard_targets.txt") objects for shard ${{ matrix.shard }} (SHA-1 modulo)"
-
-      - name: Compile shard ${{ matrix.shard }} objects
-        id: compile
-        timeout-minutes: 155
-        run: |
-          set -o pipefail
-          work="/tmp/cb_work"
-          out_dir="$work/src/out/Release"
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          export APPLE_TOOL_MODE=replay
-          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          export CCACHE_BASEDIR="$work"
-          export CCACHE_NOHASHDIR="true"
-          export CCACHE_CPP2="true"
-          export CCACHE_COMPILERCHECK="content"
-          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
-          export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="0"
-
-          if [ -s "$RUNNER_TEMP/shard_targets.txt" ]; then
-            # Stops 15 min before the step timeout so the ccache still persists.
-            ./scripts/run_with_budget.py 140 "$RUNNER_TEMP/ninja.log" -- bash -c \
-              'tr "\n" "\0" < "$0" | xargs -0 -r -s 1048576 "$1" -C "$2" -k 0' \
-              "$RUNNER_TEMP/shard_targets.txt" "$work/src/third_party/ninja/ninja" "$out_dir"
-          fi
-
-      - name: Always persist shard ${{ matrix.shard }} ccache bucket to GHCR
-        if: always()
-        run: |
-          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
-          if [ -d "$RUNNER_TEMP/ccache" ]; then
-            if [ -f "$RUNNER_TEMP/ccache_seeded" ]; then
-              CCACHE_DIR="$RUNNER_TEMP/ccache" ccache --evict-older-than 1d
-            fi
-            echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-            shard_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-shard-${{ matrix.shard }}"
-            ./scripts/oci_artifacts.sh push \
-              "$shard_ccache_ref" \
-              "$RUNNER_TEMP" \
-              ccache \
-              --repo "${{ github.repository }}"
-          fi
-
-      - name: Write shard ${{ matrix.shard }} summary
-        if: always()
-        run: |
-          ./scripts/write_job_summary.py \
-            --title "Stage 2b — Compile Shard ${{ matrix.shard }}" \
-            --key "sha1-mod-${SHARD_COUNT}:shard-${{ matrix.shard }}" \
-            --checkpoint "${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-shard-${{ matrix.shard }}" \
-            --outcome "${{ steps.compile.outcome }}" \
-            --start-epoch "${{ steps.init.outputs.start_epoch }}" \
-            --ccache-dir "$RUNNER_TEMP/ccache" \
-            --ninja-log "$RUNNER_TEMP/ninja.log"
+      - id: check
+        run: ./scripts/stage.sh compile check
+      - if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh compile init
+      - name: Prepare tree & plan shard
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh compile prepare
+      - id: build
+        name: Compile shard objects
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh compile build
+      - name: Persist checkpoint
+        if: steps.build.outcome == 'success'
+        run: ./scripts/stage.sh compile persist
+      - name: Persist ccache bucket
+        if: always() && steps.check.outputs.done == 'false'
+        run: ./scripts/stage.sh compile persist-cache
+      - name: Summary
+        if: always() && steps.check.outputs.done == 'false'
+        run: >-
+          ./scripts/write_job_summary.py --title "3 Compile shard ${{ matrix.shard }}"
+          --checkpoint "$COMPILE_PREFIX-${{ matrix.shard }}" --key "${COMPILE_PREFIX##*:}-${{ matrix.shard }}"
+          --outcome "${{ steps.build.outcome }}" --start-epoch "${JOB_START:-0}"
+          --ccache-dir "$RUNNER_TEMP/ccache" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
   link:
-    name: Stage 3 - Persist Merged ccache & Link Chromium.app
-    needs: [plan, xcode-stub, codegen, apple-prebuild, compile-shards]
+    name: 4 Link (Linux)
+    needs: [plan, codegen, apple, compile]
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_link == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 215
+    timeout-minutes: 180
+    env:
+      JOB_TIMEOUT_MIN: 180
+      PERSIST_RESERVE_MIN: 15
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      STUB_REF: ${{ needs.plan.outputs.stub_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+      COMPILE_PREFIX: ${{ needs.plan.outputs.compile_prefix }}
+      LINK_REF: ${{ needs.plan.outputs.link_ref }}
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+      INJECT_FAILURE: ${{ inputs.inject_failure }}
     steps:
       - uses: actions/checkout@v5
+      - id: check
+        run: ./scripts/stage.sh link check
+      - if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh link init
+      - name: Prepare tree & import verified shard objects
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh link prepare
+      - id: build
+        name: Link Chromium.app
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh link build
+      - name: Persist checkpoint
+        if: steps.build.outcome == 'success'
+        run: ./scripts/stage.sh link persist
+      - name: Summary
+        if: always() && steps.check.outputs.done == 'false'
+        run: >-
+          ./scripts/write_job_summary.py --title "4 Link (Linux)"
+          --checkpoint "$LINK_REF" --key "${LINK_REF##*:}" --outcome "${{ steps.build.outcome }}"
+          --start-epoch "${JOB_START:-0}" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
-      - name: Reclaim disk & install tools (swap deferred until pre-link)
-        id: init
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd ccache rsync
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Assemble codegen + shard ccache buckets & push merged ccache to GHCR BEFORE linking
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          mkdir -p "$CCACHE_DIR"
-
-          if [ "${{ needs.plan.outputs.run_shards }}" = "true" ]; then
-            tags=("${{ needs.plan.outputs.chromium_rev }}-codegen")
-            for (( i = 0; i < SHARD_COUNT; i++ )); do
-              tags+=("${{ needs.plan.outputs.chromium_rev }}-shard-${i}")
-            done
-            # Pull 4 buckets concurrently, merge, delete, repeat: bounded disk
-            # peak with ~4x faster assembly than one-at-a-time.
-            batch=4
-            echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Pulling ${#tags[@]} ccache buckets from GHCR, ${batch} at a time"
-            for (( b = 0; b < ${#tags[@]}; b += batch )); do
-              dirs=()
-              pids=()
-              for tag in "${tags[@]:b:batch}"; do
-                d="$(mktemp -d)"
-                dirs+=("$d")
-                ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.ccache_repo }}:${tag}" "$d" &
-                pids+=("$!")
-              done
-              for pid in "${pids[@]}"; do
-                wait "$pid"
-              done
-              for d in "${dirs[@]}"; do
-                rsync -a --ignore-existing "$d/ccache/" "$CCACHE_DIR/"
-                rm -rf "$d"
-              done
-              echo "  merged: ${tags[*]:b:batch}"
-            done
-
-            ccache -M 0
-            echo "==> Merged ccache total (persisting to ${{ needs.plan.outputs.merged_ccache_ref }} BEFORE ld64.lld):"
-            du -sh "$CCACHE_DIR"
-            df -h / /mnt 2>/dev/null || df -h /
-
-            ./scripts/oci_artifacts.sh push \
-              "${{ needs.plan.outputs.merged_ccache_ref }}" \
-              "$RUNNER_TEMP" \
-              ccache \
-              --repo "${{ github.repository }}"
-
-            # Mark this shard farm complete so a link-only failure resumes here.
-            mkdir -p "$RUNNER_TEMP/shards_marker"
-            echo "${{ needs.plan.outputs.shards_ref }}" > "$RUNNER_TEMP/shards_marker/complete.txt"
-            ./scripts/oci_artifacts.sh push \
-              "${{ needs.plan.outputs.shards_ref }}" \
-              "$RUNNER_TEMP/shards_marker" \
-              complete.txt \
-              --repo "${{ github.repository }}"
-          elif [ "${{ needs.plan.outputs.has_merged_ccache }}" = "true" ]; then
-            echo "==> Pulling warm merged ccache from ${{ needs.plan.outputs.merged_ccache_ref }}"
-            ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.merged_ccache_ref }}" "$RUNNER_TEMP"
-            ccache -M 0
-            du -sh "$CCACHE_DIR"
-          fi
-
-      - name: Stage source, Stage 1/2a checkpoints, input scan, & adaptive swapfile
-        env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-        run: |
-          source ./version.lock
-          work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/s1"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.src_ref }}" "$work"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s1_ref }}" "$RUNNER_TEMP/s1"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-          ./scripts/overlay_linux_host_deps.py --work-dir "$work"
-
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/s1/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-          zstd -dc "$RUNNER_TEMP/s1/apple_tool_cache.tar.zst" | tar -C "$RUNNER_TEMP" -xf -
-          rm -rf "$RUNNER_TEMP/s1"
-
-          mkdir -p "$work/src/ci" "$work/src/out/Release"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          touch -t 200001010000 "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$work/src/out/Release/args.gn"
-          cat >> "$work/src/out/Release/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          ios_sdk_developer_dir = "//xcode_stub"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          cc_wrapper = "ccache"
-          EOF
-
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          mkdir -p "$RUNNER_TEMP/s2a"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s2a_ref }}" "$RUNNER_TEMP/s2a"
-          zstd -dc "$RUNNER_TEMP/s2a/codegen_gen.tar.zst" | tar -C "$work/src/out/Release" -xf -
-          rm -rf "$RUNNER_TEMP/s2a"
-          (cd "$work/src" && gn gen out/Release)
-          ./scripts/rewrite_ninja_graph.py --out-dir "$work/src/out/Release" --mode prune
-
-          ./scripts/check_inputs.py \
-            --ninja "$work/src/third_party/ninja/ninja" \
-            --out-dir "$work/src/out/Release" \
-            --targets chrome
-
-          ./scripts/reclaim_disk_linux.sh --swap-only 16
-
-      - name: Link Chromium.app via ld64.lld
-        id: link_chrome
-        timeout-minutes: 145
-        run: |
-          set -o pipefail
-          work="/tmp/cb_work"
-          out_dir="$work/src/out/Release"
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          export APPLE_TOOL_MODE=replay
-          export APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
-          export CCACHE_DIR="$RUNNER_TEMP/ccache"
-          export CCACHE_BASEDIR="$work"
-          export CCACHE_NOHASHDIR="true"
-          export CCACHE_CPP2="true"
-          export CCACHE_COMPILERCHECK="content"
-          export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros"
-          export CCACHE_COMPRESS="true"
-          export CCACHE_MAXSIZE="0"
-
-          ccache -z
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building & linking target 'chrome'"
-          ./scripts/run_with_budget.py 130 "$RUNNER_TEMP/ninja.log" -- \
-            "$work/src/third_party/ninja/ninja" -C "$out_dir" chrome
-          echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Link finished"
-
-      - name: Persist Stage 3 unsigned app checkpoint to GHCR
-        if: steps.link_chrome.outcome == 'success'
-        run: |
-          ./scripts/reclaim_disk_linux.sh --drop-swap
-          out_dir="/tmp/cb_work/src/out/Release"
-          stage_out="$RUNNER_TEMP/linked_stage"
-          s3_out="$RUNNER_TEMP/s3_out"
-          mkdir -p "$stage_out" "$s3_out"
-
-          mv "$out_dir/Chromium.app" "$stage_out/Chromium.app"
-          if [ -d "$out_dir/.deferred_extract_metadata" ]; then
-            mv "$out_dir/.deferred_extract_metadata" "$stage_out/.deferred_extract_metadata"
-          fi
-          tar -C "$stage_out" -cf - . | zstd -T0 -5 -o "$s3_out/chromium_app_unsigned.tar.zst"
-          rm -rf /tmp/cb_work "$stage_out" || echo "::warning::Work tree not fully removed; continuing"
-
-          ./scripts/oci_artifacts.sh push \
-            "${{ needs.plan.outputs.s3_ref }}" \
-            "$s3_out" \
-            chromium_app_unsigned.tar.zst \
-            --repo "${{ github.repository }}"
-
-      # Incremental runs compile misses inside the link job; persist them even
-      # when the link fails or times out so the next attempt makes progress.
-      # (A completed shard farm already pushed the merged cache before linking.)
-      - name: Always refresh merged ccache after incremental compile
-        if: >-
-          always() &&
-          needs.plan.outputs.incremental_link == 'true' &&
-          steps.link_chrome.outcome != 'skipped' &&
-          steps.link_chrome.outcome != ''
-        run: |
-          ./scripts/reclaim_disk_linux.sh --drop-swap || true
-          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
-          if [ -d "$RUNNER_TEMP/ccache" ]; then
-            echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-            ./scripts/oci_artifacts.sh push \
-              "${{ needs.plan.outputs.merged_ccache_ref }}" \
-              "$RUNNER_TEMP" \
-              ccache \
-              --repo "${{ github.repository }}"
-          fi
-
-      - name: Release swap & write Stage 3 summary
-        if: always()
-        run: |
-          ./scripts/reclaim_disk_linux.sh --drop-swap || true
-          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
-          ./scripts/write_job_summary.py \
-            --title "Stage 3 — Link Chromium.app & Merged ccache" \
-            --key "${{ needs.plan.outputs.k3 }}" \
-            --checkpoint "${{ needs.plan.outputs.s3_ref }}" \
-            --outcome "${{ steps.link_chrome.outcome }}" \
-            --start-epoch "${{ steps.init.outputs.start_epoch }}" \
-            --ccache-dir "$RUNNER_TEMP/ccache" \
-            --ninja-log "$RUNNER_TEMP/ninja.log"
-
-  apple-package:
-    name: Stage 4 - Finalize AppIntents Metadata & Package IPA
+  package:
+    name: 5 Package IPA (Mac)
     needs: [plan, link]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_package == 'true' }}
+    if: ${{ !failure() && !cancelled() }}
     runs-on: xcode-27
     timeout-minutes: 45
+    env:
+      LINK_REF: ${{ needs.plan.outputs.link_ref }}
+      CHROMIUM_VERSION: ${{ needs.plan.outputs.chromium_version }}
+      WITH_APP_GROUPS: ${{ inputs.with_app_groups }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Pull Stage 3 checkpoint from GHCR & package IPA
-        id: pkg
-        run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-          command -v zstd >/dev/null 2>&1 || brew install zstd
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          source ./version.lock
-          mkdir -p "$RUNNER_TEMP/s3" "$RUNNER_TEMP/work/src/out/Release"
-          ./scripts/oci_artifacts.sh pull "${{ needs.plan.outputs.s3_ref }}" "$RUNNER_TEMP/s3"
-          zstd -dc "$RUNNER_TEMP/s3/chromium_app_unsigned.tar.zst" \
-            | tar -C "$RUNNER_TEMP/work/src/out/Release" -xf -
-          rm -rf "$RUNNER_TEMP/s3"
-
-          extra_flags=()
-          if [ "${{ inputs.with_app_groups }}" = "true" ]; then
-            extra_flags+=(--with-app-groups)
-          fi
-
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          ./scripts/package_ipa.sh \
-            --src-dir "$RUNNER_TEMP/work/src" \
-            --out-rel "out/Release" \
-            --output-ipa "$GITHUB_WORKSPACE/dist/Chromium-Blink-${CHROMIUM_VERSION}-arm64.ipa" \
-            "${extra_flags[@]}"
-
-      - name: Upload final IPA artifact
-        uses: actions/upload-artifact@v6
+      - run: ./scripts/stage.sh package run
+      - uses: actions/upload-artifact@v6
         with:
           name: Chromium-Blink-${{ needs.plan.outputs.chromium_version }}-arm64
           path: |
             dist/*.ipa
             dist/*.ipa.sha256
           retention-days: 30
-
       - name: Publish GitHub Release
         if: inputs.publish_release == true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          source ./version.lock
           tag="v${CHROMIUM_VERSION}-r${GITHUB_RUN_NUMBER}"
-          gh release create "$tag" \
-            dist/*.ipa \
-            dist/*.ipa.sha256 \
-            --clobber \
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
             --title "Chromium Blink iOS ${CHROMIUM_VERSION} (Build #${GITHUB_RUN_NUMBER})" \
-            --notes "Unsigned arm64 iOS build with Blink engine (\`use_blink = true\`), built from Chromium \`${CHROMIUM_REV:0:12}\`."
-
-      - name: Write Stage 4 summary
-        if: always()
-        run: |
-          ./scripts/write_job_summary.py \
-            --title "Stage 4 — Finalize AppIntents Metadata & Package IPA" \
-            --key "${{ needs.plan.outputs.k4 }}" \
-            --checkpoint "${{ needs.plan.outputs.s3_ref }}" \
-            --outcome "${{ steps.pkg.outcome }}" \
-            --start-epoch "${{ steps.pkg.outputs.start_epoch }}"
+            --notes "Unsigned arm64 iOS build with Blink engine, Chromium ${{ needs.plan.outputs.chromium_rev }}."
+          gh release upload "$tag" dist/*.ipa dist/*.ipa.sha256 --clobber

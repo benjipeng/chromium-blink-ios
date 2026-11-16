@@ -1,0 +1,2 @@
+ios_app_bundle_id_prefix = "@BUNDLE_ID_PREFIX@"
+apple_tool_wrapper = "//ci/apple_tool_wrapper.py"

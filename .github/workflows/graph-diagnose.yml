@@ -1,121 +1,64 @@
 name: Diagnose Build Graph (no compile)
 
-# Regenerates the real Linux Ninja graph exactly as codegen does, then audits
-# the codegen plan against the stage contract without compiling anything:
-# closure composition, every dependency path from codegen into device work,
-# and the generated inputs Apple edges and device compiles need. Raw and
-# pruned graphs are uploaded so planner changes can be checked against them.
+# Prepares the Linux tree exactly as the codegen stage does (scripts/stage.sh),
+# then, without compiling: plans codegen, audits the plan against the stage
+# contract, compares the raw and pruned graphs with a baseline run's artifact,
+# and uploads graphs and reports.
 
 on:
   workflow_dispatch:
     inputs:
-      stub_ref:
-        description: Encrypted Xcode SDK stub (OCI ref)
-        default: ghcr.io/benjipeng/chromium-blink-ios/xcode-stub:27A9275-ee2dc189544f
+      baseline_run:
+        description: Run ID of an earlier diagnosis whose artifact is the comparison baseline (blank to skip)
+        default: "43868838103"
         type: string
 
 permissions:
   contents: read
   packages: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ORAS_USER: ${{ github.actor }}
 
 jobs:
   diagnose:
     name: Real-graph codegen plan audit
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      BASELINE_RUN: ${{ inputs.baseline_run }}
     steps:
       - uses: actions/checkout@v5
+      - run: ./scripts/stage.sh plan refs
+      - run: ./scripts/stage.sh diagnose init
+      - name: Prepare tree (snapshots raw and pruned graphs)
+        run: ./scripts/stage.sh diagnose prepare
 
-      - name: Reclaim disk & install tools
+      - name: Plan codegen & audit against the stage contract
         run: |
-          chmod +x ./scripts/*.sh ./scripts/*.py
-          ./scripts/reclaim_disk_linux.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
-          ./scripts/oci_artifacts.sh exists "ghcr.io/oras-probe:none" >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Pull source & SDK stub, overlay Linux host deps, gn gen
-        env:
-          CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
-          STUB_REF: ${{ inputs.stub_ref }}
-        run: |
-          source ./version.lock
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          repo_lc="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          work="/tmp/cb_work"
-          mkdir -p "$work" "$RUNNER_TEMP/stub"
-          ./scripts/oci_artifacts.sh pull "ghcr.io/$repo_lc/chromium-ios-src:$CHROMIUM_REV" "$work"
-          ./scripts/apply_patches.sh --src-dir "$work/src"
-          ./scripts/overlay_linux_host_deps.py --work-dir "$work"
-          ./scripts/oci_artifacts.sh pull "$STUB_REF" "$RUNNER_TEMP/stub"
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-            -pass env:CI_ARTIFACT_KEY \
-            -in "$RUNNER_TEMP/stub/xcode_stub.tar.zst.enc" \
-            | zstd -d | tar -C "$work/src" -xf -
-          rm -rf "$RUNNER_TEMP/stub"
-
-          # Same args as the codegen job, so the graph is the one it builds.
-          mkdir -p "$work/src/ci" "$work/src/out/Release"
-          cp ./scripts/apple_tool_wrapper.py "$work/src/ci/apple_tool_wrapper.py"
-          touch -t 200001010000 "$work/src/ci/apple_tool_wrapper.py"
-          cp ./args/device.gn "$work/src/out/Release/args.gn"
-          cat >> "$work/src/out/Release/args.gn" <<EOF
-          ios_app_bundle_id_prefix = "$BUNDLE_ID_PREFIX"
-          ios_sdk_developer_dir = "//xcode_stub"
-          apple_tool_wrapper = "//ci/apple_tool_wrapper.py"
-          cc_wrapper = "ccache"
-          EOF
-          export PATH="$work/depot_tools:$PATH"
-          export DEPOT_TOOLS_UPDATE=0
-          (cd "$work/src" && gn gen out/Release)
-
-      - name: Snapshot graph, prune, plan & audit
-        run: |
-          out_dir="/tmp/cb_work/src/out/Release"
-          ninja_bin="/tmp/cb_work/src/third_party/ninja/ninja"
           art="$RUNNER_TEMP/graph-diagnosis"
-          mkdir -p "$art"
-          snapshot() {
-            (cd "$out_dir" && find . \( -name '*.ninja' -o -name 'args.gn' \) -print0 \
-              | tar --null -T - -cf - | zstd -T0 -12 -q -o "$art/$1.tar.zst")
-          }
+          out_dir=/tmp/cb_work/src/out/Release
+          ./scripts/plan_shards.py --ninja /tmp/cb_work/src/third_party/ninja/ninja \
+            --out-dir "$out_dir" --mode codegen > "$art/codegen_targets.txt"
+          ./scripts/diagnose_graph.py --out-dir "$out_dir" --roots-file "$art/codegen_targets.txt" \
+            --write-filtered "$art/codegen_targets_filtered.txt" --report "$art/report.txt" \
+            --expect gen/ios/chrome/browser/shared/ui/buildflags.h --check
+          { echo "### Codegen plan audit"; echo '```text'; head -c 60000 "$art/report.txt"; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          snapshot graph-raw
-          ./scripts/rewrite_ninja_graph.py --out-dir "$out_dir" --mode prune
-          snapshot graph-pruned
+      - name: Compare with baseline
+        if: always() && inputs.baseline_run != ''
+        run: |
+          gh run download "$BASELINE_RUN" -R "$GITHUB_REPOSITORY" -n graph-diagnosis -D "$RUNNER_TEMP/baseline"
+          ./scripts/compare_graphs.py --baseline "$RUNNER_TEMP/baseline" --current "$RUNNER_TEMP/graph-diagnosis" \
+            | tee "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"
+          { echo "### Compared with run $BASELINE_RUN"; echo '```text'
+            cat "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-          start=$(date +%s)
-          ./scripts/plan_shards.py --ninja "$ninja_bin" --out-dir "$out_dir" \
-            --mode codegen > "$art/codegen_targets.txt"
-          echo "==> Planned $(wc -l < "$art/codegen_targets.txt") targets in $(( $(date +%s) - start ))s"
-
-          ./scripts/diagnose_graph.py --out-dir "$out_dir" \
-            --roots-file "$art/codegen_targets.txt" \
-            --write-filtered "$art/codegen_targets_filtered.txt" \
-            --report "$art/report.txt" \
-            --expect gen/ios/chrome/browser/shared/ui/buildflags.h
-
-          for list in codegen_targets codegen_targets_filtered; do
-            tr '\n' '\0' < "$art/$list.txt" \
-              | xargs -0 -r -s 1048576 "$ninja_bin" -C "$out_dir" -n \
-              | awk '/^\[/ { tc = ($3 ~ /^clang_/) ? substr($3, 1, index($3, "/") - 1) : ($3 ~ /^\/\//) ? "action" : "target"; n[$2 " " tc]++ }
-                     END { for (k in n) printf "%7d  %s\n", n[k], k }' \
-              | sort -rn > "$art/$list.dryrun.txt"
-            echo "==> ninja -n over $list"; cat "$art/$list.dryrun.txt"
-          done
-
-          {
-            echo "### Codegen plan audit"
-            echo '```text'
-            head -c 60000 "$art/report.txt"
-            echo '```'
-            for list in codegen_targets codegen_targets_filtered; do
-              echo "#### \`ninja -n\` over $list"
-              echo '```text'; cat "$art/$list.dryrun.txt"; echo '```'
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload graphs & audit
+      - name: Upload graphs & reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
