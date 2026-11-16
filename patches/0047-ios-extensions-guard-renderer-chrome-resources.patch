@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions probe: guard //chrome:resources in //extensions/renderer
+
+diff --git a/extensions/renderer/BUILD.gn b/extensions/renderer/BUILD.gn
+index 44f94f1..9ed632d 100644
+--- a/extensions/renderer/BUILD.gn
++++ b/extensions/renderer/BUILD.gn
+@@ -253,7 +253,6 @@ source_set("renderer") {
+   deps = [
+     "//build:android_buildflags",
+     "//build:chromeos_buildflags",
+-    "//chrome:resources",
+     "//components/crx_file",
+     "//components/guest_view/buildflags",
+     "//components/url_formatter",
+@@ -278,6 +277,10 @@ source_set("renderer") {
+     "//ui/strings:auto_image_annotation_strings_grit",
+   ]
+ 
++  if (!is_ios) {
++    deps += [ "//chrome:resources" ]
++  }
++
+   # TODO(https://crbug.com/356905053): The following files don't compile
+   # cleanly with the experimental desktop-android build. Either make them
+   # compile, or determine they should not be included and place them under a
