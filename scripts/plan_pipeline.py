@@ -175,12 +175,22 @@ def plan(repo: str, with_app_groups: str) -> None:
     has_apple = has_link or exists(apple_ref)
     missing = [] if has_link else [i for i in range(SHARD_COUNT) if not exists(f"{compile_prefix}-{i}")]
 
+    # A shard rescue (ONLY_SHARDS, e.g. "15" or "3,15") builds just those
+    # shards beside a running build and stops before link.
+    only = sorted({int(s) for s in os.environ.get("ONLY_SHARDS", "").replace(" ", "").split(",") if s})
+    if only:
+        if any(not 0 <= i < SHARD_COUNT for i in only):
+            sys.exit(f"::error::ONLY_SHARDS {only} is outside 0..{SHARD_COUNT - 1}")
+        if not (has_codegen and has_apple):
+            sys.exit("::error::A shard rescue needs the codegen and Apple checkpoints; run a full build")
+        missing = [i for i in missing if i in only]
+
     run = {
         "codegen": not has_codegen,
         "apple": not has_apple,
         "compile": bool(missing),
-        "link": not has_link,
-        "package": True,
+        "link": not has_link and not only,
+        "package": not only,
     }
     write_outputs({
         "chromium_rev": refs.rev,
@@ -205,8 +215,8 @@ def plan(repo: str, with_app_groups: str) -> None:
         ("2 Apple tools (Mac)", k_apple, "run" if run["apple"] else "reuse"),
         (f"3 Compile × {SHARD_COUNT} (Linux)", k_compile,
          f"run {len(missing)} shard(s): {missing}" if missing else "reuse all"),
-        ("4 Link (Linux)", k_link, "run" if run["link"] else "reuse"),
-        ("5 Package IPA (Mac)", k_package, "run"),
+        ("4 Link (Linux)", k_link, "run" if run["link"] else "skip (shard rescue)" if only else "reuse"),
+        ("5 Package IPA (Mac)", k_package, "run" if run["package"] else "skip (shard rescue)"),
     ]
     summary = ["## Build plan", "", f"Chromium `{refs.rev[:12]}` ({lock['CHROMIUM_VERSION']}), "
                f"source `{src[:19]}`, SDK `{stub[:19]}`", "", "| Stage | Key | Action |", "| :-- | :-- | :-- |"]

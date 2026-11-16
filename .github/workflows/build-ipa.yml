@@ -29,10 +29,15 @@ on:
         type: choice
         options: [none, shard-before-commit, shard-after-commit, link]
         default: none
+      shards:
+        description: "Rescue: build only these compile shards (e.g. 15 or 3,15), beside a running build; stops before link"
+        type: string
+        default: ""
 
-# Every workflow that writes GHCR checkpoints shares this group.
+# Every workflow that writes GHCR checkpoints shares this group. A shard rescue
+# writes only its own shards' tags, so it runs in a group of its own.
 concurrency:
-  group: ghcr-writes
+  group: ${{ inputs.shards == '' && 'ghcr-writes' || format('ghcr-shards-{0}', inputs.shards) }}
   cancel-in-progress: false
 
 permissions:
@@ -90,11 +95,13 @@ jobs:
       run_apple: ${{ steps.plan.outputs.run_apple }}
       run_compile: ${{ steps.plan.outputs.run_compile }}
       run_link: ${{ steps.plan.outputs.run_link }}
+      run_package: ${{ steps.plan.outputs.run_package }}
     steps:
       - uses: actions/checkout@v5
       - id: plan
         env:
           WITH_APP_GROUPS: ${{ inputs.with_app_groups }}
+          ONLY_SHARDS: ${{ inputs.shards }}
         run: ./scripts/stage.sh plan run
 
   codegen:
@@ -275,7 +282,7 @@ jobs:
   package:
     name: 5 Package IPA (Mac)
     needs: [plan, link]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_package == 'true' }}
     runs-on: xcode-27
     timeout-minutes: 45
     env:
