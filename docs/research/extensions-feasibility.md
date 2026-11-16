@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-1. **Both `enable_extensions_core = true` and `enable_extensions = true` fail during `gn gen` on iOS Blink without Chromium patches**, and `gn gen` stops before generating any Ninja edges, so the added graph size is **unverified** directly.
+1. **Core-only graph generation now passes with two narrow iOS dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`. Unpatched Chromium still fails. This proves graph generation, not extension compilation or runtime support: the current `chrome` closure reaches only the extensions constants and feature definitions.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.
 4. **The only realistic architecture to run Chromium extensions on iOS Blink** is to (a) decouple `//extensions` from its residual `//chrome` GN deps and desktop-only assumptions (notably `//extensions/renderer/BUILD.gn:256`'s `"//chrome:resources"`), (b) build a dedicated iOS Blink embedder in `//ios/web/content` + `//ios/chrome/browser` implementing `ExtensionsClient`, `ExtensionsBrowserClient`, `ExtensionsRendererClient`, and core API delegates (mirroring Desktop Android's `enable_extensions_core` split), and (c) build mobile extension UI (`chrome://extensions` or native UIKit/SwiftUI) against `ProfileIOS` / `WebStateList` while respecting sideloading's `--single-process` + `--jitless` constraints.
@@ -25,6 +25,10 @@ All probes were run on `benjipeng/chromium-blink-ios` branch `probe/extensions-g
 | 2 | `enable_extensions = true` | [43925411473](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925411473) | `//extensions/BUILD.gn:15:1` via `//BUILD.gn:297:9` |
 | 3 | `enable_extensions = true; enable_guest_view = true` | [43927150887](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43927150887) | `//components/web_modal/BUILD.gn:5:1` via `//extensions/browser/BUILD.gn:839:15` |
 | 4 | `enable_extensions = true; enable_guest_view = true; enable_platform_apps = false` | [43928163373](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43928163373) | `//extensions/browser/api/app_current_window_internal/BUILD.gn:7:1` via `//extensions/browser/api/BUILD.gn:64:7` |
+| 5 | `enable_extensions_core = true`; guard renderer's `//chrome:resources` on iOS | [43938061454](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43938061454) | `//chrome/common/net/BUILD.gn:8:1`, reached through the desktop test-support buildflags dependency |
+| 6 | Core-only; also guard test support's `//chrome/common:buildflags` on iOS | [43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) | **GN and codegen contract passed**; no compilation |
+
+The two guards preserve the platform assertions and the test target definitions. Removing all extensions test targets would leave unresolved dependencies in sibling GN files. Their presence in the generated graph does not establish that those tests compile on iOS.
 
 ### Probe 1: `enable_extensions_core = true` ([run 43925398726](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925398726))
 
@@ -111,7 +115,11 @@ See //extensions/browser/api/BUILD.gn:64:7: which caused the file to be included
 - `//extensions/browser/mime_handler/BUILD.gn:7`: `assert(enable_extensions && !is_android)` (if `enable_extensions = true`, `mime_handler` itself doesn't assert `!is_ios`, though `//extensions/browser/BUILD.gn:767` pulls `mime_handler_page` / `stream_container` for `!is_android`).
 
 ### Build-graph size impact
-Because all `gn gen` runs aborted on GN `assert()` failures before emitting Ninja files, the exact added edge count for `//extensions` + `//components/guest_view` on iOS Blink is **unverified**. On baseline (`43868838103`), the full Ninja graph is `263,702` edges (`43,494` codegen roots / `49,500` closure edges).
+The successful core-only probe has **265,988 edges across 13,869 Ninja files**. Its codegen audit reports 43,247 roots, 10,939 edges in their closure, zero forbidden work, and zero unplanned required Apple inputs; `buildflags.h` is covered. The older baseline (`43868838103`) has 263,702 raw edges, but it predates planner and workflow changes, so the difference is not a controlled measure of extension overhead.
+
+The actual `chrome` closure contains only `extensions/common/constants_impl.ninja` and `extensions/common/extension_features.ninja` from the extensions tree. Full `extensions/common:common` and renderer targets would pull in 15,940 and 27,318 device C-family compilations respectively. The next compile probe therefore selects individual object outputs rather than those transitive targets.
+
+The successful run's comparison step did not execute: `compare_graphs.py` lacked executable permission and `tee` masked that error. Commit `8ec9f1d` invokes Python explicitly, propagates pipeline failures, and reports expected feature-probe graph changes without treating them as baseline regressions. The GN and codegen checks were separate and did pass.
 
 ---
 
@@ -212,7 +220,7 @@ If the goal is content-blocking + userscripts rather than full Chrome Web Store 
 
 ## 4. Open Questions (Unverified)
 
-1. **Full `gn gen` blocker list & Ninja edge delta under `enable_extensions_core = true`:** Once `"//chrome:resources"` (`//extensions/renderer/BUILD.gn:256`) and `"//chrome/common:buildflags"` (`//extensions/BUILD.gn:159`) are bypassed or guarded, what additional `!is_ios` asserts or missing targets appear in `//extensions/common`, `//extensions/browser`, `//extensions/renderer`, and `//components/*`, and how many Ninja edges are added?
+1. **Production resource and dependency coverage:** Graph generation passes after two dependency guards, but which resources and generated headers will the eventual iOS renderer integration actually need? The full emitted graph includes test targets; its total size must not be confused with the browser's production closure.
 2. **Actual compile/link errors in `//extensions/` for `target_os = "ios"`:** Upstream `//extensions/` has never been compiled for `is_ios = true` (POSIX/Apple paths in `//extensions` often assume `is_mac` rather than `is_apple`, e.g., `//extensions/browser/BUILD.gn:875` `CoreServices.framework` under `if (is_mac)`, or `//extensions/common/file_util.cc`, `//extensions/browser/updater/`, `native_messaging`, `services/data_decoder` out-of-process unzipping under `--single-process`).
 3. **Single-process (`--single-process`) & `--jitless` compatibility for extension service workers and isolated worlds:** Whether `extensions::ServiceWorkerTaskQueue`, `ExtensionHost`, and `NativeExtensionBindingsSystem` run cleanly in-process on iOS Blink, and what the Jetsam RAM overhead is on 4–6 GB devices (`patches/0001-ios-sideload-single-process-jitless-switches.patch:55-66`).
 4. **In-process CRX unzipping / JSON parsing:** `//extensions/browser/sandboxed_unpacker.cc` uses `//components/services/unzip` and `//services/data_decoder` out-of-process services by default; under sideloaded iOS without `.appex` helper processes, in-process service execution must be verified.

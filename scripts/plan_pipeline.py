@@ -69,6 +69,7 @@ NON_OUTPUT = {
     "scripts/run_with_budget.py",
     "scripts/sparse_checkout.conf",
     "scripts/stages/sdk.sh",  # the SDK enters keys by digest
+    "scripts/stages/probe.sh",  # diagnostic objects are never stage checkpoints
     "scripts/sync_pruned_source.sh",
     "scripts/write_job_summary.py",
 }

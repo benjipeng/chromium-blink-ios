@@ -1,10 +1,10 @@
-name: Diagnose Build Graph (no compile)
-run-name: GN probe · ${{ github.ref_name }} · ${{ inputs.extra_gn_args || 'baseline' }}
+name: Probe Chromium build graph
+run-name: ${{ inputs.compile_extensions && 'Extension object probe' || 'GN probe' }} · ${{ github.ref_name }} · ${{ inputs.extra_gn_args || 'baseline' }}
 
 # Prepares the Linux tree exactly as the codegen stage does (scripts/stage.sh),
-# then, without compiling: plans codegen, audits the plan against the stage
-# contract, compares the raw and pruned graphs with a baseline run's artifact,
-# and uploads graphs and reports.
+# then plans codegen without compiling and audits the stage contract.
+# An opt-in probe compiles three extension objects on Linux, without linking.
+# Both modes compare graphs with a baseline and upload graphs and reports.
 
 on:
   workflow_dispatch:
@@ -17,6 +17,10 @@ on:
         description: Extra GN args appended to args.gn (newline or semicolon separated)
         default: ""
         type: string
+      compile_extensions:
+        description: Compile three extensions core C++ objects on Linux after graph checks (no link)
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -29,13 +33,16 @@ env:
 
 jobs:
   diagnose:
-    name: Real-graph codegen plan audit
+    name: Graph audit and optional extension object probe
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
       BASELINE_RUN: ${{ inputs.baseline_run }}
       EXTRA_GN_ARGS: ${{ inputs.extra_gn_args }}
+      COMPILE_EXTENSIONS: ${{ inputs.compile_extensions }}
+      JOB_TIMEOUT_MIN: 60
+      PERSIST_RESERVE_MIN: 5
     steps:
       - uses: actions/checkout@v5
       - run: ./scripts/stage.sh plan refs
@@ -48,7 +55,7 @@ jobs:
 
           fields = (
               "GITHUB_REF", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
-              "SRC_REF", "STUB_REF", "EXTRA_GN_ARGS",
+              "SRC_REF", "STUB_REF", "EXTRA_GN_ARGS", "COMPILE_EXTENSIONS",
           )
           identity = {field: os.environ.get(field, "") for field in fields}
           report = Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis" / "probe-context.json"
@@ -85,6 +92,10 @@ jobs:
             | tee "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"
           { echo "### Compared with run $BASELINE_RUN"; echo '```text'
             cat "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compile three extension core objects (Linux)
+        if: inputs.compile_extensions
+        run: ./scripts/stage.sh probe compile
 
       - name: Upload graphs & reports
         if: always()

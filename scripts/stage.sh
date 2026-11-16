@@ -277,7 +277,7 @@ case "$stage" in
       *) echo "error: unknown diagnose step '$step'" >&2; exit 2 ;;
     esac
     ;;
-  sdk|codegen|apple|compile|link|package)
+  sdk|codegen|apple|compile|link|package|probe)
     # shellcheck source=/dev/null
     source "$SCRIPTS/stages/$stage.sh"
     fn="${stage}_${step//-/_}"
