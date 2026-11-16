@@ -1,4 +1,5 @@
 name: Diagnose Build Graph (no compile)
+run-name: GN probe · ${{ github.ref_name }} · ${{ inputs.extra_gn_args || 'baseline' }}
 
 # Prepares the Linux tree exactly as the codegen stage does (scripts/stage.sh),
 # then, without compiling: plans codegen, audits the plan against the stage
@@ -38,6 +39,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: ./scripts/stage.sh plan refs
+      - name: Record probe identity
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          fields = (
+              "GITHUB_REF", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+              "SRC_REF", "STUB_REF", "EXTRA_GN_ARGS",
+          )
+          identity = {field: os.environ.get(field, "") for field in fields}
+          report = Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis" / "probe-context.json"
+          report.parent.mkdir(parents=True, exist_ok=True)
+          report.write_text(json.dumps(identity, indent=2) + "\n")
+          PY
       - run: ./scripts/stage.sh diagnose init
       - name: Prepare tree (snapshots raw and pruned graphs)
         run: ./scripts/stage.sh diagnose prepare
