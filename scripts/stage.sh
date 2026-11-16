@@ -127,15 +127,10 @@ write_args() {
   fi
 }
 
-# The same production roots are used on Linux and Mac and enter every key.
+# Production roots live in the patched .gn so nested queries inherit them too.
 generate_graph() {
-  local source_dir="$1" gn_binary="$2" argument
-  local flags=()
-  while IFS= read -r argument || [ -n "$argument" ]; do
-    case "$argument" in ''|\#*) continue ;; esac
-    flags+=("$argument")
-  done < "$REPO_ROOT/ci/gn_gen.flags"
-  (cd "$source_dir" && "$gn_binary" gen out/Release "${flags[@]}")
+  local source_dir="$1" gn_binary="$2"
+  (cd "$source_dir" && "$gn_binary" gen out/Release)
 }
 
 decrypt_stub() {

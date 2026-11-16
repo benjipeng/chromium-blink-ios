@@ -22,6 +22,12 @@ probe_compile() {
 obj/extensions/common/common/extension.o
 obj/extensions/browser/browser_sources/process_manager.o
 obj/extensions/renderer/renderer/dispatcher.o
+obj/extensions/browser/browser_sources/extension_registrar_factory.o
+obj/extensions/browser/browser_sources/process_manager_factory.o
+obj/extensions/browser/browser_sources/renderer_startup_helper.o
+obj/ios/web/content/init/init/ios_content_client.o
+obj/ios/web/content/init/init/ios_content_renderer_client.o
+obj/ios/web/content/init/init/ios_content_browser_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_renderer_client.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o

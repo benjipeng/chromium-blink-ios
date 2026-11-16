@@ -1490,7 +1490,7 @@ new file mode 100644
 +#include "extensions/common/extension.h"
 +#include "extensions/common/features/feature_channel.h"
 +#include "extensions/common/manifest_handlers/background_info.h"
-+#include "extensions/common/manifest_handlers/manifest_url_handler.h"
++#include "extensions/common/manifest_handlers/manifest_url_handlers.h"
 +#include "extensions/common/mojom/manifest.mojom-shared.h"
 +#include "extensions/common/switches.h"
 +#include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"

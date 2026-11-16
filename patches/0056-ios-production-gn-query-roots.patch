@@ -1,0 +1,11 @@
+diff --git a/.gn b/.gn
+--- a/.gn
++++ b/.gn
+@@ -11,2 +11,7 @@
+ # The location of the build configuration file.
+ buildconfig = "//build/config/BUILDCONFIG.gn"
++
++# Keep nested GN queries on the same iOS production graph as the app build.
++# In particular, V8 metagen invokes gn desc in its own temporary directory.
++root = "//ios/chrome/app"
++root_patterns = [ "//ios/chrome/app:*" ]
