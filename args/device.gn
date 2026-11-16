@@ -7,6 +7,15 @@ target_cpu = "arm64"
 target_environment = "device"
 use_blink = true
 
+# Experimental Chromium extensions core, shared by Linux and macOS stages.
+# These args are part of the checkpoint identity; the probe workflow does not
+# need a transient override to match the IPA build.
+enable_extensions_core = true
+enable_extensions = false
+enable_platform_apps = false
+enable_hosted_apps = false
+enable_guest_view = false
+
 # Release optimization with full symbol stripping to minimize object/cache bloat.
 is_debug = false
 is_component_build = false
