@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compares a graph-diagnosis artifact with a baseline run's artifact.
 
-The raw and pruned Ninja graphs must be byte-identical (a refactor of the
-workflow must not change what GN generates or how it is pruned). The codegen
+The raw and pruned Ninja graphs must be byte-identical by default (a refactor
+must not change what GN generates or how it is pruned). Feature probes can
+allow graph differences while retaining the comparison report. The codegen
 plan is reported as a difference against the baseline's filtered plan, since
 planner fixes are expected to change it.
 """
@@ -38,6 +39,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--baseline", type=pathlib.Path, required=True)
     ap.add_argument("--current", type=pathlib.Path, required=True)
+    ap.add_argument("--allow-differences", action="store_true",
+                    help="Report expected feature-probe changes without failing")
     args = ap.parse_args()
 
     lines: list[str] = []
@@ -62,7 +65,7 @@ def main() -> int:
     lines += [f"  removed: {p}" for p in sorted(base_plan - cur_plan)[:20]]
 
     print("\n".join(lines))
-    if not identical:
+    if not identical and not args.allow_differences:
         print("::error::The generated or pruned graph differs from the baseline")
         return 1
     return 0

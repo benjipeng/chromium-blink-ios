@@ -73,9 +73,15 @@ jobs:
 
       - name: Compare with baseline
         if: success() && inputs.baseline_run != ''
+        shell: bash
         run: |
           gh run download "$BASELINE_RUN" -R "$GITHUB_REPOSITORY" -n graph-diagnosis -D "$RUNNER_TEMP/baseline"
-          ./scripts/compare_graphs.py --baseline "$RUNNER_TEMP/baseline" --current "$RUNNER_TEMP/graph-diagnosis" \
+          comparison_args=()
+          if [ -n "$EXTRA_GN_ARGS" ]; then
+            comparison_args+=(--allow-differences)
+          fi
+          python3 ./scripts/compare_graphs.py --baseline "$RUNNER_TEMP/baseline" --current "$RUNNER_TEMP/graph-diagnosis" \
+            "${comparison_args[@]}" \
             | tee "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"
           { echo "### Compared with run $BASELINE_RUN"; echo '```text'
             cat "$RUNNER_TEMP/graph-diagnosis/baseline_compare.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
