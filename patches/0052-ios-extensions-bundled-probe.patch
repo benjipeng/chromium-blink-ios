@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: bundle a genuine content-script verification extension
+
+diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.gn
+--- a/ios/chrome/app/resources/BUILD.gn
++++ b/ios/chrome/app/resources/BUILD.gn
+@@ -21,8 +21,23 @@
+     ":system_strings",
+     "//ios/chrome/app/resources:packed_resources",
+   ]
++  if (enable_extensions_core) {
++    public_deps += [ ":ios_extension_probe" ]
++  }
+ }
+ 
++if (enable_extensions_core) {
++  bundle_data("ios_extension_probe") {
++    sources = [
++      "extensions/ios_probe/content.js",
++      "extensions/ios_probe/manifest.json",
++    ]
++    outputs = [
++      "{{bundle_resources_dir}}/Extensions/iOSProbe/{{source_file_part}}",
++    ]
++  }
++}
++
+ grit("ios_resources") {
+   source = "ios_resources.grd"
+   inputs = [
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/manifest.json b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+@@ -0,0 +1,17 @@
++{
++  "manifest_version": 3,
++  "name": "Chromium iOS Extension Probe",
++  "version": "1.0",
++  "description": "Bundled verification of Chromium extension loading and isolated-world bindings.",
++  "content_scripts": [
++    {
++      "matches": [
++        "https://example.com/*"
++      ],
++      "js": [
++        "content.js"
++      ],
++      "run_at": "document_end"
++    }
++  ]
++}
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/content.js b/ios/chrome/app/resources/extensions/ios_probe/content.js
+new file mode 100644
+--- /dev/null
++++ b/ios/chrome/app/resources/extensions/ios_probe/content.js
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++(() => {
++  const id = globalThis.chrome?.runtime?.id;
++  if (!id || chrome.runtime.getManifest().name !==
++      'Chromium iOS Extension Probe') {
++    throw new Error('Chromium extension bindings or manifest are unavailable.');
++  }
++  globalThis.__iosBlinkExtensionIsolatedWorld = id;
++  document.documentElement.dataset.iosBlinkExtensionId = id;
++  const badge = document.createElement('div');
++  badge.id = 'ios-blink-extension-probe';
++  badge.dataset.extensionId = id;
++  badge.textContent = 'Chromium extension active · ' + id.slice(0, 8);
++  badge.style.cssText =
++      'position:fixed;bottom:12px;right:12px;z-index:2147483647;' +
++      'padding:8px 12px;background:#064e3b;color:white;' +
++      'font:12px system-ui;border-radius:6px;pointer-events:none';
++  (document.body || document.documentElement).appendChild(badge);
++  console.info('CHROMIUM_IOS_EXTENSION_PROBE', id);
++})();
+

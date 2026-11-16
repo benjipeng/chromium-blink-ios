@@ -1,4 +1,5 @@
 name: Build Chromium Blink iOS IPA
+run-name: IPA · ${{ github.ref_name }} · build ${{ github.run_number }}
 
 # Orchestration only: every stage runs scripts/stage.sh, and its checkpoint key
 # comes from scripts/plan_pipeline.py (inputs by content, never this YAML).
@@ -58,6 +59,8 @@ jobs:
       need_sdk: ${{ steps.preflight.outputs.need_sdk }}
     steps:
       - uses: actions/checkout@v5
+      - name: Check patch series before scheduling build stages
+        run: python3 scripts/check_remote_patches.py
       - id: preflight
         run: ./scripts/stage.sh plan preflight
 
