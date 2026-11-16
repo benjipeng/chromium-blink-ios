@@ -1,0 +1,219 @@
+# Feasibility Memo: Chromium Extensions in iOS Blink (`benjipeng/chromium-blink-ios`)
+
+- **Pinned Chromium revision:** `34d81e7bfe669b8eccaaf35c6e14c7bfc0689703` (M159, `159.0.8149.0`, `version.lock`)
+- **Target configuration:** `target_os = "ios"`, `target_cpu = "arm64"`, `target_environment = "device"`, `use_blink = true`, `is_component_build = false` (`args/device.gn`, `ci/gn_args.linux`)
+- **Baseline build graph (`graph-diagnose.yml` run `43868838103`):** `263,702` raw Ninja edges across `13,769` ninja files; `43,494` codegen roots (`49,500` edges in closure) ([run 43868838103](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43868838103)).
+
+---
+
+## Executive Summary
+
+1. **Both `enable_extensions_core = true` and `enable_extensions = true` fail during `gn gen` on iOS Blink without Chromium patches**, and `gn gen` stops before generating any Ninja edges, so the added graph size is **unverified** directly.
+2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
+3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.
+4. **The only realistic architecture to run Chromium extensions on iOS Blink** is to (a) decouple `//extensions` from its residual `//chrome` GN deps and desktop-only assumptions (notably `//extensions/renderer/BUILD.gn:256`'s `"//chrome:resources"`), (b) build a dedicated iOS Blink embedder in `//ios/web/content` + `//ios/chrome/browser` implementing `ExtensionsClient`, `ExtensionsBrowserClient`, `ExtensionsRendererClient`, and core API delegates (mirroring Desktop Android's `enable_extensions_core` split), and (c) build mobile extension UI (`chrome://extensions` or native UIKit/SwiftUI) against `ProfileIOS` / `WebStateList` while respecting sideloading's `--single-process` + `--jitless` constraints.
+
+---
+
+## 1. GN-Only CI Probe Results (`probe/extensions-gn`)
+
+All probes were run on `benjipeng/chromium-blink-ios` branch `probe/extensions-gn` using `.github/workflows/graph-diagnose.yml` with `scripts/stage.sh` modified to append `extra_gn_args` to `out/Release/args.gn` and capture `gn gen` output (`gn_gen.log`) without compiling.
+
+| Probe | Extra GN args | CI Run | Blocking file:line |
+|---|---|---|---|
+| 1 | `enable_extensions_core = true` | [43925398726](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925398726) | `//chrome/chrome_repack_locales.gni:10:1` via `//extensions/renderer/BUILD.gn:256:5` |
+| 2 | `enable_extensions = true` | [43925411473](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925411473) | `//extensions/BUILD.gn:15:1` via `//BUILD.gn:297:9` |
+| 3 | `enable_extensions = true; enable_guest_view = true` | [43927150887](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43927150887) | `//components/web_modal/BUILD.gn:5:1` via `//extensions/browser/BUILD.gn:839:15` |
+| 4 | `enable_extensions = true; enable_guest_view = true; enable_platform_apps = false` | [43928163373](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43928163373) | `//extensions/browser/api/app_current_window_internal/BUILD.gn:7:1` via `//extensions/browser/api/BUILD.gn:64:7` |
+
+### Probe 1: `enable_extensions_core = true` ([run 43925398726](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925398726))
+
+**Verbatim `gn gen` error:**
+```text
+ERROR at //chrome/chrome_repack_locales.gni:10:1: Assertion failed.
+assert(!is_ios, "Chromium/iOS shouldn't use anything in //chrome")
+^-----
+Chromium/iOS shouldn't use anything in //chrome
+See //chrome/chrome_paks.gni:17:1: whence //chrome/chrome_repack_locales.gni was imported.
+import("chrome_repack_locales.gni")
+^---------------------------------
+See //chrome/BUILD.gn:19:1: whence //chrome/chrome_paks.gni was imported.
+import("//chrome/chrome_paks.gni")
+^--------------------------------
+See //extensions/renderer/BUILD.gn:256:5: which caused the file to be included.
+    "//chrome:resources",
+    ^-------------------
+```
+
+**Why this triggers even without `//ios/chrome` depending on `//extensions`:**
+- Existing components already compiled on iOS Blink depend on `//extensions/common:common_constants` and `//extensions/common:extension_features` whenever `enable_extensions_core` is true — specifically `//components/omnibox/browser/BUILD.gn:500-504` and `//components/no_state_prefetch/common/BUILD.gn:31-33`.
+- Evaluating `//extensions/common/BUILD.gn` parses all targets in that file; `static_library("common")` depends on `"//extensions:extensions_resources"` (`//extensions/common/BUILD.gn:614`).
+- Evaluating `//extensions/BUILD.gn` parses `test_support` (`//extensions/BUILD.gn:180`) and `extensions_unittests` (`//extensions/BUILD.gn:296`), both of which depend on `"//extensions/renderer"`.
+- `//extensions/renderer/BUILD.gn:256` unconditionally includes `"//chrome:resources"` in `deps`. Evaluating `//chrome/BUILD.gn` imports `//chrome/chrome_paks.gni` (`:19`), which imports `//chrome/chrome_repack_locales.gni` (`:17`), hitting `assert(!is_ios, "Chromium/iOS shouldn't use anything in //chrome")` at `:10:1`.
+- **Desktop Android comparison:** Desktop Android (`is_android = true`) satisfies `!is_ios` and compiles `//chrome` natively (`//chrome/BUILD.gn:1743` defines `group("resources")`). Note that `//extensions/DEPS` explicitly forbids `//chrome` dependencies (`# Do not add Chrome dependencies`) and `//extensions/renderer/DEPS` has no `+chrome` include rules, suggesting `"//chrome:resources"` in `//extensions/renderer/BUILD.gn:256` may be a stale build dep, though whether any renderer target reads a `//chrome:resources` pak at runtime/compile time is **unverified**.
+
+### Probe 2: `enable_extensions = true` ([run 43925411473](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43925411473))
+
+**Verbatim `gn gen` error:**
+```text
+ERROR at //extensions/BUILD.gn:15:1: Assertion failed.
+assert(!enable_extensions || enable_guest_view)
+^-----
+See //BUILD.gn:297:9: which caused the file to be included.
+        "//extensions:extensions_unittests",
+        ^----------------------------------
+```
+
+**Why this triggers:**
+- Root `//BUILD.gn:295-300` adds `"//extensions:extensions_unittests"` and `"//extensions/browser/api/declarative_net_request/filter_list_converter"` when `enable_extensions` is true.
+- `//components/guest_view/buildflags/buildflags.gni:12` defaults `enable_guest_view = !is_ios && !is_castos` (`false` on iOS).
+- `//extensions/BUILD.gn:15`, `//extensions/common/BUILD.gn:18`, `//extensions/browser/BUILD.gn:20`, and `//extensions/renderer/BUILD.gn:12` all enforce `assert(!enable_extensions || enable_guest_view)`.
+- **Desktop Android comparison:** Desktop Android leaves `enable_extensions = false` and instead sets `enable_desktop_android_extensions = is_desktop_android` -> `enable_extensions_core = true` (`//extensions/buildflags/buildflags.gni:45-68`), avoiding `//BUILD.gn:295` and the `enable_guest_view` coupling unless `enable_guest_view` is explicitly turned on.
+
+### Probe 3: `enable_extensions = true; enable_guest_view = true` ([run 43927150887](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43927150887))
+
+**Verbatim `gn gen` error:**
+```text
+ERROR at //components/web_modal/BUILD.gn:5:1: Assertion failed.
+assert(!is_android && !is_ios)
+^-----
+See //extensions/browser/BUILD.gn:839:15: which caused the file to be included.
+    deps += [ "//components/web_modal" ]
+              ^-----------------------
+```
+
+**Why this triggers:**
+- `enable_extensions = true` defaults `enable_platform_apps = enable_extensions` (`//extensions/buildflags/buildflags.gni:57`).
+- Inside `if (enable_platform_apps)` at `//extensions/browser/BUILD.gn:819-840`, `browser_sources` adds `"//components/web_modal"` (`:839`), whose `//components/web_modal/BUILD.gn:5` asserts `assert(!is_android && !is_ios)`.
+- **Desktop Android comparison:** Desktop Android keeps `enable_extensions = false` -> `enable_platform_apps = false`, so `//components/web_modal` is excluded (see also Ultimatum's `args.gn` explicitly setting `enable_platform_apps = false`).
+
+### Probe 4: `enable_extensions = true; enable_guest_view = true; enable_platform_apps = false` ([run 43928163373](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43928163373))
+
+**Verbatim `gn gen` error:**
+```text
+ERROR at //extensions/browser/api/app_current_window_internal/BUILD.gn:7:1: Assertion failed.
+assert(enable_platform_apps,
+^-----
+Cannot depend on platform apps because enable_platform_apps=false.
+See //extensions/browser/api/BUILD.gn:64:7: which caused the file to be included.
+      "//extensions/browser/api/app_current_window_internal",
+      ^-----------------------------------------------------
+```
+
+**Why this triggers:**
+- `//extensions/browser/api/BUILD.gn:60-66` gates `app_current_window_internal`, `app_runtime`, and `app_window` behind `if (enable_extensions)` rather than `if (enable_platform_apps)`, even though `//extensions/browser/api/app_current_window_internal/BUILD.gn:7` asserts `enable_platform_apps`.
+- Combined with Probes 2 and 3, this shows `enable_extensions = true` is self-contradictory on iOS unless either `//components/web_modal` is enabled on iOS (`enable_platform_apps = true`) or `//extensions/browser/api/BUILD.gn` is patched to gate app APIs on `enable_platform_apps`.
+- **Desktop Android comparison:** Desktop Android avoids this deadlock entirely because `enable_extensions` stays `false` (`enable_extensions_core = true`, `enable_platform_apps = false`).
+
+### Additional static `//chrome` / `!is_ios` traps found in `//extensions` at `34d81e7bfe669b8eccaaf35c6e14c7bfc0689703`
+- `//extensions/BUILD.gn:159`: `static_library("test_support")` depends on `"//chrome/common:buildflags"` (unconditionally inside `//extensions/BUILD.gn`, which imports `//chrome` -> hits `assert(!is_ios)` in `//chrome/BUILD.gn:77` whenever `//extensions/BUILD.gn` is parsed, unless `//chrome/common:buildflags` is removed or guarded).
+- `//extensions/BUILD.gn:280`: `test("extensions_unittests")` lists `data = [ ..., "//chrome/test/data/extensions/" ]`.
+- `//extensions/browser/mime_handler/BUILD.gn:7`: `assert(enable_extensions && !is_android)` (if `enable_extensions = true`, `mime_handler` itself doesn't assert `!is_ios`, though `//extensions/browser/BUILD.gn:767` pulls `mime_handler_page` / `stream_container` for `!is_android`).
+
+### Build-graph size impact
+Because all `gn gen` runs aborted on GN `assert()` failures before emitting Ninja files, the exact added edge count for `//extensions` + `//components/guest_view` on iOS Blink is **unverified**. On baseline (`43868838103`), the full Ninja graph is `263,702` edges (`43,494` codegen roots / `49,500` closure edges).
+
+---
+
+## 2. Upstream & Downstream Research
+
+### 2.1 Desktop Android Extensions Port (`enable_desktop_android_extensions` / `enable_extensions_core`)
+
+- **Origin & Tracking:** Introduced in August 2024 under [crbug.com/356905053](https://issues.chromium.org/issues/356905053) ("Support extensions on experimental desktop android builds") to bring Chromium extensions to Android desktop form factors (`is_desktop_android = true` in `//build/config/chrome_build.gni:41` and `:69-75`, which asserts `target_os == "android"`).
+- **Build Flag Architecture (`//extensions/buildflags/buildflags.gni` and `//extensions/docs/buildflags.md`):**
+  - `enable_extensions = !is_android && !is_ios && !is_castos && !is_fuchsia`: legacy flag covering Win/Mac/Linux/ChromeOS (`ENABLE_EXTENSIONS`).
+  - `enable_desktop_android_extensions = is_desktop_android`: internal implementation detail flag (`ENABLE_DESKTOP_ANDROID_EXTENSIONS`), actively being replaced by `IS_ANDROID && ENABLE_EXTENSIONS_CORE` (e.g., [CL 8615887](https://chromium-review.googlesource.com/c/chromium/src/+/8615887), Oct 2026).
+  - `enable_extensions_core = enable_extensions || enable_desktop_android_extensions`: primary gate for shared extensions code across desktop and desktop Android (`ENABLE_EXTENSIONS_CORE`), tracked for eventual consolidation back into `enable_extensions` under [crbug.com/546631276](https://issues.chromium.org/issues/546631276) ([CL 8435498](https://chromium-review.googlesource.com/c/chromium/src/+/8435498)).
+  - `enable_platform_apps = enable_extensions` and `enable_hosted_apps = enable_extensions`: both stay `false` on desktop Android.
+  - Desktop Android officially supports **Manifest V3 only** (`//extensions/docs/buildflags.md:22-24`).
+- **Enabled Directories / Targets at `34d81e7bfe669b8eccaaf35c6e14c7bfc0689703`:**
+  - `//extensions/common`, `//extensions/common/api`, `//extensions/browser`, `//extensions/renderer`, `//extensions/strings`: all assert `enable_extensions_core` (plus `//extensions/BUILD.gn:15` asserts `!enable_extensions || enable_guest_view`).
+  - **Core APIs enabled under `enable_extensions_core`** (`//extensions/browser/api/BUILD.gn:27-57`, `//extensions/common/api/schema.gni:11-37`): `alarms`, `contentSettings`, `cookies`, `declarativeNetRequest`, `dns`, `fileHandlers`, `i18n`, `idle`, `management`, `messaging` + `native_messaging`, `metricsPrivate`, `offscreen`, `permissions`, `power`, `proxy`, `runtime`, `scripting`, `storage`, `system.cpu`, `system.display`, `system.memory`, `system.network`, `test`, `userScripts`, `webstorePrivate`.
+  - **APIs still excluded under `if (enable_extensions)`** (`//extensions/browser/api/BUILD.gn:60-103`): `app_*`, `automationInternal`, `feedbackPrivate`, `fileSystem`, `mimeHandler` / `mimeHandlerPrivate`, `networkingPrivate`, `printerProvider`, `protocolHandlers`, `socket` / `sockets.*`, `systemInfo`, `systemStorage`, and ChromeOS-only hardware APIs.
+  - **`//chrome/browser/extensions` and `//chrome/common/extensions`:** Both assert `enable_extensions_core` (`//chrome/browser/extensions/BUILD.gn:26`, `//chrome/common/extensions/BUILD.gn:8`). Files not yet ported to Android remain inside `if (enable_extensions)` (`//chrome/browser/extensions/BUILD.gn:790-1231`).
+  - **Android UI & Bridges:** `//chrome/browser/ui/extensions/BUILD.gn:8` asserts `enable_extensions_core`; Android-specific JNI/Java bridges live in `//chrome/browser/ui/android/extensions/BUILD.gn` (`if (enable_extensions_core)`), including `ExtensionsToolbarAndroid`, `ExtensionsMenuDelegateAndroid`, `ExtensionActionDelegateAndroid`, `ExtensionActionPopupContents`, `ExtensionInstallDialogViewAndroid`, `ExtensionKeybindingRegistryAndroid`, `ExtensionDeveloperPrivateBridge`, plus `//chrome/browser/ui/android/extensions/windowing` and `side_panel` ([CL 8499267](https://chromium-review.googlesource.com/c/chromium/src/+/8499267)). `chrome://extensions` WebUI (`//chrome/browser/ui/webui/extensions/BUILD.gn:7`) is also gated on `enable_extensions_core`.
+- **Desktop-Only Pieces Replaced or Stubbed for Desktop Android:**
+  - `//chrome/browser/extensions/chrome_extensions_browser_client_android.cc`: temporary lightweight `ChromeExtensionsBrowserClient` implementation (explicitly marked `TODO(https://crbug.com/356905053)` to be deleted as code moves up to `//extensions` or is made cross-platform). Stubs out `GetProcessManagerDelegate()`, `GetControlledFrameEmbedderURLLoader()`, and full Safe Browsing (`SafeBrowsingDelegate` stub instead of `ChromeSafeBrowsingDelegate` when `safe_browsing_mode != 1`; `//chrome/browser/extensions/BUILD.gn:1880-1892`).
+  - `//chrome/browser/extensions/api/chrome_extensions_api_client_android.cc`: stubs out `CreateUsbDevicePermissionsPrompt()` returning `nullptr`.
+  - `//chrome/browser/extensions/extension_menu_model_android.cc`, `api/tabs/windows_util_android.cc`, `api/tabs/tabs_event_router_platform_delegate_android.cc`, `api/management/chrome_management_api_delegate_android.cc`, `extension_disabled_ui_android.cc`, `extension_error_ui_android.cc`, `external_install_error_android.cc`, `system_display/display_info_provider_android.cc`: Android-native delegates replacing Views/Aura/Cocoa UI and desktop `Browser` assumptions (`//chrome/browser/extensions/BUILD.gn:690-729`).
+- **Status at our rev & on `main` (Nov 2026):** Mature enough for Chrome Web Store installs, `chrome://extensions`, extension toolbar/popups, side panel ([CL 8307120](https://chromium-review.googlesource.com/c/chromium/src/+/8307120)), keyboard shortcut reordering ([CL 8749247](https://chromium-review.googlesource.com/c/chromium/src/+/8749247)), and `image_writer_private` ([CL 8228184](https://chromium-review.googlesource.com/c/chromium/src/+/8228184)), with ongoing CLs migrating remaining `ENABLE_DESKTOP_ANDROID_EXTENSIONS` checks to `ENABLE_EXTENSIONS_CORE` and `ChromeExtensionsBrowserClient` pieces out of `_android.cc`. Public snapshot builds (`AndroidDesktop_arm64`) and downstream ports use it directly (see [Brave PR #40844](https://github.com/brave/brave-core/pull/40844) / [brave-browser#59354](https://github.com/brave/brave-browser/issues/59354) and [Ultimatum](https://github.com/gonzazoid/Ultimatum)).
+
+### 2.2 Prior Art: iOS Blink, Android Forks (Kiwi, Ultimatum, Brave)
+
+- **Google's experimental iOS Blink port (`use_blink = true`):**
+  - Tracked under [crbug.com/40254930](https://issues.chromium.org/40254930) ("Create a content_shell iOS port"), which introduced the `use_blink` GN variable (`//build/config/features.gni:39`, default `use_blink = !is_ios`) and `USE_BLINK` buildflag for `content_shell` and `ios_chrome` experimental builds (`ios-blink-rel-fyi`, [crbug.com/514423253](https://issues.chromium.org/issues/514423253)).
+  - **No upstream `//extensions` work exists for iOS Blink.** In `//ios/BUILD.gn`, `//ios/chrome/app/BUILD.gn`, `//ios/chrome/browser/BUILD.gn`, and `//ios/web/content/BUILD.gn`, there are zero references to `enable_extensions`, `enable_extensions_core`, or `//extensions/`. All "extension" references in `ios/` Blink commits refer to iOS `.appex` helper processes (`//content/shell/app/ios/extensions.gni`, e.g., `chrome_content_process.appex`) or Apple's `WKWebExtension` (below).
+  - **No public third-party port of Chromium `//extensions` to iOS Blink** was found in web searches (status: none verified / likely nonexistent).
+- **Kiwi Browser (`kiwibrowser/src`, `kiwibrowser/src.next`, [crbug.com/40686993](https://issues.chromium.org/issues/40686993)):**
+  - Enabled the legacy `enable_extensions = true` + `enable_plugins = true` on `target_os = "android"` by patching ~400 build/runtime issues: replacing `<if expr="not is_android">` and `if (!is_android)` guards with `enable_extensions`, removing `is_android` assertions in `guest_view`, and providing Android shims for desktop `Browser` / `TabStripModel` / extension popups and `chrome://extensions`. Discontinued in Jan 2025; code later absorbed into Microsoft Edge Android.
+  - **Key lesson vs. iOS:** Kiwi still ran inside `//chrome/browser` on Android (where `//chrome` already compiles). On iOS, `//chrome` is excluded by design (`assert(!is_ios)`), so Kiwi's approach cannot simply flip `enable_extensions = true` without either porting `//chrome/browser/extensions` into `//ios/chrome/browser` or building an embedder directly on `//extensions`.
+- **Ultimatum (`gonzazoid/Ultimatum`) & Brave Android ([brave-browser#59354](https://github.com/brave/brave-browser/issues/59354), [brave-core#40844](https://github.com/brave/brave-core/pull/40844)):**
+  - Ultimatum builds on upstream Desktop Android using `enable_desktop_android_extensions = true`, `enable_guest_view = true`, `enable_platform_apps = false`, adding a two-window (`regular`/`incognito`) `chrome.windows` shim and `chrome.tabs` wiring.
+  - Brave enables `enable_extensions_core = true` (keeping `enable_extensions = false`) across Android in 45 files / 8 commits ([brave-core#40844](https://github.com/brave/brave-core/pull/40844)), patching `theme_resources.grd`, `ui/webui/resources/BUILD.gn`, `chrome/browser/profiles/BUILD.gn`, and `TabModel` / `BraveActivity` bridges. Both rely on `//chrome/browser`.
+
+### 2.3 How `WKWebExtension` / `BuiltInWebExtension` Is Wired at `34d81e7bfe669b8eccaaf35c6e14c7bfc0689703`
+
+The existing extension symbols in `benjipeng/chromium-blink-ios`'s built `chrome_framework` belong exclusively to Apple's WebKit-based built-in Global Privacy Control (GPC) extension (`web_extensions/gpc_web_extension`), and are **completely inert under `use_blink = true`**:
+
+1. **Profile service creation (`//ios/chrome/browser/profile/model/keyed_service_factories.mm:370` -> `//ios/chrome/browser/web_extension/model/extension_service_factory.mm:24-56`):**
+   - `ExtensionServiceFactory` is registered for every `ProfileIOS` (`ServiceCreation::kCreateWithProfile`). When `universal_optout::IsGPCExtensionEnabled(&profile)` or `IsUniversalOptOutExtensionSilentEnabled()` holds on iOS 18.4+ (`kUniversalOptOut` and `kUniversalOptOutExtension` are enabled by default in `//components/universal_optout/features.cc:21-23`), it constructs `ExtensionServiceImpl` (`//ios/chrome/browser/web_extension/model/extension_service_impl.mm`) owning `web::ExtensionController::Create()`.
+2. **Apple `WKWebExtension` wrapper (`//ios/web/extension/`):**
+   - `web::ExtensionController::Create()` (`//ios/web/extension/extension_controller_impl.mm:40-45`) instantiates `ExtensionControllerImpl`, which creates a `WKWebExtensionController` (`:49-53`) and loads `web::GPCWebExtension` (`//ios/web/extension/gpc_web_extension/gpc_web_extension.mm:22-26`, pointing to `web_extensions/gpc_web_extension` in the framework bundle) via `BuiltInWebExtension::CreateWKWebExtension` (`//ios/web/extension/built_in_web_extension.mm:53-57`, calling `[WKWebExtension extensionWithResourceBaseURL:completionHandler:]`).
+3. **Sole attachment point (`//ios/web/web_state/ui/wk_web_view_configuration_provider.mm:215-225`):**
+   - `WKWebViewConfigurationProvider::UpdateConfiguration()` calls `GetWebClient()->GetExtensionController(browser_state_)` (implemented in `//ios/chrome/browser/web/model/chrome_web_client.mm:735-740`) and sets `[configuration_ setWebExtensionController:extension_controller_impl->GetWKWebExtensionController()]` on a `WKWebViewConfiguration`.
+4. **Why it is inert under Blink (`use_blink = true`):**
+   - `web::WebState::Create()` (`//ios/web/web_state/web_state_factory.mm:12-23`) switches on `BUILDFLAG(USE_BLINK)`: when true, it constructs `web::ContentWebState` (`//ios/web/content/web_state/content_web_state.mm`) backed by `content::WebContents`, instead of `web::WebStateImpl` / `CRWWebController` / `WKWebViewConfigurationProvider`.
+   - `//ios/web/content/BUILD.gn` has zero dependencies on `//ios/web/extension` or `//ios/web/web_state/ui:wk_web_view_configuration_provider`, and `//ios/web/content/init/ios_content_browser_client.cc` and `content_browser_context.mm` never call `GetExtensionController`. Thus `WKWebExtensionController` may allocate in the background on iOS 18.4+, but no Blink tab ever attaches to it.
+
+---
+
+## 3. Architectural Gap & Realistic Implementation Routes
+
+### Core Architectural Differences: Desktop Android vs. iOS Blink
+
+| Dimension | Desktop Android (`is_desktop_android`) | iOS Blink Sideload (`benjipeng/chromium-blink-ios`) |
+|---|---|---|
+| Browser layer | `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`) | `//ios/chrome/browser` (`ProfileIOS`, `Browser`, `WebStateList`) |
+| Content wrapper | Direct `content::WebContents` / `content::BrowserContext` | `web::ContentWebState` wraps `content::WebContents`; `web::ContentBrowserContext` is attached via `SupportsUserData` on `web::BrowserState` (`//ios/web/content/content_browser_context.mm:15-45`) |
+| `//chrome` availability | Full `//chrome` targets available | Forbidden by `assert(!is_ios)` in `//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10` |
+| Process & JIT model | Multi-process (content/extension renderer processes), V8 JIT enabled | Single-process + jitless (`--single-process`, `--jitless --wasm-jitless` in `patches/0001-ios-sideload-single-process-jitless-switches.patch:47-76`); incognito disabled because single-process `//content` supports only one `BrowserContext` (`patches/0016-ios-sideload-disable-incognito.patch:62-67`) |
+| Embedder `ContentBrowserContext` delegates | Full `Profile` delegates | `ContentBrowserContext` returns `nullptr` for `GetGuestManager()`, `GetSpecialStoragePolicy()`, `GetSSLHostStateDelegate()`, etc. (`//ios/web/content/content_browser_context.mm:82-156`); `IOSContentBrowserClient` (`127` lines) and `IOSContentRendererClient` (`68` lines) are minimal |
+
+### Route A — Minimal `//extensions` Core Embedder in `//ios/web/content` + `//ios/chrome/browser` (Recommended)
+
+Use Desktop Android's `enable_extensions_core` boundary (avoiding `//chrome/browser/extensions`, `enable_platform_apps`, and `enable_guest_view` initially), and build a thin iOS Blink embedder directly on `//extensions/common`, `//extensions/browser`, and `//extensions/renderer`:
+1. **Unblock `gn gen` (~small patchset):**
+   - Introduce an iOS-compatible GN path (either enable `enable_extensions_core` for `is_ios && use_blink` or override in `args.gn`).
+   - Remove or guard `"//chrome:resources"` in `//extensions/renderer/BUILD.gn:256` (`if (!is_ios)` or investigate removing it upstream, since `//extensions/renderer/DEPS` forbids `//chrome`).
+   - Guard `"//chrome/common:buildflags"` (`//extensions/BUILD.gn:159`) and `"//chrome/test/data/extensions/"` (`//extensions/BUILD.gn:280`) with `if (!is_ios)` (or avoid pulling `//extensions:test_support` unless needed).
+   - Add `//extensions/strings` and `//extensions:extensions_resources` pak files to `chrome_framework` resource repacking in `//ios/chrome/app/resources/BUILD.gn` (`repack_unscaled_resources` / `ios_chrome_repack_locales`).
+2. **Core Embedder Wiring in `//ios/web/content` + `//ios/chrome/browser` (~medium-large):**
+   - Implement `IOSExtensionsClient` (`//extensions/common/extensions_client.h`), `IOSExtensionsBrowserClient` (`//extensions/browser/extensions_browser_client.h`), `IOSExtensionsAPIClient` (`//extensions/browser/api/extensions_api_client.h`), and `IOSExtensionsRendererClient` (`//extensions/renderer/extensions_renderer_client.h`).
+   - Hook `IOSContentBrowserClient` (`//ios/web/content/init/ios_content_browser_client.cc`) for `chrome-extension://` `URLLoaderFactory`, `OverrideWebkitPrefs`, Mojo interface binders, `AppendExtraCommandLineSwitches`, and `SiteInstance` / `WebContents` lifecycle (`ExtensionWebContentsObserver`), following the pattern already used by `patches/0034-ios-sideload-chrome-scheme-pages.patch` and `patches/0026-ios-sideload-site-permissions.patch`.
+   - Hook `IOSContentRendererClient` (`//ios/web/content/init/ios_content_renderer_client.cc`) to forward `RenderThreadStarted`, `RenderFrameCreated`, `RunScriptsAtDocumentStart/End/Idle`, `WillSendRequest`, etc. to `ExtensionsRendererClient`.
+   - Bridge `ContentBrowserContext` (`content::BrowserContext*`) <-> `ProfileIOS` (`PrefService*`, state path, incognito pairing) and call `extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt()`.
+   - Implement an extension lifecycle manager (`ExtensionRegistrar` / `ExtensionService`-equivalent, `CrxInstaller`, `UnpackedInstaller`, `ExtensionSystem`, `ProcessManagerDelegate` without `//chrome/browser/extensions`, or extract `ExtensionService` / `CrxInstaller` glue from `//chrome/browser/extensions`).
+3. **Browser APIs & Mobile UI (~large):**
+   - Core APIs (`storage`, `runtime`, `scripting`, `declarativeNetRequest`, `webRequest`, `cookies`, `alarms`, `offscreen`, `permissions`, `i18n`) live mostly in `//extensions/browser/api/`, though `tabs`, `windows`, `action`, `contextMenus`, `management`, `webNavigation`, `sidePanel`, and `developerPrivate` live in `//chrome/browser/extensions/api/` and would need iOS `WebStateList` / `Browser` / `ContentWebState` reimplementations or extracted shared delegates.
+   - Management & action UI: build native UIKit/SwiftUI views (extension list, unpacked/CRX loader, toolbar action button, popup `ContentWebState` sheet) or port `chrome://extensions` (`//chrome/browser/ui/webui/extensions` currently depends heavily on `//chrome/browser/*`).
+- **Estimated size & risk:** **Large (multi-month engineering effort; high maintenance surface).** High risk around `//chrome/browser/extensions/api/tabs` + `ExtensionTabUtil` + `ExtensionViewHost` coupling to `//chrome/browser`, WebExtension popup presentation inside iOS `UIViewController`s, and single-process memory pressure (Jetsam) when running extension service workers / content scripts alongside tabs in one jitless process.
+
+### Route B — Port `//chrome/browser/extensions` onto iOS (Not Recommended)
+
+Attempting to compile `//chrome/browser/extensions` (`//chrome/browser/extensions/BUILD.gn`) directly on iOS would require resolving transitive dependencies across `//chrome/browser/profiles`, `//chrome/browser/ui/browser_window`, `//chrome/browser/tab_list`, `//chrome/browser/safe_browsing`, `//chrome/browser/download`, etc., all of which live behind `assert(!is_ios)`. This is effectively rebuilding `//ios/chrome` on top of `//chrome/browser`. **Size:** prohibitive.
+
+### Route C — Lightweight Userscript / WebExtension Subset in `//ios/web/content`
+
+If the goal is content-blocking + userscripts rather than full Chrome Web Store `.crx` compatibility:
+- `//components/js_injection` is **already wired** into `IOSContentRendererClient` (`//ios/web/content/init/ios_content_renderer_client.cc:20-35`) and `//ios/web/content/BUILD.gn:64-65`.
+- A lightweight WebExtension subset (manifest parser + isolated-world script/CSS injection + `browser.storage` + `declarativeNetRequest` or `URLLoaderThrottle`) could avoid most of `//extensions/browser` and all of `//chrome/browser/extensions`, at the cost of incomplete Chrome Web Store API compatibility.
+
+---
+
+## 4. Open Questions (Unverified)
+
+1. **Full `gn gen` blocker list & Ninja edge delta under `enable_extensions_core = true`:** Once `"//chrome:resources"` (`//extensions/renderer/BUILD.gn:256`) and `"//chrome/common:buildflags"` (`//extensions/BUILD.gn:159`) are bypassed or guarded, what additional `!is_ios` asserts or missing targets appear in `//extensions/common`, `//extensions/browser`, `//extensions/renderer`, and `//components/*`, and how many Ninja edges are added?
+2. **Actual compile/link errors in `//extensions/` for `target_os = "ios"`:** Upstream `//extensions/` has never been compiled for `is_ios = true` (POSIX/Apple paths in `//extensions` often assume `is_mac` rather than `is_apple`, e.g., `//extensions/browser/BUILD.gn:875` `CoreServices.framework` under `if (is_mac)`, or `//extensions/common/file_util.cc`, `//extensions/browser/updater/`, `native_messaging`, `services/data_decoder` out-of-process unzipping under `--single-process`).
+3. **Single-process (`--single-process`) & `--jitless` compatibility for extension service workers and isolated worlds:** Whether `extensions::ServiceWorkerTaskQueue`, `ExtensionHost`, and `NativeExtensionBindingsSystem` run cleanly in-process on iOS Blink, and what the Jetsam RAM overhead is on 4–6 GB devices (`patches/0001-ios-sideload-single-process-jitless-switches.patch:55-66`).
+4. **In-process CRX unzipping / JSON parsing:** `//extensions/browser/sandboxed_unpacker.cc` uses `//components/services/unzip` and `//services/data_decoder` out-of-process services by default; under sideloaded iOS without `.appex` helper processes, in-process service execution must be verified.
+5. **Whether `//extensions/renderer/BUILD.gn:256` (`"//chrome:resources"`) is genuinely unused by C++ sources in `//extensions/renderer`:** Unverified without checking all `#include`s or compiling `//extensions/renderer`.
