@@ -439,6 +439,14 @@ jobs:
             --mode codegen > "$RUNNER_TEMP/codegen_targets.txt"
           echo "==> Planned $(wc -l < "$RUNNER_TEMP/codegen_targets.txt") host/Rust/codegen targets"
 
+          # Contract gate: no device compile/link/Swift in the plan, and every
+          # generated input of the Apple edges planned. Fails before compiling.
+          ./scripts/diagnose_graph.py --out-dir "$work/src/out/Release" \
+            --roots-file "$RUNNER_TEMP/codegen_targets.txt" \
+            --report "$RUNNER_TEMP/plan_audit.txt" \
+            --expect gen/ios/chrome/browser/shared/ui/buildflags.h \
+            --check
+
           # Show what the pruned closure really contains before spending hours on it.
           tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
             | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$work/src/out/Release" -n \
@@ -474,9 +482,14 @@ jobs:
 
           rc=0
           if [ -s "$RUNNER_TEMP/codegen_targets.txt" ]; then
-            tr '\n' '\0' < "$RUNNER_TEMP/codegen_targets.txt" \
-              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
-              2>&1 | tee "$RUNNER_TEMP/ninja.log" || rc=$?
+            # Stops 15 min before the step timeout so the ccache still persists.
+            ./scripts/run_with_budget.py 120 "$RUNNER_TEMP/ninja.log" -- bash -c \
+              'tr "\n" "\0" < "$0" | xargs -0 -r -s 1048576 "$1" -C "$2" -k 0' \
+              "$RUNNER_TEMP/codegen_targets.txt" "$work/src/third_party/ninja/ninja" "$out_dir" || rc=$?
+          fi
+          if [ "$rc" -eq 124 ]; then
+            echo "::error::Codegen exceeded its build budget; progress is kept in the ccache bucket"
+            exit 1
           fi
 
           if [ "$rc" -ne 0 ]; then
@@ -525,7 +538,7 @@ jobs:
             done < "$RUNNER_TEMP/codegen_targets.txt"
             tar -cf - "${pack_items[@]}" | zstd -T0 -4 -o "$RUNNER_TEMP/s2a_out/codegen_gen.tar.zst"
           )
-          rm -rf /tmp/cb_work
+          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
           ./scripts/oci_artifacts.sh push \
             "${{ needs.plan.outputs.s2a_ref }}" \
             "$RUNNER_TEMP/s2a_out" \
@@ -536,7 +549,7 @@ jobs:
       - name: Always persist codegen ccache bucket to GHCR
         if: always()
         run: |
-          rm -rf /tmp/cb_work
+          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
           if [ -d "$RUNNER_TEMP/ccache" ]; then
             echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
             cg_ccache_ref="${{ needs.plan.outputs.ccache_repo }}:${{ needs.plan.outputs.chromium_rev }}-codegen"
@@ -838,15 +851,16 @@ jobs:
           export CCACHE_MAXSIZE="0"
 
           if [ -s "$RUNNER_TEMP/shard_targets.txt" ]; then
-            tr '\n' '\0' < "$RUNNER_TEMP/shard_targets.txt" \
-              | xargs -0 -r -s 1048576 "$work/src/third_party/ninja/ninja" -C "$out_dir" -k 0 \
-              2>&1 | tee "$RUNNER_TEMP/ninja.log"
+            # Stops 15 min before the step timeout so the ccache still persists.
+            ./scripts/run_with_budget.py 140 "$RUNNER_TEMP/ninja.log" -- bash -c \
+              'tr "\n" "\0" < "$0" | xargs -0 -r -s 1048576 "$1" -C "$2" -k 0' \
+              "$RUNNER_TEMP/shard_targets.txt" "$work/src/third_party/ninja/ninja" "$out_dir"
           fi
 
       - name: Always persist shard ${{ matrix.shard }} ccache bucket to GHCR
         if: always()
         run: |
-          rm -rf /tmp/cb_work
+          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
           if [ -d "$RUNNER_TEMP/ccache" ]; then
             if [ -f "$RUNNER_TEMP/ccache_seeded" ]; then
               CCACHE_DIR="$RUNNER_TEMP/ccache" ccache --evict-older-than 1d
@@ -1019,8 +1033,8 @@ jobs:
 
           ccache -z
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Building & linking target 'chrome'"
-          "$work/src/third_party/ninja/ninja" -C "$out_dir" chrome \
-            2>&1 | tee "$RUNNER_TEMP/ninja.log"
+          ./scripts/run_with_budget.py 130 "$RUNNER_TEMP/ninja.log" -- \
+            "$work/src/third_party/ninja/ninja" -C "$out_dir" chrome
           echo "==> [$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Link finished"
 
       - name: Persist Stage 3 unsigned app checkpoint to GHCR
@@ -1037,7 +1051,7 @@ jobs:
             mv "$out_dir/.deferred_extract_metadata" "$stage_out/.deferred_extract_metadata"
           fi
           tar -C "$stage_out" -cf - . | zstd -T0 -5 -o "$s3_out/chromium_app_unsigned.tar.zst"
-          rm -rf /tmp/cb_work "$stage_out"
+          rm -rf /tmp/cb_work "$stage_out" || echo "::warning::Work tree not fully removed; continuing"
 
           ./scripts/oci_artifacts.sh push \
             "${{ needs.plan.outputs.s3_ref }}" \
@@ -1056,7 +1070,7 @@ jobs:
           steps.link_chrome.outcome != ''
         run: |
           ./scripts/reclaim_disk_linux.sh --drop-swap || true
-          rm -rf /tmp/cb_work
+          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
           if [ -d "$RUNNER_TEMP/ccache" ]; then
             echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
             ./scripts/oci_artifacts.sh push \
@@ -1070,7 +1084,7 @@ jobs:
         if: always()
         run: |
           ./scripts/reclaim_disk_linux.sh --drop-swap || true
-          rm -rf /tmp/cb_work
+          rm -rf /tmp/cb_work || echo "::warning::Work tree not fully removed; continuing"
           ./scripts/write_job_summary.py \
             --title "Stage 3 — Link Chromium.app & Merged ccache" \
             --key "${{ needs.plan.outputs.k3 }}" \
