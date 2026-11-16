@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS sideload: Google services off by default
+
+A Chromium build has no Google API keys or Google sign-in, so sign-in
+prompts, price tracking and remote search suggestions are dead ends. Turn
+them off by default; each stays available in Settings > Google services.
+
+diff --git a/components/signin/internal/identity_manager/primary_account_manager.cc b/components/signin/internal/identity_manager/primary_account_manager.cc
+index 5cad965..d369e1f 100644
+--- a/components/signin/internal/identity_manager/primary_account_manager.cc
++++ b/components/signin/internal/identity_manager/primary_account_manager.cc
+@@ -332,7 +332,8 @@ void PrimaryAccountManager::RegisterProfilePrefs(PrefRegistrySimple* registry) {
+       prefs::kGoogleServicesSyncingUsernameMigratedToSignedIn, std::string());
+   registry->RegisterIntegerPref(prefs::kGoogleServicesSyncingUserMigrationType,
+                                 /*SyncToSigninMigrationType::kUnknown=*/0);
+-  registry->RegisterBooleanPref(prefs::kSigninAllowed, true);
++  // [ios-blink-sideload] No Google sign-in in a Chromium build: off by default.
++  registry->RegisterBooleanPref(prefs::kSigninAllowed, false);
+   registry->RegisterBooleanPref(prefs::kSignedInWithCredentialProvider, false);
+   registry->RegisterBooleanPref(prefs::kExplicitBrowserSignin, false);
+   registry->RegisterBooleanPref(
+diff --git a/ios/chrome/browser/shared/model/prefs/browser_prefs.mm b/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
+index 84bc771..32a24e8 100644
+--- a/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
++++ b/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
+@@ -339,7 +339,8 @@ void RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterListPref(prefs::kRestrictAccountsToPatterns);
+   registry->RegisterIntegerPref(prefs::kBrowserSigninPolicy,
+                                 static_cast<int>(BrowserSigninMode::kEnabled));
+-  registry->RegisterBooleanPref(prefs::kSigninAllowedOnDevice, true);
++  // [ios-blink-sideload] No Google sign-in in a Chromium build: off by default.
++  registry->RegisterBooleanPref(prefs::kSigninAllowedOnDevice, false);
+   registry->RegisterBooleanPref(prefs::kAppStoreRatingPolicyEnabled, true);
+   registry->RegisterBooleanPref(kIosParcelTrackingPolicyEnabled, false);
+ 
+@@ -585,8 +586,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(
+       translate::prefs::kOfferTranslateEnabled, true,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++  // [ios-blink-sideload] Price tracking needs Google commerce services.
+   registry->RegisterBooleanPref(
+-      prefs::kTrackPricesOnTabsEnabled, true,
++      prefs::kTrackPricesOnTabsEnabled, false,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterBooleanPref(
+       prefs::kNTPContentSuggestionsEnabled, true,
+@@ -602,8 +604,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterStringPref(prefs::kDefaultCharset,
+                                l10n_util::GetStringUTF8(IDS_DEFAULT_ENCODING),
+                                user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++  // [ios-blink-sideload] Do not send typed text for suggestions by default.
+   registry->RegisterBooleanPref(
+-      prefs::kSearchSuggestEnabled, true,
++      prefs::kSearchSuggestEnabled, false,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterBooleanPref(prefs::kSavingBrowserHistoryDisabled, false);
+ 

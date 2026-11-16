@@ -35,3 +35,4 @@
 0036-ios-sideload-page-while-turning.patch
 0037-ios-sideload-notch-in-landscape.patch
 0038-ios-sideload-one-resize-per-turn.patch
+0046-ios-sideload-google-services-off-by-default.patch

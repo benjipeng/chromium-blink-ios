@@ -16,7 +16,7 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
  #include "base/task/single_thread_task_executor.h"
  #include "base/task/thread_pool/thread_pool_instance.h"
  #include "base/threading/platform_thread.h"
-@@ -113,6 +116,94 @@ void SetupSignalHandlers() {
+@@ -113,6 +116,96 @@ void SetupSignalHandlers() {
  
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
  
@@ -88,8 +88,10 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
 +        ram_mb >= 7000 ? "768" : (ram_mb >= 5120 ? "512" : (ram_mb >= 3500 ? "384" : "192")));
 +  }
 +
++  // The Optimization Guide is disabled below, and Gemini dereferences it
++  // unchecked; Gemini also needs Google keys and sign-in, so turn it off.
 +  AppendToFeatureSwitch(command_line, switches::kEnableFeatures,
-+                        "WebContentsDiscard");
++                        "WebContentsDiscard,GeminiKillSwitch");
 +  // AVSampleBufferDisplayLayer video needs extra fixes before it draws through
 +  // the in-process layer tree, and the
 +  // back/forward cache keeps whole pages alive inside the one process.
@@ -111,7 +113,7 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
  bool IsSubprocess() {
    auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kProcessType);
-@@ -288,6 +379,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+@@ -288,6 +381,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
      // Enable spatial navigation; we interpret remote control swipes as arrow
      // keys.
      command_line->AppendSwitch(switches::kEnableSpatialNavigation);
