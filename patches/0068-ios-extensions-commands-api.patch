@@ -1,0 +1,1408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: implement generic chrome.commands API and shortcut formatting
+
+---
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 08a5d21..13aebf2 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -8,12 +8,18 @@ assert(enable_extensions_core)
+ 
+ source_set("model") {
+   sources = [
++    "ios_command_service.cc",
++    "ios_command_service.h",
++    "ios_commands_api.cc",
++    "ios_commands_api.h",
+     "ios_extension_system.h",
+     "ios_extension_system.mm",
+     "ios_extension_system_factory.h",
+     "ios_extension_system_factory.mm",
+     "ios_extension_web_contents_observer.h",
+     "ios_extension_web_contents_observer.mm",
++    "ios_extensions_browser_api_provider.cc",
++    "ios_extensions_browser_api_provider.h",
+     "ios_extensions_browser_client.h",
+     "ios_extensions_browser_client.mm",
+   ]
+diff --git a/ios/chrome/browser/extensions/model/ios_command_service.cc b/ios/chrome/browser/extensions/model/ios_command_service.cc
+new file mode 100644
+index 0000000..9aea3f0
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_command_service.cc
+@@ -0,0 +1,780 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_command_service.h"
++
++#include <memory>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/lazy_instance.h"
++#include "base/observer_list.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/user_prefs/user_prefs.h"
++#include "content/public/browser/browser_context.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/event_router_factory.h"
++#include "extensions/browser/extension_event_histogram_value.h"
++#include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/extension_prefs_factory.h"
++#include "extensions/browser/extension_registry_factory.h"
++#include "extensions/browser/extension_system_provider.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/common/api/commands/commands_handler.h"
++#include "extensions/common/command.h"
++#include "extensions/common/event_args.h"
++#include "extensions/common/extension_id.h"
++#include "extensions/common/manifest_constants.h"
++#include "extensions/common/permissions/permissions_data.h"
++#include "ui/base/accelerators/command.h"
++
++namespace extensions {
++namespace {
++
++constexpr char kExtensionCommandsPref[] = "extensions.commands";
++constexpr char kExtension[] = "extension";
++constexpr char kCommandName[] = "command_name";
++constexpr char kGlobal[] = "global";
++
++constexpr char kCommands[] = "commands";
++constexpr char kSuggestedKey[] = "suggested_key";
++constexpr char kSuggestedKeyWasAssigned[] = "was_assigned";
++
++std::string GetPlatformKeybindingKeyForAccelerator(
++    const ui::Accelerator& accelerator,
++    const ExtensionId& extension_id) {
++  std::string key = Command::CommandPlatform() + ":" +
++                    Command::AcceleratorToString(accelerator);
++  if (accelerator.IsMediaKey()) {
++    key += ":" + extension_id;
++  }
++  return key;
++}
++
++bool IsForCurrentPlatform(const std::string& key) {
++  return base::StartsWith(key, Command::CommandPlatform() + ":",
++                          base::CompareCase::SENSITIVE);
++}
++
++void MergeSuggestedKeyPrefs(const ExtensionId& extension_id,
++                            ExtensionPrefs* extension_prefs,
++                            base::DictValue suggested_key_prefs) {
++  const base::DictValue* current_prefs =
++      extension_prefs->ReadPrefAsDict(extension_id, kCommands);
++  if (current_prefs) {
++    base::DictValue new_prefs = current_prefs->Clone();
++    new_prefs.Merge(std::move(suggested_key_prefs));
++    suggested_key_prefs = std::move(new_prefs);
++  }
++
++  extension_prefs->UpdateExtensionPref(
++      extension_id, kCommands, base::Value(std::move(suggested_key_prefs)));
++}
++
++void ClearSuggestedKeyWasAssignedPrefs(
++    const ExtensionId& extension_id,
++    ExtensionPrefs& extension_prefs,
++    const std::vector<Command>& removed_commands) {
++  if (removed_commands.empty()) {
++    return;
++  }
++
++  ExtensionPrefs::ScopedDictionaryUpdate updater(&extension_prefs, extension_id,
++                                                 kCommands);
++  std::unique_ptr<prefs::DictionaryValueUpdate> current_prefs = updater.Get();
++  if (!current_prefs) {
++    return;
++  }
++
++  for (const Command& removed_command : removed_commands) {
++    std::unique_ptr<prefs::DictionaryValueUpdate> command_prefs;
++    if (current_prefs->GetDictionary(removed_command.command_name(),
++                                     &command_prefs)) {
++      command_prefs->Remove(kSuggestedKeyWasAssigned);
++    }
++  }
++}
++
++bool IsCommandRelevant(IOSCommandService::QueryType query_type,
++                       bool is_active,
++                       bool user_modified) {
++  switch (query_type) {
++    case IOSCommandService::ALL:
++      return true;
++    case IOSCommandService::ACTIVE:
++      return is_active;
++    case IOSCommandService::ACTIVE_OR_USER_MODIFIED:
++      return is_active || user_modified;
++  }
++}
++
++}  // namespace
++
++// static
++void IOSCommandService::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterDictionaryPref(
++      kExtensionCommandsPref,
++      user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
++}
++
++IOSCommandService::IOSCommandService(content::BrowserContext* context)
++    : browser_context_(context) {
++  CHECK(browser_context_);
++  extension_registry_observation_.Observe(
++      ExtensionRegistry::Get(browser_context_));
++}
++
++IOSCommandService::~IOSCommandService() {
++  for (auto& observer : observers_) {
++    observer.OnCommandServiceDestroying();
++  }
++}
++
++static base::LazyInstance<BrowserContextKeyedAPIFactory<IOSCommandService>>::
++    DestructorAtExit g_ios_command_service_factory = LAZY_INSTANCE_INITIALIZER;
++
++// static
++BrowserContextKeyedAPIFactory<IOSCommandService>*
++IOSCommandService::GetFactoryInstance() {
++  return g_ios_command_service_factory.Pointer();
++}
++
++// static
++IOSCommandService* IOSCommandService::Get(content::BrowserContext* context) {
++  return BrowserContextKeyedAPIFactory<IOSCommandService>::Get(context);
++}
++
++bool IOSCommandService::GetNamedCommands(const ExtensionId& extension_id,
++                                         QueryType type,
++                                         CommandScope scope,
++                                         ui::CommandMap* command_map) const {
++  const Extension* extension =
++      GetExtensionInEnabledOrDisabledExtensions(extension_id);
++  if (!extension) {
++    return false;
++  }
++
++  command_map->clear();
++  const ui::CommandMap* commands = CommandsInfo::GetNamedCommands(extension);
++  if (!commands) {
++    return false;
++  }
++
++  for (const auto& named_command : *commands) {
++    Command saved_command =
++        FindCommandByName(extension_id, named_command.second.command_name());
++    ui::Accelerator shortcut_assigned = saved_command.accelerator();
++
++    bool user_modified = IsCommandShortcutUserModified(
++        extension, named_command.second.command_name());
++    bool is_active = shortcut_assigned.key_code() != ui::VKEY_UNKNOWN;
++    if (!IsCommandRelevant(type, is_active, user_modified)) {
++      continue;
++    }
++
++    ui::Command command = named_command.second;
++    if (scope != ANY_SCOPE && ((scope == GLOBAL) != saved_command.global())) {
++      continue;
++    }
++
++    if (is_active || user_modified) {
++      command.set_accelerator(shortcut_assigned);
++    }
++    command.set_global(saved_command.global());
++
++    (*command_map)[named_command.second.command_name()] = command;
++  }
++
++  return !command_map->empty();
++}
++
++bool IOSCommandService::AddKeybindingPref(const ui::Accelerator& accelerator,
++                                          const ExtensionId& extension_id,
++                                          const std::string& command_name,
++                                          bool allow_overrides,
++                                          bool global) {
++  Command existing_command = FindCommandByName(extension_id, command_name);
++  if (existing_command.command_name() == command_name &&
++      existing_command.accelerator() == accelerator &&
++      existing_command.global() == global) {
++    return true;
++  }
++
++  CHECK(!accelerator.IsMediaKey() ||
++        !Command::IsActionRelatedCommand(command_name));
++
++  PrefService* prefs = user_prefs::UserPrefs::Get(browser_context_);
++  ScopedDictPrefUpdate updater(prefs, kExtensionCommandsPref);
++  base::DictValue& bindings = updater.Get();
++
++  std::string key =
++      GetPlatformKeybindingKeyForAccelerator(accelerator, extension_id);
++
++  if (bindings.Find(key)) {
++    if (!allow_overrides) {
++      return false;
++    }
++
++    const base::DictValue* item = bindings.FindDict(key);
++    const ExtensionId* old_extension_id = item->FindString(kExtension);
++    const std::string* old_command_name = item->FindString(kCommandName);
++    RemoveKeybindingPrefs(old_extension_id ? *old_extension_id : std::string(),
++                          old_command_name ? *old_command_name : std::string());
++  }
++
++  if (existing_command.accelerator().key_code() != ui::VKEY_UNKNOWN) {
++    RemoveKeybindingPrefs(extension_id, command_name);
++  }
++
++  if (accelerator.key_code() != ui::VKEY_UNKNOWN) {
++    base::DictValue keybinding;
++    keybinding.Set(kExtension, extension_id);
++    keybinding.Set(kCommandName, command_name);
++    keybinding.Set(kGlobal, global);
++    bindings.Set(key, std::move(keybinding));
++  }
++
++  base::DictValue command_keys;
++  command_keys.Set(kSuggestedKeyWasAssigned, true);
++  base::DictValue suggested_key_prefs;
++  suggested_key_prefs.Set(command_name, base::Value(std::move(command_keys)));
++  MergeSuggestedKeyPrefs(extension_id, ExtensionPrefs::Get(browser_context_),
++                         std::move(suggested_key_prefs));
++
++  for (auto& observer : observers_) {
++    if (accelerator.key_code() != ui::VKEY_UNKNOWN) {
++      observer.OnExtensionCommandAdded(extension_id, command_name);
++    } else {
++      observer.OnExtensionCommandRemoved(extension_id, command_name);
++    }
++  }
++
++  return true;
++}
++
++void IOSCommandService::OnExtensionWillBeInstalled(
++    content::BrowserContext* browser_context,
++    const Extension* extension,
++    bool is_update,
++    const std::string& old_name) {
++  UpdateKeybindings(extension);
++}
++
++void IOSCommandService::OnExtensionUninstalled(
++    content::BrowserContext* browser_context,
++    const Extension* extension,
++    extensions::UninstallReason reason) {
++  if (reason == extensions::UNINSTALL_REASON_COMPONENT_REMOVED) {
++    return;
++  }
++  RemoveKeybindingPrefs(extension->id(), std::string());
++}
++
++void IOSCommandService::UpdateKeybindingPrefs(const ExtensionId& extension_id,
++                                              const std::string& command_name,
++                                              const std::string& keystroke) {
++  Command command = FindCommandByName(extension_id, command_name);
++  RemoveKeybindingPrefs(extension_id, command_name);
++
++  ui::Accelerator accelerator =
++      Command::StringToAccelerator(keystroke, command_name);
++  AddKeybindingPref(accelerator, extension_id, command_name, true,
++                    command.global());
++}
++
++bool IOSCommandService::SetScope(const ExtensionId& extension_id,
++                                 const std::string& command_name,
++                                 bool global) {
++  Command command = FindCommandByName(extension_id, command_name);
++  if (global == command.global()) {
++    return false;
++  }
++  RemoveKeybindingPrefs(extension_id, command_name);
++  AddKeybindingPref(command.accelerator(), extension_id, command_name, true,
++                    global);
++  return true;
++}
++
++Command IOSCommandService::FindCommandByName(const ExtensionId& extension_id,
++                                             const std::string& command) const {
++  PrefService* prefs = user_prefs::UserPrefs::Get(browser_context_);
++  const base::DictValue& bindings = prefs->GetDict(kExtensionCommandsPref);
++  for (const auto it : bindings) {
++    const ExtensionId* extension = it.second.GetDict().FindString(kExtension);
++    if (!extension || *extension != extension_id) {
++      continue;
++    }
++    const std::string* command_name =
++        it.second.GetDict().FindString(kCommandName);
++    if (!command_name || *command_name != command) {
++      continue;
++    }
++    std::string shortcut = it.first;
++    if (!IsForCurrentPlatform(shortcut)) {
++      continue;
++    }
++    std::optional<bool> global = it.second.GetDict().FindBool(kGlobal);
++
++    std::vector<std::string_view> tokens = base::SplitStringPiece(
++        shortcut, ":", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++    CHECK(tokens.size() >= 2);
++
++    return Command(*command_name, std::u16string(), tokens[1],
++                   global.value_or(false));
++  }
++
++  return Command();
++}
++
++void IOSCommandService::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void IOSCommandService::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++const Extension* IOSCommandService::GetExtensionInEnabledOrDisabledExtensions(
++    const ExtensionId& extension_id) const {
++  const ExtensionSet& enabled_extensions =
++      ExtensionRegistry::Get(browser_context_)->enabled_extensions();
++  const Extension* enabled_extension = enabled_extensions.GetByID(extension_id);
++  if (enabled_extension) {
++    return enabled_extension;
++  }
++  const ExtensionSet& disabled_extensions =
++      ExtensionRegistry::Get(browser_context_)->disabled_extensions();
++  return disabled_extensions.GetByID(extension_id);
++}
++
++bool IOSCommandService::IsUpgradeFromMV2ToMV3(
++    const Extension* extension,
++    const std::string& existing_command_name) const {
++  bool browser_or_page_action_command_in_bindings =
++      existing_command_name == manifest_values::kBrowserActionCommandEvent ||
++      existing_command_name == manifest_values::kPageActionCommandEvent;
++  return browser_or_page_action_command_in_bindings &&
++         CommandsInfo::GetActionCommand(extension);
++}
++
++void IOSCommandService::UpdateKeybindings(const Extension* extension) {
++  if (GetExtensionInEnabledOrDisabledExtensions(extension->id())) {
++    RemoveRelinquishedKeybindings(extension);
++  }
++  AssignKeybindings(extension);
++  UpdateExtensionSuggestedCommandPrefs(extension);
++  RemoveDefunctExtensionSuggestedCommandPrefs(extension);
++}
++
++void IOSCommandService::RemoveRelinquishedKeybindings(
++    const Extension* extension) {
++  ui::CommandMap existing_command_map;
++  if (GetNamedCommands(extension->id(),
++                       IOSCommandService::ACTIVE_OR_USER_MODIFIED,
++                       IOSCommandService::REGULAR, &existing_command_map)) {
++    const ui::CommandMap* new_command_map =
++        CommandsInfo::GetNamedCommands(extension);
++    for (ui::CommandMap::const_iterator it = existing_command_map.begin();
++         it != existing_command_map.end(); ++it) {
++      std::string command_name = it->first;
++      if ((!new_command_map ||
++           new_command_map->find(command_name) == new_command_map->end()) &&
++          !IsCommandShortcutUserModified(extension, command_name)) {
++        RemoveKeybindingPrefs(extension->id(), command_name);
++      }
++    }
++  }
++
++  auto remove_overrides_if_unused = [this, extension](ActionInfo::Type type) {
++    Command existing_command;
++    if (!GetExtensionActionCommand(extension->id(), type,
++                                   IOSCommandService::ACTIVE_OR_USER_MODIFIED,
++                                   &existing_command, nullptr)) {
++      return;
++    }
++
++    const std::string& existing_command_name = existing_command.command_name();
++    bool is_shortcut_user_modified =
++        IsCommandShortcutUserModified(extension, existing_command_name);
++    bool is_upgrade_from_mv2_to_mv3 =
++        IsUpgradeFromMV2ToMV3(extension, existing_command_name);
++    if (is_shortcut_user_modified && is_upgrade_from_mv2_to_mv3) {
++      const Command* action_command = CommandsInfo::GetActionCommand(extension);
++      AddKeybindingPref(existing_command.accelerator(), extension->id(),
++                        action_command->command_name(), true,
++                        action_command->global());
++    } else if (is_shortcut_user_modified) {
++      return;
++    }
++
++    const Command* new_command = nullptr;
++    switch (type) {
++      case ActionInfo::Type::kAction:
++        new_command = CommandsInfo::GetActionCommand(extension);
++        break;
++      case ActionInfo::Type::kBrowser:
++        new_command = CommandsInfo::GetBrowserActionCommand(extension);
++        break;
++      case ActionInfo::Type::kPage:
++        new_command = CommandsInfo::GetPageActionCommand(extension);
++        break;
++    }
++
++    const bool should_relinquish =
++        !new_command ||
++        (type == ActionInfo::Type::kBrowser &&
++         new_command->accelerator().key_code() == ui::VKEY_UNKNOWN);
++    if (!should_relinquish) {
++      return;
++    }
++
++    RemoveKeybindingPrefs(extension->id(), existing_command_name);
++  };
++
++  for (ActionInfo::Type type :
++       {ActionInfo::Type::kAction, ActionInfo::Type::kBrowser,
++        ActionInfo::Type::kPage}) {
++    remove_overrides_if_unused(type);
++  }
++}
++
++void IOSCommandService::AssignKeybindings(const Extension* extension) {
++  const ui::CommandMap* commands = CommandsInfo::GetNamedCommands(extension);
++  if (!commands) {
++    return;
++  }
++
++  for (const auto& named_command : *commands) {
++    const ui::Command command = named_command.second;
++    if (CanAutoAssign(command, extension)) {
++      AddKeybindingPref(command.accelerator(), extension->id(),
++                        command.command_name(), false, command.global());
++    }
++  }
++
++  const Command* browser_action_command =
++      CommandsInfo::GetBrowserActionCommand(extension);
++  if (browser_action_command &&
++      CanAutoAssign(*browser_action_command, extension)) {
++    AddKeybindingPref(browser_action_command->accelerator(), extension->id(),
++                      browser_action_command->command_name(), false, false);
++  }
++
++  const Command* page_action_command =
++      CommandsInfo::GetPageActionCommand(extension);
++  if (page_action_command && CanAutoAssign(*page_action_command, extension)) {
++    AddKeybindingPref(page_action_command->accelerator(), extension->id(),
++                      page_action_command->command_name(), false, false);
++  }
++
++  const Command* action_command = CommandsInfo::GetActionCommand(extension);
++  if (action_command && CanAutoAssign(*action_command, extension)) {
++    AddKeybindingPref(action_command->accelerator(), extension->id(),
++                      action_command->command_name(), false, false);
++  }
++}
++
++bool IOSCommandService::CanAutoAssign(const ui::Command& command,
++                                      const Extension* extension) {
++  if (IsCommandShortcutUserModified(extension, command.command_name())) {
++    return false;
++  }
++
++  if (command.accelerator().IsMediaKey()) {
++    return true;
++  }
++
++  if (command.global()) {
++    if (Command::IsActionRelatedCommand(command.command_name())) {
++      return false;
++    }
++
++    if (extension->permissions_data()->HasAPIPermission(
++            mojom::APIPermissionID::kCommandsAccessibility)) {
++      return true;
++    }
++
++    if (!command.accelerator().IsCtrlDown() ||
++        !command.accelerator().IsShiftDown()) {
++      return false;
++    }
++    return (command.accelerator().key_code() >= ui::VKEY_0 &&
++            command.accelerator().key_code() <= ui::VKEY_9);
++  }
++
++  return true;
++}
++
++void IOSCommandService::UpdateExtensionSuggestedCommandPrefs(
++    const Extension* extension) {
++  base::DictValue suggested_key_prefs;
++
++  const ui::CommandMap* commands = CommandsInfo::GetNamedCommands(extension);
++  if (commands) {
++    for (const auto& named_command : *commands) {
++      const ui::Command command = named_command.second;
++      base::DictValue command_keys;
++      command_keys.Set(kSuggestedKey,
++                       Command::AcceleratorToString(command.accelerator()));
++      suggested_key_prefs.Set(command.command_name(), std::move(command_keys));
++    }
++  }
++
++  const Command* browser_action_command =
++      CommandsInfo::GetBrowserActionCommand(extension);
++  if (browser_action_command &&
++      browser_action_command->accelerator().key_code() != ui::VKEY_UNKNOWN) {
++    base::DictValue command_keys;
++    command_keys.Set(kSuggestedKey, Command::AcceleratorToString(
++                                        browser_action_command->accelerator()));
++    suggested_key_prefs.Set(browser_action_command->command_name(),
++                            std::move(command_keys));
++  }
++
++  const Command* action_command = CommandsInfo::GetActionCommand(extension);
++  if (action_command &&
++      action_command->accelerator().key_code() != ui::VKEY_UNKNOWN) {
++    base::DictValue command_keys;
++    command_keys.Set(kSuggestedKey, Command::AcceleratorToString(
++                                        action_command->accelerator()));
++    suggested_key_prefs.Set(action_command->command_name(),
++                            std::move(command_keys));
++  }
++
++  const Command* page_action_command =
++      CommandsInfo::GetPageActionCommand(extension);
++  if (page_action_command) {
++    base::DictValue command_keys;
++    command_keys.Set(kSuggestedKey, Command::AcceleratorToString(
++                                        page_action_command->accelerator()));
++    suggested_key_prefs.Set(page_action_command->command_name(),
++                            std::move(command_keys));
++  }
++
++  MergeSuggestedKeyPrefs(extension->id(), ExtensionPrefs::Get(browser_context_),
++                         std::move(suggested_key_prefs));
++}
++
++void IOSCommandService::RemoveDefunctExtensionSuggestedCommandPrefs(
++    const Extension* extension) {
++  ExtensionPrefs* extension_prefs = ExtensionPrefs::Get(browser_context_);
++  const base::DictValue* current_prefs =
++      extension_prefs->ReadPrefAsDict(extension->id(), kCommands);
++
++  if (current_prefs) {
++    base::DictValue suggested_key_prefs = current_prefs->Clone();
++
++    const ui::CommandMap* named_commands =
++        CommandsInfo::GetNamedCommands(extension);
++
++    const Command* browser_action_command =
++        CommandsInfo::GetBrowserActionCommand(extension);
++    for (const auto [key, _] : *current_prefs) {
++      if (key == manifest_values::kBrowserActionCommandEvent) {
++        if (!browser_action_command ||
++            browser_action_command->accelerator().key_code() ==
++                ui::VKEY_UNKNOWN) {
++          suggested_key_prefs.Remove(key);
++        }
++      } else if (key == manifest_values::kPageActionCommandEvent) {
++        if (!CommandsInfo::GetPageActionCommand(extension)) {
++          suggested_key_prefs.Remove(key);
++        }
++      } else if (key == manifest_values::kActionCommandEvent) {
++        if (!CommandsInfo::GetActionCommand(extension)) {
++          suggested_key_prefs.Remove(key);
++        }
++      } else if (named_commands) {
++        if (named_commands->find(key) == named_commands->end()) {
++          suggested_key_prefs.Remove(key);
++        }
++      }
++    }
++
++    extension_prefs->UpdateExtensionPref(
++        extension->id(), kCommands,
++        base::Value(std::move(suggested_key_prefs)));
++  }
++}
++
++bool IOSCommandService::IsCommandShortcutUserModified(
++    const Extension* extension,
++    const std::string& command_name) const {
++  ui::Accelerator suggested_key;
++  std::optional<bool> suggested_key_was_assigned;
++  ExtensionPrefs* extension_prefs = ExtensionPrefs::Get(browser_context_);
++  const base::DictValue* commands_prefs =
++      extension_prefs->ReadPrefAsDict(extension->id(), kCommands);
++  if (commands_prefs) {
++    const base::DictValue* suggested_key_prefs =
++        commands_prefs->FindDict(command_name);
++    if (suggested_key_prefs) {
++      const std::string* suggested_key_string =
++          suggested_key_prefs->FindString(kSuggestedKey);
++      if (suggested_key_string) {
++        suggested_key =
++            Command::StringToAccelerator(*suggested_key_string, command_name);
++      }
++      suggested_key_was_assigned =
++          suggested_key_prefs->FindBool(kSuggestedKeyWasAssigned);
++    }
++  }
++
++  Command active_command = FindCommandByName(extension->id(), command_name);
++
++  return suggested_key_was_assigned.value_or(false)
++             ? active_command.accelerator() != suggested_key
++             : active_command.accelerator().key_code() != ui::VKEY_UNKNOWN;
++}
++
++void IOSCommandService::RemoveKeybindingPrefs(const ExtensionId& extension_id,
++                                              const std::string& command_name) {
++  PrefService* prefs = user_prefs::UserPrefs::Get(browser_context_);
++  ScopedDictPrefUpdate updater(prefs, kExtensionCommandsPref);
++  base::DictValue& bindings = updater.Get();
++
++  std::vector<std::string> keys_to_remove;
++  std::vector<Command> removed_commands;
++  for (const auto it : bindings) {
++    if (!IsForCurrentPlatform(it.first)) {
++      continue;
++    }
++
++    const base::DictValue& dict = it.second.GetDict();
++    const ExtensionId* extension = dict.FindString(kExtension);
++
++    if (extension && *extension == extension_id) {
++      const std::string* command = dict.FindString(kCommandName);
++      if (command && !command_name.empty() && command_name != *command) {
++        continue;
++      }
++
++      removed_commands.push_back(FindCommandByName(extension_id, *command));
++      keys_to_remove.push_back(it.first);
++    }
++  }
++
++  for (const std::string& key : keys_to_remove) {
++    bindings.Remove(key);
++  }
++
++  ClearSuggestedKeyWasAssignedPrefs(
++      extension_id, *ExtensionPrefs::Get(browser_context_), removed_commands);
++
++  for (const Command& removed_command : removed_commands) {
++    for (auto& observer : observers_) {
++      observer.OnExtensionCommandRemoved(extension_id,
++                                         removed_command.command_name());
++    }
++  }
++}
++
++bool IOSCommandService::GetExtensionActionCommand(
++    const ExtensionId& extension_id,
++    ActionInfo::Type action_type,
++    QueryType query_type,
++    Command* command,
++    bool* active) const {
++  const Extension* extension =
++      GetExtensionInEnabledOrDisabledExtensions(extension_id);
++  if (!extension) {
++    return false;
++  }
++
++  if (active) {
++    *active = false;
++  }
++
++  const Command* requested_command = nullptr;
++  switch (action_type) {
++    case ActionInfo::Type::kBrowser:
++      requested_command = CommandsInfo::GetBrowserActionCommand(extension);
++      break;
++    case ActionInfo::Type::kPage:
++      requested_command = CommandsInfo::GetPageActionCommand(extension);
++      break;
++    case ActionInfo::Type::kAction:
++      requested_command = CommandsInfo::GetActionCommand(extension);
++      break;
++  }
++  if (!requested_command) {
++    return false;
++  }
++
++  Command saved_command =
++      FindCommandByName(extension_id, requested_command->command_name());
++  ui::Accelerator shortcut_assigned = saved_command.accelerator();
++
++  bool is_active = shortcut_assigned.key_code() != ui::VKEY_UNKNOWN;
++  if (active) {
++    *active = is_active;
++  }
++
++  bool user_modified = IsCommandShortcutUserModified(
++      extension, requested_command->command_name());
++  if (!IsCommandRelevant(query_type, is_active, user_modified)) {
++    return false;
++  }
++
++  *command = *requested_command;
++  if (is_active || user_modified) {
++    command->set_accelerator(shortcut_assigned);
++  }
++
++  return true;
++}
++
++template <>
++void BrowserContextKeyedAPIFactory<
++    IOSCommandService>::DeclareFactoryDependencies() {
++  if (ExtensionsBrowserClient::Get()) {
++    DependsOn(ExtensionsBrowserClient::Get()->GetExtensionSystemFactory());
++  }
++  DependsOn(ExtensionRegistryFactory::GetInstance());
++  DependsOn(ExtensionPrefsFactory::GetInstance());
++  DependsOn(EventRouterFactory::GetInstance());
++}
++
++bool DispatchExtensionCommandEvent(content::BrowserContext* browser_context,
++                                   const ExtensionId& extension_id,
++                                   const std::string& command_name,
++                                   std::optional<base::DictValue> tab_dict) {
++  auto* client = ExtensionsBrowserClient::Get();
++  if (!client || !browser_context || !client->IsValidContext(browser_context) ||
++      extension_id.empty() || command_name.empty()) {
++    return false;
++  }
++  ExtensionRegistry* registry = ExtensionRegistry::Get(browser_context);
++  if (!registry ||
++      !registry->enabled_extensions().GetByID(extension_id)) {
++    return false;
++  }
++  EventRouter* event_router = EventRouter::Get(browser_context);
++  if (!event_router) {
++    return false;
++  }
++
++  base::ListValue args;
++  args.Append(command_name);
++  if (tab_dict.has_value()) {
++    args.Append(std::move(*tab_dict));
++  }
++
++  auto event = std::make_unique<Event>(
++      events::COMMANDS_ON_COMMAND, "commands.onCommand",
++      base::MakeRefCounted<EventArgs>(std::move(args)), browser_context);
++  event->user_gesture = EventRouter::UserGestureState::kEnabled;
++  event_router->DispatchEventToExtension(extension_id, std::move(event));
++  return true;
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_command_service.h b/ios/chrome/browser/extensions/model/ios_command_service.h
+new file mode 100644
+index 0000000..113d664
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_command_service.h
+@@ -0,0 +1,166 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMAND_SERVICE_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMAND_SERVICE_H_
++
++#include <optional>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "extensions/browser/browser_context_keyed_api_factory.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/buildflags/buildflags.h"
++#include "extensions/common/api/extension_action/action_info.h"
++#include "extensions/common/command.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/extension_id.h"
++#include "ui/base/accelerators/command.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace content {
++class BrowserContext;
++}
++
++namespace ui {
++class Accelerator;
++}
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace extensions {
++
++// Tracks extension command keybinding preferences on iOS and dispatches
++// commands.onCommand events through EventRouter.
++class IOSCommandService : public BrowserContextKeyedAPI,
++                          public ExtensionRegistryObserver {
++ public:
++  enum QueryType {
++    ALL,
++    ACTIVE,
++    ACTIVE_OR_USER_MODIFIED,
++  };
++
++  enum CommandScope {
++    REGULAR,
++    GLOBAL,
++    ANY_SCOPE,
++  };
++
++  class Observer {
++   public:
++    virtual void OnExtensionCommandAdded(const ExtensionId& extension_id,
++                                         const std::string& command_name) {}
++    virtual void OnExtensionCommandRemoved(const ExtensionId& extension_id,
++                                           const std::string& command_name) {}
++    virtual void OnCommandServiceDestroying() {}
++
++   protected:
++    virtual ~Observer() = default;
++  };
++
++  static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++  explicit IOSCommandService(content::BrowserContext* context);
++  IOSCommandService(const IOSCommandService&) = delete;
++  IOSCommandService& operator=(const IOSCommandService&) = delete;
++  ~IOSCommandService() override;
++
++  static BrowserContextKeyedAPIFactory<IOSCommandService>* GetFactoryInstance();
++  static IOSCommandService* Get(content::BrowserContext* context);
++
++  bool GetExtensionActionCommand(const ExtensionId& extension_id,
++                                 ActionInfo::Type action_type,
++                                 QueryType type,
++                                 Command* command,
++                                 bool* active) const;
++
++  bool GetNamedCommands(const ExtensionId& extension_id,
++                        QueryType type,
++                        CommandScope scope,
++                        ui::CommandMap* command_map) const;
++
++  bool AddKeybindingPref(const ui::Accelerator& accelerator,
++                         const ExtensionId& extension_id,
++                         const std::string& command_name,
++                         bool allow_overrides,
++                         bool global);
++
++  void RemoveKeybindingPrefs(const ExtensionId& extension_id,
++                             const std::string& command_name);
++
++  void UpdateKeybindingPrefs(const ExtensionId& extension_id,
++                             const std::string& command_name,
++                             const std::string& keystroke);
++
++  bool SetScope(const ExtensionId& extension_id,
++                const std::string& command_name,
++                bool global);
++
++  Command FindCommandByName(const ExtensionId& extension_id,
++                            const std::string& command) const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  const Extension* GetExtensionInEnabledOrDisabledExtensions(
++      const ExtensionId& extension_id) const;
++
++  bool IsUpgradeFromMV2ToMV3(const Extension* extension,
++                             const std::string& existing_command_name) const;
++
++ private:
++  friend class BrowserContextKeyedAPIFactory<IOSCommandService>;
++
++  static const char* service_name() { return "IOSCommandService"; }
++  static const bool kServiceRedirectedInIncognito = true;
++
++  // ExtensionRegistryObserver:
++  void OnExtensionWillBeInstalled(content::BrowserContext* browser_context,
++                                  const Extension* extension,
++                                  bool is_update,
++                                  const std::string& old_name) override;
++  void OnExtensionUninstalled(content::BrowserContext* browser_context,
++                              const Extension* extension,
++                              extensions::UninstallReason reason) override;
++
++  void UpdateKeybindings(const Extension* extension);
++  void RemoveRelinquishedKeybindings(const Extension* extension);
++  void AssignKeybindings(const Extension* extension);
++  bool CanAutoAssign(const ui::Command& command, const Extension* extension);
++  void UpdateExtensionSuggestedCommandPrefs(const Extension* extension);
++  void RemoveDefunctExtensionSuggestedCommandPrefs(const Extension* extension);
++  bool IsCommandShortcutUserModified(const Extension* extension,
++                                     const std::string& command_name) const;
++
++  raw_ptr<content::BrowserContext> browser_context_;
++
++  base::ScopedObservation<ExtensionRegistry, ExtensionRegistryObserver>
++      extension_registry_observation_{this};
++
++  base::ObserverList<Observer>::Unchecked observers_;
++};
++
++template <>
++void BrowserContextKeyedAPIFactory<
++    IOSCommandService>::DeclareFactoryDependencies();
++
++// Dispatches commands.onCommand to `extension_id` via EventRouter with user
++// gesture enabled so stopped MV3 service workers wake up and receive the event.
++bool DispatchExtensionCommandEvent(
++    content::BrowserContext* browser_context,
++    const ExtensionId& extension_id,
++    const std::string& command_name,
++    std::optional<base::DictValue> tab_dict = std::nullopt);
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMAND_SERVICE_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_commands_api.cc b/ios/chrome/browser/extensions/model/ios_commands_api.cc
+new file mode 100644
+index 0000000..03566ed
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_commands_api.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_commands_api.h"
++
++#include <utility>
++
++#include "base/values.h"
++#include "extensions/common/api/extension_action/action_info.h"
++#include "extensions/common/command.h"
++#include "ios/chrome/browser/extensions/model/ios_command_service.h"
++#include "ui/base/accelerators/command.h"
++
++namespace extensions {
++
++namespace {
++
++base::DictValue CreateCommandValue(const ui::Command& command, bool active) {
++  base::DictValue result;
++  result.Set("name", command.command_name());
++  result.Set("description", command.description());
++  result.Set("shortcut", active ? command.accelerator().GetShortcutText()
++                                : std::u16string());
++  return result;
++}
++
++}  // namespace
++
++ExtensionFunction::ResponseAction CommandsGetAllFunction::Run() {
++  base::ListValue command_list;
++
++  IOSCommandService* command_service =
++      IOSCommandService::Get(browser_context());
++
++  Command browser_action;
++  bool active = false;
++  if (command_service->GetExtensionActionCommand(
++          extension_->id(), ActionInfo::Type::kBrowser, IOSCommandService::ALL,
++          &browser_action, &active)) {
++    command_list.Append(CreateCommandValue(browser_action, active));
++  }
++
++  Command action;
++  if (command_service->GetExtensionActionCommand(
++          extension_->id(), ActionInfo::Type::kAction, IOSCommandService::ALL,
++          &action, &active)) {
++    command_list.Append(CreateCommandValue(action, active));
++  }
++
++  Command page_action;
++  if (command_service->GetExtensionActionCommand(
++          extension_->id(), ActionInfo::Type::kPage, IOSCommandService::ALL,
++          &page_action, &active)) {
++    command_list.Append(CreateCommandValue(page_action, active));
++  }
++
++  ui::CommandMap named_commands;
++  command_service->GetNamedCommands(extension_->id(), IOSCommandService::ALL,
++                                    IOSCommandService::ANY_SCOPE,
++                                    &named_commands);
++
++  for (ui::CommandMap::const_iterator iter = named_commands.begin();
++       iter != named_commands.end(); ++iter) {
++    Command command = command_service->FindCommandByName(
++        extension_->id(), iter->second.command_name());
++    ui::Accelerator shortcut_assigned = command.accelerator();
++    active = (shortcut_assigned.key_code() != ui::VKEY_UNKNOWN);
++
++    command_list.Append(CreateCommandValue(iter->second, active));
++  }
++
++  return RespondNow(WithArguments(std::move(command_list)));
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_commands_api.h b/ios/chrome/browser/extensions/model/ios_commands_api.h
+new file mode 100644
+index 0000000..f592ec8
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_commands_api.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMANDS_API_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMANDS_API_H_
++
++#include "extensions/browser/extension_function.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace extensions {
++
++class CommandsGetAllFunction : public ExtensionFunction {
++  ~CommandsGetAllFunction() override = default;
++  ResponseAction Run() override;
++  DECLARE_EXTENSION_FUNCTION("commands.getAll", COMMANDS_GETALL)
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_COMMANDS_API_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+new file mode 100644
+index 0000000..6b7a2a4
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
++
++#include "extensions/browser/extension_function_registry.h"
++#include "ios/chrome/browser/extensions/model/ios_commands_api.h"
++
++namespace extensions {
++
++IOSExtensionsBrowserAPIProvider::IOSExtensionsBrowserAPIProvider() = default;
++IOSExtensionsBrowserAPIProvider::~IOSExtensionsBrowserAPIProvider() = default;
++
++void IOSExtensionsBrowserAPIProvider::RegisterExtensionFunctions(
++    ExtensionFunctionRegistry* registry) {
++  registry->RegisterFunction<CommandsGetAllFunction>();
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h
+new file mode 100644
+index 0000000..a7694ef
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_API_PROVIDER_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_API_PROVIDER_H_
++
++#include "extensions/browser/extensions_browser_api_provider.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace extensions {
++
++class IOSExtensionsBrowserAPIProvider final
++    : public ExtensionsBrowserAPIProvider {
++ public:
++  IOSExtensionsBrowserAPIProvider();
++  IOSExtensionsBrowserAPIProvider(const IOSExtensionsBrowserAPIProvider&) =
++      delete;
++  IOSExtensionsBrowserAPIProvider& operator=(
++      const IOSExtensionsBrowserAPIProvider&) = delete;
++  ~IOSExtensionsBrowserAPIProvider() override;
++
++  void RegisterExtensionFunctions(ExtensionFunctionRegistry* registry) override;
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_API_PROVIDER_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index ee0617b..194b294 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -67,7 +67,9 @@
+ #include "extensions/common/manifest_handlers/manifest_url_handlers.h"
+ #include "extensions/common/mojom/manifest.mojom-shared.h"
+ #include "extensions/common/switches.h"
++#include "ios/chrome/browser/extensions/model/ios_command_service.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
+ #include "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #include "ios/chrome/browser/shared/model/paths/paths.h"
+@@ -301,6 +303,7 @@ void EnsureIOSExtensionFactoriesBuilt() {
+   static const bool factories_built = [] {
+     extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
+     extensions::IOSExtensionSystemFactory::GetInstance();
++    extensions::IOSCommandService::GetFactoryInstance();
+     return true;
+   }();
+   (void)factories_built;
+@@ -429,6 +432,7 @@ void RegisterIOSExtensionPrefs(user_prefs::PrefRegistrySyncable* registry) {
+   extensions::ExtensionPrefs::RegisterProfilePrefs(registry);
+   extensions::PermissionsManager::RegisterProfilePrefs(registry);
+   extensions::RuntimeAPI::RegisterPrefs(registry);
++  extensions::IOSCommandService::RegisterProfilePrefs(registry);
+   BrowserContextDependencyManager::GetInstance()
+       ->RegisterProfilePrefsForServices(registry);
+ }
+@@ -484,6 +488,7 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+ IOSExtensionsBrowserClient::IOSExtensionsBrowserClient()
+     : api_client_(std::make_unique<IOSExtensionsAPIClient>()) {
+   AddAPIProvider(std::make_unique<CoreExtensionsBrowserAPIProvider>());
++  AddAPIProvider(std::make_unique<IOSExtensionsBrowserAPIProvider>());
+   SetCurrentChannel(::GetChannel());
+ 
+   {
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index 02d2ad5..e3dfd36 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -3,11 +3,33 @@
+ # found in the LICENSE file.
+ 
+ import("//extensions/buildflags/buildflags.gni")
++import("//extensions/common/api/schema.gni")
++import("//tools/json_schema_compiler/json_features.gni")
++import("//tools/json_schema_compiler/json_schema_api.gni")
+ 
+ assert(enable_extensions_core)
+ 
++json_features("ios_api_features") {
++  feature_type = "APIFeature"
++  method_name = "AddIOSAPIFeatures"
++  sources = [ "ios_api_features.json" ]
++  visibility = [ ":clients" ]
++}
++
++generated_json_strings("ios_api_json_strings") {
++  sources = [ "//chrome/common/extensions/api/commands.json" ]
++  root = "//chrome/common/extensions/api"
++  target_prefix = "ios/web/content/init/extensions"
++  bundle_name = "IOS"
++  root_namespace = extensions_api_root_namespace
++  deps = [ "//extensions/common/api" ]
++  visibility = [ ":clients" ]
++}
++
+ source_set("clients") {
+   sources = [
++    "ios_extensions_api_provider.cc",
++    "ios_extensions_api_provider.h",
+     "ios_extensions_client.cc",
+     "ios_extensions_client.h",
+     "ios_extensions_renderer_client.cc",
+@@ -17,6 +39,8 @@ source_set("clients") {
+     "//extensions/renderer",
+   ]
+   deps = [
++    ":ios_api_features",
++    ":ios_api_json_strings",
+     "//base",
+     "//extensions/common:core_api_provider",
+     "//services/service_manager/public/cpp",
+diff --git a/ios/web/content/init/extensions/ios_api_features.json b/ios/web/content/init/extensions/ios_api_features.json
+new file mode 100644
+index 0000000..be4b2ec
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_api_features.json
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++{
++  "commands": {
++    "dependencies": ["manifest:commands"],
++    "contexts": ["privileged_extension"]
++  }
++}
+diff --git a/ios/web/content/init/extensions/ios_extensions_api_provider.cc b/ios/web/content/init/extensions/ios_extensions_api_provider.cc
+new file mode 100644
+index 0000000..8eb471e
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_extensions_api_provider.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/web/content/init/extensions/ios_extensions_api_provider.h"
++
++#include "ios/web/content/init/extensions/generated_schemas.h"
++#include "ios/web/content/init/extensions/ios_api_features.h"
++
++namespace web {
++
++IOSExtensionsAPIProvider::IOSExtensionsAPIProvider() = default;
++IOSExtensionsAPIProvider::~IOSExtensionsAPIProvider() = default;
++
++void IOSExtensionsAPIProvider::AddAPIFeatures(
++    extensions::FeatureProvider* provider) {
++  extensions::AddIOSAPIFeatures(provider);
++}
++
++void IOSExtensionsAPIProvider::AddManifestFeatures(
++    extensions::FeatureProvider* provider) {}
++
++void IOSExtensionsAPIProvider::AddPermissionFeatures(
++    extensions::FeatureProvider* provider) {}
++
++void IOSExtensionsAPIProvider::AddBehaviorFeatures(
++    extensions::FeatureProvider* provider) {}
++
++void IOSExtensionsAPIProvider::AddAPIJSONSources(
++    extensions::JSONFeatureProviderSource* json_source) {}
++
++bool IOSExtensionsAPIProvider::IsAPISchemaGenerated(const std::string& name) {
++  return extensions::api::IOSGeneratedSchemas::IsGenerated(name);
++}
++
++std::string_view IOSExtensionsAPIProvider::GetAPISchema(
++    const std::string& name) {
++  return extensions::api::IOSGeneratedSchemas::Get(name);
++}
++
++void IOSExtensionsAPIProvider::RegisterPermissions(
++    extensions::PermissionsInfo* permissions_info) {}
++
++void IOSExtensionsAPIProvider::RegisterManifestHandlers(
++    extensions::ManifestHandlerRegistry* registry) {}
++
++}  // namespace web
+diff --git a/ios/web/content/init/extensions/ios_extensions_api_provider.h b/ios/web/content/init/extensions/ios_extensions_api_provider.h
+new file mode 100644
+index 0000000..5b848cf
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_extensions_api_provider.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_API_PROVIDER_H_
++#define IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_API_PROVIDER_H_
++
++#include <string>
++#include <string_view>
++
++#include "extensions/common/extensions_api_provider.h"
++
++namespace web {
++
++class IOSExtensionsAPIProvider final
++    : public extensions::ExtensionsAPIProvider {
++ public:
++  IOSExtensionsAPIProvider();
++  IOSExtensionsAPIProvider(const IOSExtensionsAPIProvider&) = delete;
++  IOSExtensionsAPIProvider& operator=(const IOSExtensionsAPIProvider&) = delete;
++  ~IOSExtensionsAPIProvider() override;
++
++  // extensions::ExtensionsAPIProvider:
++  void AddAPIFeatures(extensions::FeatureProvider* provider) override;
++  void AddManifestFeatures(extensions::FeatureProvider* provider) override;
++  void AddPermissionFeatures(extensions::FeatureProvider* provider) override;
++  void AddBehaviorFeatures(extensions::FeatureProvider* provider) override;
++  void AddAPIJSONSources(
++      extensions::JSONFeatureProviderSource* json_source) override;
++  bool IsAPISchemaGenerated(const std::string& name) override;
++  std::string_view GetAPISchema(const std::string& name) override;
++  void RegisterPermissions(
++      extensions::PermissionsInfo* permissions_info) override;
++  void RegisterManifestHandlers(
++      extensions::ManifestHandlerRegistry* registry) override;
++};
++
++}  // namespace web
++
++#endif  // IOS_WEB_CONTENT_INIT_EXTENSIONS_IOS_EXTENSIONS_API_PROVIDER_H_
+diff --git a/ios/web/content/init/extensions/ios_extensions_client.cc b/ios/web/content/init/extensions/ios_extensions_client.cc
+index b685b04..9459601 100644
+--- a/ios/web/content/init/extensions/ios_extensions_client.cc
++++ b/ios/web/content/init/extensions/ios_extensions_client.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/no_destructor.h"
+ #include "extensions/common/core_extensions_api_provider.h"
++#include "ios/web/content/init/extensions/ios_extensions_api_provider.h"
+ #include "extensions/common/extension_urls.h"
+ #include "extensions/common/extensions_client.h"
+ #include "extensions/common/permissions/manifest_permission.h"
+@@ -64,6 +65,7 @@ class IOSExtensionsClient final : public extensions::ExtensionsClient {
+         new_webstore_url_(extension_urls::kNewChromeWebstoreBaseURL),
+         update_url_(extension_urls::kChromeWebstoreUpdateURL) {
+     AddAPIProvider(std::make_unique<extensions::CoreExtensionsAPIProvider>());
++    AddAPIProvider(std::make_unique<IOSExtensionsAPIProvider>());
+   }
+ 
+   void Initialize() override {}
+diff --git a/ui/base/accelerators/accelerator.cc b/ui/base/accelerators/accelerator.cc
+index 3d8645b..43a9815 100644
+--- a/ui/base/accelerators/accelerator.cc
++++ b/ui/base/accelerators/accelerator.cc
+@@ -246,7 +246,8 @@ std::u16string Accelerator::GetKeyCodeStringForShortcut() const {
+     if (key != 0) {
+       key_string += key;
+     }
+-#elif defined(USE_AURA) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID)
++#elif defined(USE_AURA) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_ANDROID) || \
++    BUILDFLAG(IS_IOS)
+     const uint16_t c = DomCodeToUsLayoutCharacter(
+         UsLayoutKeyboardCodeToDomCode(key_code_), false);
+     if (c != 0) {
+diff --git a/ui/base/accelerators/command.cc b/ui/base/accelerators/command.cc
+index dc3ab6f..b35791c 100644
+--- a/ui/base/accelerators/command.cc
++++ b/ui/base/accelerators/command.cc
+@@ -87,8 +87,8 @@ std::string Command::CommandPlatform() {
+   // TODO(crbug.com/40220501): Change this once we decide what string should be
+   // used for Fuchsia.
+   return ui::kKeybindingPlatformLinux;
+-#elif BUILDFLAG(IS_ANDROID)
+-  // For now, we use linux keybindings on android.
++#elif BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
++  // For now, we use linux keybindings on android and iOS.
+   // TODO(https://crbug.com/356905053): Should this be ChromeOS keybindings?
+   return ui::kKeybindingPlatformLinux;
+ #else
