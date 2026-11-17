@@ -100,6 +100,16 @@ object checkpoints remain available as evidence and reusable data. The narrow
 compile probe now also selects the 15 failed outputs, checking their fixes
 before scheduling Mac work and another 18-runner compile.
 
+Hydrogen's follow-up audit also confirmed a downstream link blocker:
+`CpuInfoProvider::QueryCpuTimePerProcessor()` has no iOS implementation, while
+generated function registration would keep its callers live. Patch `0058`
+excludes `system.cpu` from both the iOS schema registration list and the API
+implementation dependencies. It does not add a placeholder backend. A suspected
+`system.display` gap was disproved: the shared embedder implementation exists
+and returns the standard API-unavailable error without a provider, so that code
+is preserved. The two patches apply in sequence to pinned source snippets in
+memory; actual compilation remains exclusively on GitHub Actions.
+
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
 3. **The existing `WKWebExtension` / `BuiltInWebExtension` code in `chrome_framework` is WebKit-only and inert under `use_blink = true`.** It attaches solely to `WKWebViewConfiguration` inside `WKWebViewConfigurationProvider`, which `ContentWebState` never uses.

@@ -1,0 +1,34 @@
+diff --git a/extensions/common/api/schema.gni b/extensions/common/api/schema.gni
+--- a/extensions/common/api/schema.gni
++++ b/extensions/common/api/schema.gni
+@@ -137,8 +137,11 @@
+   ]
+ }
+ 
+-if (is_ios) {
+-  # Shared core code needs these C++ types even when the corresponding public
++if (is_ios) {
++  # The CPU provider has no iOS implementation; do not register that API.
++  extensions_api_schema_files_ -= [ "system_cpu.webidl" ]
++
++  # Shared core code needs these C++ types even when the corresponding public
+   # APIs and guest-view implementation are disabled.
+   extensions_types_only_schema_files_ += [
+     "icon_variants.webidl",
+diff --git a/extensions/browser/api/BUILD.gn b/extensions/browser/api/BUILD.gn
+--- a/extensions/browser/api/BUILD.gn
++++ b/extensions/browser/api/BUILD.gn
+@@ -57,7 +57,12 @@
+     "//extensions/browser/api/webstore_private",
+   ]
+ 
+-  # APIs that are currently not supported on desktop-android.
++  if (is_ios) {
++    # cpu_info_provider has platform implementations for desktop/Android only.
++    public_deps -= [ "//extensions/browser/api/system_cpu" ]
++  }
++
++  # APIs that are currently not supported on desktop-android.
+   if (enable_extensions) {
+     public_deps += [
+       "//extensions/browser:browser_sources",
