@@ -8,10 +8,10 @@
 
 ## Executive Summary
 
-### Diagnostic Simulator milestone passed (`25552fd` + `0060`/`0061` binary patches) & `0062` store-lifecycle fix
+### Diagnostic Simulator milestone passed (including detached restart) & `0060`–`0062` compile probe succeeded (`44088941518`)
 
-- **Demonstrated Simulator runtime milestone (`PID 47357`):** On the `vtool`-retargeted
-  iPhone Duo CoreSimulator derivative (`C229AC75-8053-4B7F-A2F8-DFE983E26C13`,
+- **Demonstrated Simulator runtime milestone (`PID 47357` & detached `PID 55921`):** On the
+  `vtool`-retargeted iPhone Duo CoreSimulator derivative (`C229AC75-8053-4B7F-A2F8-DFE983E26C13`,
   `com.benjipeng.chromiumblink.chrome.ios.extprobe`) with the two startup fixes patched
   persistently in `chrome_framework` (`WebstorePrivateApi::EnsureAssociatedFactoryBuilt`
   returning early and a `112` B trampoline registering `extensions.user_permissions`,
@@ -20,15 +20,30 @@
   `https://example.com/`, verified `chrome.runtime.id` and `chrome.runtime.getManifest()`,
   logged `[1117/075723.361297:INFO:CONSOLE:22] "CHROMIUM_IOS_EXTENSION_PROBE ilpkfbhghnmiapddaoenpemkcjeknbbo"`
   from `chrome-extension://ilpkfbhghnmiapddaoenpemkcjeknbbo/content.js`, and rendered the
-  green DOM badge (`example-extension-badge.png`).
+  green DOM badge (`example-extension-badge.png`). After detaching and exiting LLDB and
+  terminating `PID 47357`, a fresh launch without any debugger (`PID 55921`) repeated
+  `[1117/080151.419935:INFO:CONSOLE:22] "CHROMIUM_IOS_EXTENSION_PROBE ilpkfbhghnmiapddaoenpemkcjeknbbo"`
+  in restart stderr and visibly re-rendered the green DOM badge (`detached-restart-extension.png`);
+  AXe first observed SpringBoard at `3.052s` (`PID 57486`) and test-app readiness at
+  `8.109s` (`PID 55921`, an observational upper bound including `simctl` and AXe overhead on
+  a post-onboarding process restart, not a cold-install benchmark).
+- **Consolidated `0060`–`0062` narrow compile probe ([run 44088941518](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44088941518), `2f769b4`):**
+  Passed `scripts/check_remote_patches.py` across all `53` patches against `119` pinned
+  upstream files (`3,383,732` bytes), passed the codegen contract (`47,345` codegen roots,
+  `11,143` edges in closure, `0` required-but-unplanned inputs vs. baseline `43944365971`
+  `43,247` filtered roots), and compiled all `35` verified device objects (`[3430/3430]`,
+  `811 / 813` direct `ccache` hits, `99.75%`, `2` misses) including
+  `api_browser_context_keyed_service_factories.o`, `generated_api_registration.o`,
+  `ios_extensions_browser_client.o`, and `ios_extension_system.o` (uploading `graph-diagnosis`
+  artifact `14331527430`, `9,568,116` bytes).
 - **Distinction between verified vs. source-reviewed changes:**
-  - **Demonstrated in Simulator (diagnostic binary copy):** `0060` (`webstorePrivate`
-    startup bypass) and `0061` (`PermissionsManager::RegisterProfilePrefs` and
-    `RuntimeAPI::RegisterPrefs` registration before `CreateProfilePrefs` / `CreateProfileServices`),
+  - **Demonstrated in Simulator (diagnostic binary copy, with LLDB & detached restart):**
+    `0060` (`webstorePrivate` startup bypass) and `0061` (`PermissionsManager::RegisterProfilePrefs`
+    and `RuntimeAPI::RegisterPrefs` registration before `CreateProfilePrefs` / `CreateProfileServices`),
     plus bundled `https://example.com/*` content-script injection, `chrome.runtime.id`,
     `getManifest()`, and DOM badge rendering.
-  - **Source-reviewed only (not yet `chrome.storage` API runtime-verified):** `0062`
-    (`0062-ios-extensions-create-stores-in-system-ctor.patch`) moves `store_factory_`,
+  - **Compile-verified & source-reviewed only (not yet `chrome.storage` API runtime-verified):**
+    `0062` (`0062-ios-extensions-create-stores-in-system-ctor.patch`) moves `store_factory_`,
     `state_store_`, `rules_store_`, and `dynamic_user_scripts_store_` creation from
     `IOSExtensionSystem::InitForRegularProfile()` into `IOSExtensionSystem::IOSExtensionSystem()`
     (keeping `deferred_load=false`, matching `StateStore::Init()` which only calls
@@ -39,7 +54,8 @@
     from observing a null `rules_store_` during `CreateBrowserContextServices()`.
   - **Still unverified / unbuilt:** A clean source-rebuilt IPA incorporating `0060`–`0062`
     has not yet been built; `chrome.storage` API calls, arbitrary third-party extensions,
-    extension management UI, MV3 service workers, and physical iPhone execution remain unverified.
+    `chrome://extensions` / extension management UI, MV3 service workers, and physical
+    iPhone execution remain unverified.
 - **Prior startup failure & CI preflight receipts:**
   - Initial `vtool` derivative crash (`Chromium-2026-11-17-070110.ips`, PID `21174`, `SIGSEGV`
     in `PendingApprovalsShutdownNotifierFactory`) resolved by `0060` (narrow compile probe
