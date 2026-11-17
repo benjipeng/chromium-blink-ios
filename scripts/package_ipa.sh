@@ -135,13 +135,19 @@ exe_path="$bundle/$exe"
 chrome_fw="$bundle/Frameworks/chrome_framework.framework/chrome_framework"
 
 if grep -Eq '^enable_extensions_core[[:space:]]*=[[:space:]]*true' "$REPO_ROOT/args/device.gn"; then
-  for resource in manifest.json content.js rules_1.json sw.js sw_helper.js; do
+  for resource in manifest.json content.js rules_1.json; do
     [ -s "$bundle/bundled_extensions/ios_probe/$resource" ] || {
       echo "error: bundled extension probe resource missing after packaging cleanup: $resource" >&2
       exit 1
     }
   done
-  echo "==> Verified bundled extension probe resources after .appex cleanup"
+  python3 - "$bundle/bundled_extensions/ios_probe/manifest.json" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+if "background" in manifest:
+    raise SystemExit("error: bundled ios_probe/manifest.json must not declare a background service worker")
+PY
+  echo "==> Verified bundled extension probe resources (content-script/DNR-only) after .appex cleanup"
 
   bridge_target="$exe_path"
   [ -f "$chrome_fw" ] && bridge_target="$chrome_fw"

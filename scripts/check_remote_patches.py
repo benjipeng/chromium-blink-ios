@@ -98,7 +98,7 @@ def derive_extension_id_from_b64_key(key_b64: str) -> str:
 
 def validate_patched_probe_identity(patched_src: pathlib.Path) -> str:
     probe_dir = patched_src / "ios/chrome/app/resources/extensions/ios_probe"
-    for rel in ("manifest.json", "content.js", "rules_1.json", "sw.js", "sw_helper.js"):
+    for rel in ("manifest.json", "content.js", "rules_1.json"):
         path = probe_dir / rel
         if not path.is_file() or path.stat().st_size == 0:
             raise AssertionError(f"missing or empty bundled probe file: {path}")
@@ -110,16 +110,11 @@ def validate_patched_probe_identity(patched_src: pathlib.Path) -> str:
     derived_id = derive_extension_id_from_b64_key(key_b64)
 
     permissions = manifest.get("permissions")
-    if not isinstance(permissions, list) or not {"declarativeNetRequest", "storage"}.issubset(permissions):
-        raise AssertionError("ios_probe/manifest.json must declare declarativeNetRequest and storage permissions")
+    if not isinstance(permissions, list) or "declarativeNetRequest" not in permissions:
+        raise AssertionError("ios_probe/manifest.json must declare declarativeNetRequest permission")
 
-    background = manifest.get("background")
-    if not isinstance(background, dict) or background.get("service_worker") != "sw.js" or background.get("type") != "module":
-        raise AssertionError("ios_probe/manifest.json must configure module service_worker sw.js")
-
-    sw_text = (probe_dir / "sw.js").read_text(encoding="utf-8")
-    if "./sw_helper.js" not in sw_text or "chrome.runtime.onMessage.addListener" not in sw_text:
-        raise AssertionError("ios_probe/sw.js must statically import ./sw_helper.js and register runtime.onMessage")
+    if "background" in manifest:
+        raise AssertionError("bundled ios_probe/manifest.json must remain content-script/DNR-only (no background SW)")
 
     header_path = patched_src / "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
     header_text = header_path.read_text(encoding="utf-8")
