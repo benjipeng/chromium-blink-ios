@@ -60,6 +60,7 @@ obj/extensions/browser/browser_sources/extension_web_request_event_router.o
 obj/extensions/browser/browser_sources/rules_monitor_service.o
 obj/extensions/browser/browser_sources/ruleset_manager.o
 obj/extensions/browser/api/declarative_net_request/declarative_net_request/declarative_net_request_api.o
+obj/content/browser/browser/render_frame_host_impl.o
 EOF
   python3 - <<'PY'
 import os

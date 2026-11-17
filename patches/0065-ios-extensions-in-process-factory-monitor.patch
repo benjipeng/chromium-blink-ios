@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: observe in-process URLLoaderFactory resets in RFHI
+
+---
+diff --git a/content/browser/renderer_host/render_frame_host_impl.cc b/content/browser/renderer_host/render_frame_host_impl.cc
+index 99f8465..9e5cdde 100644
+--- a/content/browser/renderer_host/render_frame_host_impl.cc
++++ b/content/browser/renderer_host/render_frame_host_impl.cc
+@@ -14855,8 +14855,9 @@ bool RenderFrameHostImpl::CreateNetworkServiceDefaultFactoryAndObserve(
+       committing_navigation_request);
+ 
+   // Add a disconnect handler when Network Service is running
+-  // out-of-process.
+-  if (IsOutOfProcessNetworkService() &&
++  // out-of-process, or on iOS where in-process NetworkContext resets
++  // URLLoaderFactory bindings when extensions load or unload after commit.
++  if ((IsOutOfProcessNetworkService() || BUILDFLAG(IS_IOS)) &&
+       (!network_service_disconnect_handler_holder_ ||
+        !network_service_disconnect_handler_holder_.is_connected())) {
+     network_service_disconnect_handler_holder_.reset();
