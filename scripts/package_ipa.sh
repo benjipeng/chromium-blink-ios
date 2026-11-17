@@ -16,7 +16,6 @@ src_dir=""
 out_rel="out/Release"
 output_ipa=""
 with_app_groups=0
-skip_v1_bridge_check=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,10 +33,6 @@ while [ $# -gt 0 ]; do
       ;;
     --with-app-groups)
       with_app_groups=1
-      shift
-      ;;
-    --skip-v1-bridge-check)
-      skip_v1_bridge_check=1
       shift
       ;;
     *)
@@ -151,10 +146,10 @@ if grep -Eq '^enable_extensions_core[[:space:]]*=[[:space:]]*true' "$REPO_ROOT/a
   bridge_target="$exe_path"
   [ -f "$chrome_fw" ] && bridge_target="$chrome_fw"
   echo "==> Checking base Mach-O metadata and CrIOSExtensionManagerV1 availability"
-  helper_cfg="$(python3 - "$exe_path" "$chrome_fw" "$bridge_target" "$skip_v1_bridge_check" <<'PY'
+  helper_cfg="$(python3 - "$exe_path" "$chrome_fw" "$bridge_target" <<'PY'
 import os, re, subprocess, sys
 
-exe_path, chrome_fw, bridge_target, skip_check = sys.argv[1:5]
+exe_path, chrome_fw, bridge_target = sys.argv[1:4]
 
 def inspect_macho(path: str) -> tuple[str, str, str]:
     archs = subprocess.check_output(["lipo", "-archs", path], text=True).strip()
@@ -190,13 +185,10 @@ has_v1 = bool(
     )
 )
 if not has_v1:
-    if skip_check == "1":
-        print("WARNING: CrIOSExtensionManagerV1 missing in base binary (skipped via --skip-v1-bridge-check)", file=sys.stderr)
-    else:
-        raise SystemExit(
-            f"error: CrIOSExtensionManagerV1 ObjC class missing from {bridge_target}; "
-            "refusing to package silently unavailable Extensions UI"
-        )
+    raise SystemExit(
+        f"error: CrIOSExtensionManagerV1 ObjC class missing from {bridge_target}; "
+        "refusing to package silently unavailable Extensions UI"
+    )
 
 print(f"{exe_plat}\t{exe_minos}\t{helper_platform}\t{supported_platform}\t{dt_platform}")
 PY
