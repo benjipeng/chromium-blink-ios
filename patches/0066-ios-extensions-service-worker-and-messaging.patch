@@ -1,0 +1,516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: wire MV3 service worker hooks, MessagingDelegate, and SW fixture
+
+---
+diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.gn
+index e7eb2a3..09d4252 100644
+--- a/ios/chrome/app/resources/BUILD.gn
++++ b/ios/chrome/app/resources/BUILD.gn
+@@ -32,6 +32,8 @@ if (enable_extensions_core) {
+       "extensions/ios_probe/content.js",
+       "extensions/ios_probe/manifest.json",
+       "extensions/ios_probe/rules_1.json",
++      "extensions/ios_probe/sw.js",
++      "extensions/ios_probe/sw_helper.js",
+     ]
+     outputs = [
+       "{{bundle_resources_dir}}/bundled_extensions/ios_probe/{{source_file_part}}",
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/content.js b/ios/chrome/app/resources/extensions/ios_probe/content.js
+index 64da109..4dd4a4e 100644
+--- a/ios/chrome/app/resources/extensions/ios_probe/content.js
++++ b/ios/chrome/app/resources/extensions/ios_probe/content.js
+@@ -13,6 +13,7 @@
+   const badge = document.createElement('div');
+   badge.id = 'ios-blink-extension-probe';
+   badge.dataset.extensionId = id;
++  badge.dataset.swStatus = 'pending';
+   badge.textContent = 'Chromium extension active · ' + id.slice(0, 8);
+   badge.style.cssText =
+       'position:fixed;bottom:12px;right:12px;z-index:2147483647;' +
+@@ -20,4 +21,50 @@
+       'font:12px system-ui;border-radius:6px;pointer-events:none';
+   (document.body || document.documentElement).appendChild(badge);
+   console.info('CHROMIUM_IOS_EXTENSION_PROBE', id);
++
++  const nonce = 'probe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
++  try {
++    chrome.runtime.sendMessage({type: 'ios_probe_ping', nonce}, (reply) => {
++      const lastErr = chrome.runtime.lastError;
++      if (lastErr) {
++        const msg = lastErr.message || String(lastErr);
++        badge.dataset.swStatus = 'error';
++        badge.dataset.swError = msg;
++        document.documentElement.dataset.iosBlinkExtensionSw = 'error:' + msg;
++        console.error('CHROMIUM_IOS_EXTENSION_SW_ERROR', id, msg);
++        return;
++      }
++      if (!reply || reply.ok !== true || reply.runtimeId !== id ||
++          reply.moduleMarker !== 'ios_probe_sw_module_v1' ||
++          reply.echoNonce !== nonce || typeof reply.bootCount !== 'number') {
++        const msg = reply?.error || 'unexpected SW reply payload';
++        badge.dataset.swStatus = 'error';
++        badge.dataset.swError = msg;
++        document.documentElement.dataset.iosBlinkExtensionSw = 'error:' + msg;
++        console.error('CHROMIUM_IOS_EXTENSION_SW_ERROR', id, msg);
++        return;
++      }
++      badge.dataset.swStatus = 'ok';
++      badge.dataset.swModuleMarker = reply.moduleMarker;
++      badge.dataset.swBootCount = String(reply.bootCount);
++      badge.dataset.swEchoNonce = reply.echoNonce;
++      document.documentElement.dataset.iosBlinkExtensionSw =
++          'ok:' + reply.moduleMarker + ':' + reply.bootCount;
++      badge.textContent =
++          'Chromium extension active · ' + id.slice(0, 8) +
++          ' · SW #' + reply.bootCount;
++      console.info(
++          'CHROMIUM_IOS_EXTENSION_SW_ROUNDTRIP',
++          id,
++          reply.moduleMarker,
++          reply.bootCount,
++          reply.echoNonce);
++    });
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    badge.dataset.swStatus = 'error';
++    badge.dataset.swError = msg;
++    document.documentElement.dataset.iosBlinkExtensionSw = 'error:' + msg;
++    console.error('CHROMIUM_IOS_EXTENSION_SW_ERROR', id, msg);
++  }
+ })();
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/manifest.json b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+index 2dda84d..48d4e33 100644
+--- a/ios/chrome/app/resources/extensions/ios_probe/manifest.json
++++ b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+@@ -2,10 +2,11 @@
+   "manifest_version": 3,
+   "name": "Chromium iOS Extension Probe",
+   "version": "1.0",
+-  "description": "Bundled verification of Chromium extension loading and isolated-world bindings.",
++  "description": "Bundled verification of Chromium extension loading, MV3 service worker, storage.local, runtime messaging, and DNR.",
+   "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCs0m2LhzW0YErQ8xeUz54RM9yhhbJ+6sq0K7jVxsx3eT2tFY7GRraNstLGNO5NyO6o2cxgmGxW2owKum5vNlxBiCZMdVgVyz+zUpPust3BUJM3Jc9rOFIIbv3saKmN/IIGY2+QVTFKYX21dmSPRhlF/HKT3UpH9SuaqkxBaU2VgwIDAQAB",
+   "permissions": [
+-    "declarativeNetRequest"
++    "declarativeNetRequest",
++    "storage"
+   ],
+   "declarative_net_request": {
+     "rule_resources": [
+@@ -19,12 +20,18 @@
+   "content_scripts": [
+     {
+       "matches": [
+-        "https://example.com/*"
++        "https://example.com/*",
++        "http://127.0.0.1/*",
++        "http://localhost/*"
+       ],
+       "js": [
+         "content.js"
+       ],
+       "run_at": "document_end"
+     }
+-  ]
++  ],
++  "background": {
++    "service_worker": "sw.js",
++    "type": "module"
++  }
+ }
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/sw.js b/ios/chrome/app/resources/extensions/ios_probe/sw.js
+new file mode 100644
+index 0000000..45178ad
+--- /dev/null
++++ b/ios/chrome/app/resources/extensions/ios_probe/sw.js
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {
++  STORAGE_KEY,
++  SW_MODULE_MARKER,
++  buildStoragePayload,
++} from './sw_helper.js';
++
++let initState = null;
++let initError = null;
++
++// Register the message listener synchronously at module top level so MV3
++// service worker wakeups dispatch incoming messages while initPromise settles.
++chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
++  if (!message || message.type !== 'ios_probe_ping') {
++    return false;
++  }
++  (async () => {
++    await initPromise;
++    if (initError || !initState) {
++      sendResponse({
++        ok: false,
++        error: initError || 'SW initialization produced no state',
++      });
++      return;
++    }
++    const probeNonce =
++        typeof message.nonce === 'string' ? message.nonce : 'default';
++    const roundtripKey = 'ios_probe_last_ping';
++    await chrome.storage.local.set({
++      [roundtripKey]: {nonce: probeNonce, moduleMarker: SW_MODULE_MARKER},
++    });
++    const readback =
++        await chrome.storage.local.get([STORAGE_KEY, roundtripKey]);
++    const pingBack = readback?.[roundtripKey];
++    const stateBack = readback?.[STORAGE_KEY];
++    if (!pingBack || pingBack.nonce !== probeNonce ||
++        pingBack.moduleMarker !== SW_MODULE_MARKER ||
++        !stateBack || stateBack.moduleMarker !== SW_MODULE_MARKER) {
++      sendResponse({
++        ok: false,
++        error: 'storage.local message roundtrip verification failed',
++      });
++      return;
++    }
++    sendResponse({
++      ok: true,
++      runtimeId: chrome.runtime.id,
++      moduleMarker: SW_MODULE_MARKER,
++      bootCount: stateBack.bootCount,
++      echoNonce: pingBack.nonce,
++      senderUrl: sender?.url || null,
++    });
++  })().catch((err) => {
++    sendResponse({
++      ok: false,
++      error: err instanceof Error ? err.message : String(err),
++    });
++  });
++  return true;
++});
++
++const initPromise = (async () => {
++  try {
++    const existing = await chrome.storage.local.get(STORAGE_KEY);
++    const payload = buildStoragePayload(existing?.[STORAGE_KEY]?.bootCount);
++    await chrome.storage.local.set({[STORAGE_KEY]: payload});
++    const verified = await chrome.storage.local.get(STORAGE_KEY);
++    const roundtrip = verified?.[STORAGE_KEY];
++    if (!roundtrip || roundtrip.moduleMarker !== SW_MODULE_MARKER ||
++        roundtrip.bootCount !== payload.bootCount) {
++      throw new Error('storage.local verification mismatch after set/get');
++    }
++    initState = roundtrip;
++    console.info(
++        'CHROMIUM_IOS_EXTENSION_SW_READY',
++        chrome.runtime.id,
++        SW_MODULE_MARKER,
++        roundtrip.bootCount);
++  } catch (err) {
++    initError = err instanceof Error ? err.message : String(err);
++    console.error('CHROMIUM_IOS_EXTENSION_SW_INIT_ERROR', initError);
++  }
++})();
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/sw_helper.js b/ios/chrome/app/resources/extensions/ios_probe/sw_helper.js
+new file mode 100644
+index 0000000..664600c
+--- /dev/null
++++ b/ios/chrome/app/resources/extensions/ios_probe/sw_helper.js
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++export const SW_MODULE_MARKER = 'ios_probe_sw_module_v1';
++export const STORAGE_KEY = 'ios_probe_sw_state';
++
++export function buildStoragePayload(previousCount) {
++  const nextCount =
++      typeof previousCount === 'number' && Number.isFinite(previousCount)
++          ? previousCount + 1
++          : 1;
++  return {
++    bootCount: nextCount,
++    moduleMarker: SW_MODULE_MARKER,
++  };
++}
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 3a21971..08a5d21 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -35,6 +35,8 @@ source_set("model") {
+     "//components/version_info",
+     "//content/public/browser",
+     "//content/public/common",
++    "//extensions/browser/api:extensions_api_client",
++    "//extensions/browser/api/messaging",
+     "//extensions/browser/updater",
+     "//extensions/buildflags",
+     "//extensions/common",
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index a4e0cb6..67230ae 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -34,6 +34,7 @@
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "extensions/browser/api/core_extensions_browser_api_provider.h"
+ #include "extensions/browser/api/extensions_api_client.h"
++#include "extensions/browser/api/messaging/messaging_delegate.h"
+ #include "extensions/browser/api/runtime/runtime_api.h"
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+ #include "extensions/browser/browser_context_keyed_service_factories.h"
+@@ -264,6 +265,21 @@ bool RestartDevice(std::string* error_message) override {
+   raw_ptr<content::BrowserContext> browser_context_;
+ };
+ 
++class IOSExtensionsAPIClient final : public extensions::ExtensionsAPIClient {
++ public:
++  IOSExtensionsAPIClient()
++      : messaging_delegate_(
++            std::make_unique<extensions::MessagingDelegate>()) {}
++  ~IOSExtensionsAPIClient() override = default;
++
++  extensions::MessagingDelegate* GetMessagingDelegate() override {
++    return messaging_delegate_.get();
++  }
++
++ private:
++  std::unique_ptr<extensions::MessagingDelegate> messaging_delegate_;
++};
++
+ }  // namespace
+ 
+ base::FilePath GetIOSBundledExtensionDirectory() {
+@@ -349,7 +365,7 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+ }
+ 
+ IOSExtensionsBrowserClient::IOSExtensionsBrowserClient()
+-    : api_client_(std::make_unique<ExtensionsAPIClient>()) {
++    : api_client_(std::make_unique<IOSExtensionsAPIClient>()) {
+   AddAPIProvider(std::make_unique<CoreExtensionsBrowserAPIProvider>());
+   SetCurrentChannel(::GetChannel());
+ 
+@@ -396,11 +412,13 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+       !extension.is_extension()) {
+     return false;
+   }
+-  // MV3 service workers and background hosts require context-aware ProcessMap
+-  // adaptation under single-process Blink; restrict the initial bundled
+-  // fixture strictly to content scripts.
+-  if (BackgroundInfo::HasBackgroundPage(&extension) ||
+-      BackgroundInfo::IsServiceWorkerBased(&extension)) {
++  // Legacy MV2 background pages remain unsupported on iOS. MV3 service
++  // workers are allowed only for the verified bundled fixture path and ID.
++  if (BackgroundInfo::HasBackgroundPage(&extension)) {
++    return false;
++  }
++  if (BackgroundInfo::IsServiceWorkerBased(&extension) &&
++      extension.id() != kIOSBundledExtensionId) {
+     return false;
+   }
+   base::AutoLock lock(bundled_allowlist_lock_);
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index 53d81e7..4802f82 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -23,6 +23,7 @@
+ #include "extensions/browser/extensions_browser_client.h"
+ #include "extensions/browser/process_map.h"
+ #include "extensions/browser/renderer_startup_helper.h"
++#include "extensions/browser/url_loader_factory_manager.h"
+ #include "extensions/browser/service_worker/service_worker_host.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/mojom/event_router.mojom.h"
+@@ -456,6 +457,54 @@ void IOSContentBrowserClient::WillCreateURLLoaderFactory(
+     }
+   }
+ }
++
++void IOSContentBrowserClient::
++    RegisterNonNetworkWorkerMainResourceURLLoaderFactories(
++        content::BrowserContext* browser_context,
++        const std::optional<url::Origin>& request_initiator,
++        network::mojom::RequestDestination request_destination,
++        NonNetworkURLLoaderFactoryMap* factories) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !browser_context || !factories ||
++      !client->IsValidContext(browser_context)) {
++    return;
++  }
++  factories->emplace(
++      extensions::kExtensionScheme,
++      extensions::CreateExtensionWorkerMainResourceURLLoaderFactory(
++          browser_context, request_initiator));
++}
++
++void IOSContentBrowserClient::
++    RegisterNonNetworkServiceWorkerUpdateURLLoaderFactories(
++        content::BrowserContext* browser_context,
++        NonNetworkURLLoaderFactoryMap* factories) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !browser_context || !factories ||
++      !client->IsValidContext(browser_context)) {
++    return;
++  }
++  factories->emplace(
++      extensions::kExtensionScheme,
++      extensions::CreateExtensionServiceWorkerScriptURLLoaderFactory(
++          browser_context));
++}
++
++void IOSContentBrowserClient::OverrideURLLoaderFactoryParams(
++    content::BrowserContext* browser_context,
++    const url::Origin& origin,
++    bool is_for_isolated_world,
++    bool is_for_service_worker,
++    network::mojom::URLLoaderFactoryParams* factory_params) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !browser_context || !factory_params ||
++      !client->IsValidContext(browser_context)) {
++    return;
++  }
++  extensions::URLLoaderFactoryManager::OverrideURLLoaderFactoryParams(
++      browser_context, origin, is_for_isolated_world, is_for_service_worker,
++      factory_params);
++}
+ #endif
+ 
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index d55931f..f04d1fb 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -89,6 +89,20 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+       network::mojom::URLLoaderFactoryOverridePtr* factory_override,
+       scoped_refptr<base::SequencedTaskRunner> navigation_response_task_runner,
+       bool is_for_network_service) override;
++  void RegisterNonNetworkWorkerMainResourceURLLoaderFactories(
++      content::BrowserContext* browser_context,
++      const std::optional<url::Origin>& request_initiator,
++      network::mojom::RequestDestination request_destination,
++      NonNetworkURLLoaderFactoryMap* factories) override;
++  void RegisterNonNetworkServiceWorkerUpdateURLLoaderFactories(
++      content::BrowserContext* browser_context,
++      NonNetworkURLLoaderFactoryMap* factories) override;
++  void OverrideURLLoaderFactoryParams(
++      content::BrowserContext* browser_context,
++      const url::Origin& origin,
++      bool is_for_isolated_world,
++      bool is_for_service_worker,
++      network::mojom::URLLoaderFactoryParams* factory_params) override;
+ #endif
+ };
+ 
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+index 4ef73b8..806ff32 100644
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -6,6 +6,7 @@
+ 
+ #import "extensions/buildflags/buildflags.h"
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "extensions/renderer/dispatcher.h"
+ #import "extensions/renderer/extensions_renderer_client.h"
+ #import "ios/web/content/init/extensions/ios_extensions_client.h"
+ #endif
+@@ -119,6 +120,58 @@ void IOSContentRendererClient::RunScriptsAtDocumentIdle(
+ #endif
+ }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++void IOSContentRendererClient::
++    DidInitializeServiceWorkerContextOnWorkerThread(
++        blink::WebServiceWorkerContextProxy* context_proxy,
++        const GURL& service_worker_scope,
++        const GURL& script_url) {
++  if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
++    dispatcher->DidInitializeServiceWorkerContextOnWorkerThread(
++        context_proxy, service_worker_scope, script_url);
++  }
++}
++
++void IOSContentRendererClient::WillEvaluateServiceWorkerOnWorkerThread(
++    blink::WebServiceWorkerContextProxy* context_proxy,
++    v8::Local<v8::Context> v8_context,
++    int64_t service_worker_version_id,
++    const GURL& service_worker_scope,
++    const GURL& script_url,
++    const blink::ServiceWorkerToken& service_worker_token) {
++  if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
++    dispatcher->WillEvaluateServiceWorkerOnWorkerThread(
++        context_proxy, v8_context, service_worker_version_id,
++        service_worker_scope, script_url, service_worker_token);
++  }
++}
++
++void IOSContentRendererClient::DidStartServiceWorkerContextOnWorkerThread(
++    int64_t service_worker_version_id,
++    const GURL& service_worker_scope,
++    const GURL& script_url,
++    const blink::ServiceWorkerToken& service_worker_token) {
++  if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
++    dispatcher->DidStartServiceWorkerContextOnWorkerThread(
++        service_worker_version_id, service_worker_scope, script_url,
++        service_worker_token);
++  }
++}
++
++void IOSContentRendererClient::WillDestroyServiceWorkerContextOnWorkerThread(
++    v8::Local<v8::Context> context,
++    int64_t service_worker_version_id,
++    const GURL& service_worker_scope,
++    const GURL& script_url,
++    const blink::ServiceWorkerToken& service_worker_token) {
++  if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
++    dispatcher->WillDestroyServiceWorkerContextOnWorkerThread(
++        context, service_worker_version_id, service_worker_scope, script_url,
++        service_worker_token);
++  }
++}
++#endif
++
+ void IOSContentRendererClient::PrepareErrorPage(
+     content::RenderFrame* render_frame,
+     const blink::WebURLError& error,
+diff --git a/ios/web/content/init/ios_content_renderer_client.h b/ios/web/content/init/ios_content_renderer_client.h
+index 2421550..991de8a 100644
+--- a/ios/web/content/init/ios_content_renderer_client.h
++++ b/ios/web/content/init/ios_content_renderer_client.h
+@@ -7,6 +7,7 @@
+ 
+ #import "build/blink_buildflags.h"
+ #import "content/public/renderer/content_renderer_client.h"
++#import "extensions/buildflags/buildflags.h"
+ 
+ #if !BUILDFLAG(USE_BLINK)
+ #error File can only be included when USE_BLINK is true
+@@ -30,6 +31,30 @@ class IOSContentRendererClient : public content::ContentRendererClient {
+   void RunScriptsAtDocumentStart(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentEnd(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentIdle(content::RenderFrame* render_frame) override;
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  void DidInitializeServiceWorkerContextOnWorkerThread(
++      blink::WebServiceWorkerContextProxy* context_proxy,
++      const GURL& service_worker_scope,
++      const GURL& script_url) override;
++  void WillEvaluateServiceWorkerOnWorkerThread(
++      blink::WebServiceWorkerContextProxy* context_proxy,
++      v8::Local<v8::Context> v8_context,
++      int64_t service_worker_version_id,
++      const GURL& service_worker_scope,
++      const GURL& script_url,
++      const blink::ServiceWorkerToken& service_worker_token) override;
++  void DidStartServiceWorkerContextOnWorkerThread(
++      int64_t service_worker_version_id,
++      const GURL& service_worker_scope,
++      const GURL& script_url,
++      const blink::ServiceWorkerToken& service_worker_token) override;
++  void WillDestroyServiceWorkerContextOnWorkerThread(
++      v8::Local<v8::Context> context,
++      int64_t service_worker_version_id,
++      const GURL& service_worker_scope,
++      const GURL& script_url,
++      const blink::ServiceWorkerToken& service_worker_token) override;
++#endif
+   void PrepareErrorPage(content::RenderFrame* render_frame,
+                         const blink::WebURLError& error,
+                         const std::string& http_method,

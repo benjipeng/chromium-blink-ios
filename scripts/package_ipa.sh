@@ -135,7 +135,7 @@ exe_path="$bundle/$exe"
 chrome_fw="$bundle/Frameworks/chrome_framework.framework/chrome_framework"
 
 if grep -Eq '^enable_extensions_core[[:space:]]*=[[:space:]]*true' "$REPO_ROOT/args/device.gn"; then
-  for resource in manifest.json content.js rules_1.json; do
+  for resource in manifest.json content.js rules_1.json sw.js sw_helper.js; do
     [ -s "$bundle/bundled_extensions/ios_probe/$resource" ] || {
       echo "error: bundled extension probe resource missing after packaging cleanup: $resource" >&2
       exit 1
