@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: exclude unsupported webstorePrivate API
+
+---
+diff --git a/extensions/common/api/schema.gni b/extensions/common/api/schema.gni
+--- a/extensions/common/api/schema.gni
++++ b/extensions/common/api/schema.gni
+@@ -138,6 +138,8 @@
+ if (is_ios) {
+   # The CPU provider has no iOS implementation; do not register that API.
+   extensions_api_schema_files_ -= [ "system_cpu.webidl" ]
++  # WebstorePrivate has no iOS delegate or Web Store installation support.
++  extensions_api_schema_files_ -= [ "webstore_private.json" ]
+ 
+   # Shared core code needs these C++ types even when the corresponding public
+   # APIs and guest-view implementation are disabled.
+diff --git a/extensions/common/api/_api_features.json b/extensions/common/api/_api_features.json
+--- a/extensions/common/api/_api_features.json
++++ b/extensions/common/api/_api_features.json
+@@ -1018,12 +1018,14 @@
+   "webstorePrivate": [{
+     "channel": "stable",
+     "contexts": ["web_page"],
+-    "matches": ["https://chromewebstore.google.com/*"]
++    "matches": ["https://chromewebstore.google.com/*"],
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }, {
+     // Used for webstore testing. See comment in
+     // chrome/common/extensions/webstore_override.cc
+     "channel": "stable",
+     "contexts": ["web_page"],
+     "requires_delegated_availability_check": true,
+-    "matches": ["<all_urls>"]
++    "matches": ["<all_urls>"],
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }],
+diff --git a/extensions/browser/api/BUILD.gn b/extensions/browser/api/BUILD.gn
+--- a/extensions/browser/api/BUILD.gn
++++ b/extensions/browser/api/BUILD.gn
+@@ -59,6 +59,8 @@
+   if (is_ios) {
+     # cpu_info_provider has platform implementations for desktop/Android only.
+     public_deps -= [ "//extensions/browser/api/system_cpu" ]
++    # webstore_private requires a non-null WebstorePrivateAPIDelegate.
++    public_deps -= [ "//extensions/browser/api/webstore_private" ]
+   }
+ 
+   # APIs that are currently not supported on desktop-android.
+diff --git a/extensions/browser/api/api_browser_context_keyed_service_factories.cc b/extensions/browser/api/api_browser_context_keyed_service_factories.cc
+--- a/extensions/browser/api/api_browser_context_keyed_service_factories.cc
++++ b/extensions/browser/api/api_browser_context_keyed_service_factories.cc
+@@ -26,7 +26,9 @@
+ #include "extensions/browser/api/web_request/web_request_proxying_url_loader_factory.h"
+ #include "extensions/browser/api/web_request/web_request_proxying_websocket.h"
+ #include "extensions/browser/api/web_request/web_request_proxying_webtransport_shutdown_notifier_factory.h"
++#if !BUILDFLAG(IS_IOS)
+ #include "extensions/browser/api/webstore_private/webstore_private_api.h"
++#endif
+ #include "extensions/buildflags/buildflags.h"
+ 
+ // The following are not supported in the experimental desktop-android build.
+@@ -86,7 +88,9 @@
+   WebRequestProxyingURLLoaderFactory::EnsureAssociatedFactoryBuilt();
+   WebRequestProxyingWebSocket::EnsureAssociatedFactoryBuilt();
+   WebRequestProxyingWebTransportShutdownNotifierFactory::GetInstance();
++#if !BUILDFLAG(IS_IOS)
+   WebstorePrivateApi::EnsureAssociatedFactoryBuilt();
++#endif
+ 
+ // The following are not supported in the experimental desktop-android build.
+ // TODO(https://crbug.com/356905053): Enable these APIs on desktop-android.

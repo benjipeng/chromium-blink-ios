@@ -49,3 +49,4 @@
 0057-ios-extensions-core-schema-platform-compat.patch
 0058-ios-extensions-exclude-unsupported-cpu-api.patch
 0059-ios-extensions-link-boundaries.patch
+0060-ios-extensions-exclude-webstore-private-api.patch

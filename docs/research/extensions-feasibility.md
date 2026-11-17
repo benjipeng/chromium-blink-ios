@@ -8,6 +8,32 @@
 
 ## Executive Summary
 
+### Runtime failure confirmed on simulator derivative (`25552fd` -> `0060`)
+
+- **Status:** **Runtime failure confirmed** (no runtime pass claimed). An experimental `vtool`
+  simulator retarget of [run 44004466870](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44004466870)
+  (`com.benjipeng.chromiumblink.chrome.ios.extprobe`, PID `21174` on iPhone Duo Simulator
+  `C229AC75-8053-4B7F-A2F8-DFE983E26C13`) crashed during startup in
+  `/Users/ac/Library/Logs/DiagnosticReports/Chromium-2026-11-17-070110.ips`
+  with `EXC_BAD_ACCESS / SIGSEGV` (`far = 0x0`, `x0 = 0`).
+- **Symbol root cause (`chrome_framework` base `4671094784`):**
+  `IOSChromeMainParts::PreMainMessageLoopRun()` -> `InitializeIOSExtensionsBrowserClient()`
+  (`offset 72097408`) -> `WebstorePrivateApi::EnsureAssociatedFactoryBuilt()` (`offset 63840924`)
+  -> `base::NoDestructor<extensions::(anonymous namespace)::PendingApprovalsShutdownNotifierFactory>::NoDestructor<>()+68`
+  (`offset 63857856`, `pc = 0x3ce64c0`). `IOSExtensionsBrowserClient` constructs the base
+  `ExtensionsAPIClient`, whose `GetWebstorePrivateAPIDelegate()` returns `nullptr`, and
+  `PendingApprovalsShutdownNotifierFactory()` unconditionally dereferences
+  `delegate->GetWebStoreAPIFactoryDependencies()` (`extensions/browser/api/webstore_private/webstore_private_api.cc:145-149`).
+- **Patch `0060` (`0060-ios-extensions-exclude-webstore-private-api.patch`):** Excludes
+  `webstore_private.json` from `extensions_api_schema_files_` (`extensions/common/api/schema.gni`),
+  removes `//extensions/browser/api/webstore_private` from `api_implementations`
+  (`extensions/browser/api/BUILD.gn`), guards `#include` and
+  `WebstorePrivateApi::EnsureAssociatedFactoryBuilt()` with `#if !BUILDFLAG(IS_IOS)`
+  (`extensions/browser/api/api_browser_context_keyed_service_factories.cc`), and restricts
+  `webstorePrivate` in `extensions/common/api/_api_features.json` to
+  `["chromeos", "desktop_android", "linux", "mac", "win"]` so `chromewebstore.google.com`
+  cannot resolve the API on `IOS_PLATFORM`.
+
 ### Implementation checkpoint (November 16)
 
 The experimental branch contains actual common, renderer, browser, profile,
