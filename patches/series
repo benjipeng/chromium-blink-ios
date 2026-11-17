@@ -53,3 +53,4 @@
 0061-ios-extensions-register-missing-profile-prefs.patch
 0062-ios-extensions-create-stores-in-system-ctor.patch
 0063-ios-extensions-objc-manager-and-disable-prefs.patch
+0064-ios-extensions-dnr-network-hook-and-staging.patch

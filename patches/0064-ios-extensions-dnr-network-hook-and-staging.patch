@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: wire DNR URLLoaderFactory proxy and writable profile staging
+
+---
+diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.gn
+index 5afde30..e7eb2a3 100644
+--- a/ios/chrome/app/resources/BUILD.gn
++++ b/ios/chrome/app/resources/BUILD.gn
+@@ -31,6 +31,7 @@ if (enable_extensions_core) {
+     sources = [
+       "extensions/ios_probe/content.js",
+       "extensions/ios_probe/manifest.json",
++      "extensions/ios_probe/rules_1.json",
+     ]
+     outputs = [
+       "{{bundle_resources_dir}}/bundled_extensions/ios_probe/{{source_file_part}}",
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/manifest.json b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+index 6ac9d75..2dda84d 100644
+--- a/ios/chrome/app/resources/extensions/ios_probe/manifest.json
++++ b/ios/chrome/app/resources/extensions/ios_probe/manifest.json
+@@ -3,6 +3,19 @@
+   "name": "Chromium iOS Extension Probe",
+   "version": "1.0",
+   "description": "Bundled verification of Chromium extension loading and isolated-world bindings.",
++  "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCs0m2LhzW0YErQ8xeUz54RM9yhhbJ+6sq0K7jVxsx3eT2tFY7GRraNstLGNO5NyO6o2cxgmGxW2owKum5vNlxBiCZMdVgVyz+zUpPust3BUJM3Jc9rOFIIbv3saKmN/IIGY2+QVTFKYX21dmSPRhlF/HKT3UpH9SuaqkxBaU2VgwIDAQAB",
++  "permissions": [
++    "declarativeNetRequest"
++  ],
++  "declarative_net_request": {
++    "rule_resources": [
++      {
++        "id": "ruleset_1",
++        "enabled": true,
++        "path": "rules_1.json"
++      }
++    ]
++  },
+   "content_scripts": [
+     {
+       "matches": [
+diff --git a/ios/chrome/app/resources/extensions/ios_probe/rules_1.json b/ios/chrome/app/resources/extensions/ios_probe/rules_1.json
+new file mode 100644
+index 0000000..afbb8aa
+--- /dev/null
++++ b/ios/chrome/app/resources/extensions/ios_probe/rules_1.json
+@@ -0,0 +1,20 @@
++[
++  {
++    "id": 1,
++    "priority": 1,
++    "action": {
++      "type": "block"
++    },
++    "condition": {
++      "urlFilter": "/dnr-probe-blocked.js",
++      "initiatorDomains": [
++        "127.0.0.1",
++        "localhost"
++      ],
++      "resourceTypes": [
++        "script",
++        "xmlhttprequest"
++      ]
++    }
++  }
++]
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+index 7c44c5a..1821ded 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+@@ -7,8 +7,11 @@
+ #include <optional>
+ #include <utility>
+ 
++#include "base/check.h"
++#include "base/check_op.h"
+ #include "base/command_line.h"
+ #include "base/containers/flat_set.h"
++#include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -46,30 +49,73 @@
+ };
+ 
+ std::optional<ResolvedBundledExtension> ResolveBundledExtensionOnFileThread(
+-    const base::FilePath& bundled_dir) {
+-  if (bundled_dir.empty() || !base::DirectoryExists(bundled_dir)) {
++    const base::FilePath& bundled_dir,
++    const base::FilePath& profile_path) {
++  if (bundled_dir.empty() || profile_path.empty() ||
++      !base::DirectoryExists(bundled_dir)) {
+     return std::nullopt;
+   }
+-  const base::FilePath canonical_path = base::MakeAbsoluteFilePath(bundled_dir);
+-  if (canonical_path.empty() ||
+-      !base::PathExists(canonical_path.Append(kManifestFilename))) {
++  const base::FilePath source_path = base::MakeAbsoluteFilePath(bundled_dir);
++  if (source_path.empty() ||
++      !base::PathExists(source_path.Append(kManifestFilename))) {
+     return std::nullopt;
+   }
+ 
+-  ExtensionId extension_id =
+-      crx_file::id_util::GenerateIdForPath(canonical_path);
+   std::string error;
+   std::optional<base::DictValue> manifest =
+-      file_util::LoadManifest(canonical_path, &error);
+-  if (manifest) {
+-    if (const std::string* manifest_key =
+-            manifest->FindString(manifest_keys::kPublicKey)) {
+-      std::string public_key_bytes;
+-      if (Extension::ParsePEMKeyBytes(*manifest_key, &public_key_bytes)) {
+-        extension_id = crx_file::id_util::GenerateId(public_key_bytes);
+-      }
++      file_util::LoadManifest(source_path, &error);
++  if (!manifest) {
++    return std::nullopt;
++  }
++  const std::string* manifest_key =
++      manifest->FindString(manifest_keys::kPublicKey);
++  CHECK(manifest_key);
++  std::string public_key_bytes;
++  CHECK(Extension::ParsePEMKeyBytes(*manifest_key, &public_key_bytes));
++  const ExtensionId extension_id =
++      crx_file::id_util::GenerateId(public_key_bytes);
++  CHECK_EQ(extension_id, kIOSBundledExtensionId);
++
++  const base::FilePath staging_parent =
++      profile_path.AppendASCII("bundled_extensions");
++  const base::FilePath temp_dir = staging_parent.AppendASCII(".ios_probe.tmp");
++  const base::FilePath staged_dir = staging_parent.AppendASCII("ios_probe");
++
++  if (!base::CreateDirectory(staging_parent) ||
++      !base::DeletePathRecursively(temp_dir) ||
++      !base::CopyDirectoryNoFollow(source_path, temp_dir,
++                                   /*recursive=*/true)) {
++    base::DeletePathRecursively(temp_dir);
++    return std::nullopt;
++  }
++
++  if (!base::SetPosixFilePermissions(temp_dir, 0755)) {
++    base::DeletePathRecursively(temp_dir);
++    return std::nullopt;
++  }
++  base::FileEnumerator enumerator(
++      temp_dir, /*recursive=*/true,
++      base::FileEnumerator::FILES | base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath entry = enumerator.Next(); !entry.empty();
++       entry = enumerator.Next()) {
++    const int mode = enumerator.GetInfo().IsDirectory() ? 0755 : 0644;
++    if (!base::SetPosixFilePermissions(entry, mode)) {
++      base::DeletePathRecursively(temp_dir);
++      return std::nullopt;
+     }
+   }
++
++  if (!base::DeletePathRecursively(staged_dir) ||
++      !base::Move(temp_dir, staged_dir)) {
++    base::DeletePathRecursively(temp_dir);
++    return std::nullopt;
++  }
++
++  const base::FilePath canonical_path = base::MakeAbsoluteFilePath(staged_dir);
++  if (canonical_path.empty() ||
++      !base::PathExists(canonical_path.Append(kManifestFilename))) {
++    return std::nullopt;
++  }
+   return ResolvedBundledExtension{canonical_path, extension_id};
+ }
+ 
+@@ -263,13 +309,15 @@ void OnExtensionInstalled(const Extension* extension,
+   }
+ 
+   const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
+-  if (bundled_dir.empty()) {
++  const base::FilePath profile_path = browser_context_->GetPath();
++  if (bundled_dir.empty() || profile_path.empty()) {
+     return;
+   }
+ 
+   GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+       FROM_HERE,
+-      base::BindOnce(&ResolveBundledExtensionOnFileThread, bundled_dir),
++      base::BindOnce(&ResolveBundledExtensionOnFileThread, bundled_dir,
++                     profile_path),
+       base::BindOnce(
+           [](base::WeakPtr<IOSExtensionSystem> self,
+              std::optional<ResolvedBundledExtension> resolved) {
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 6c77c25..182ca13 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -59,6 +59,9 @@ base::FilePath GetIOSBundledExtensionDirectory();
+ 
+ namespace extensions {
+ 
++inline constexpr char kIOSBundledExtensionId[] =
++    "bbbobhphejdilhlbomegeajcfbkbkfon";
++
+ class ExtensionsAPIClient;
+ 
+ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index e3ebf08..a4e0cb6 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -311,14 +311,14 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
+       web::ContentBrowserContext::FromBrowserState(profile);
+   CHECK(browser_context);
+ 
+-  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
+-  client->RegisterBrowserContext(browser_context, profile);
+-
+-  BrowserContextDependencyManager::GetInstance()->MarkBrowserContextLive(
+-      browser_context);
+   if (!user_prefs::UserPrefs::Get(browser_context)) {
+     user_prefs::UserPrefs::Set(browser_context, profile->GetPrefs());
+   }
++  BrowserContextDependencyManager::GetInstance()->MarkBrowserContextLive(
++      browser_context);
++
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  client->RegisterBrowserContext(browser_context, profile);
+   BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
+       browser_context);
+   extensions::ExtensionSystem::Get(browser_context)
+@@ -353,10 +353,9 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   AddAPIProvider(std::make_unique<CoreExtensionsBrowserAPIProvider>());
+   SetCurrentChannel(::GetChannel());
+ 
+-  const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
+-  if (!bundled_dir.empty()) {
+-    SetAllowedBundledExtension(bundled_dir,
+-                               crx_file::id_util::GenerateIdForPath(bundled_dir));
++  {
++    base::AutoLock lock(bundled_allowlist_lock_);
++    allowed_bundled_ids_.insert(kIOSBundledExtensionId);
+   }
+ }
+ 
+@@ -381,6 +380,8 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+     const base::FilePath& canonical_path,
+     const ExtensionId& extension_id) {
+   base::AutoLock lock(bundled_allowlist_lock_);
++  allowed_bundled_paths_.clear();
++  allowed_bundled_ids_.clear();
+   if (!canonical_path.empty()) {
+     allowed_bundled_paths_.insert(canonical_path);
+   }
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index fbe7e34..53d81e7 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -5,6 +5,8 @@
+ #include "ios/web/content/init/ios_content_browser_client.h"
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#include <utility>
++
+ #include "base/functional/bind.h"
+ #include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/security_principal.h"
+@@ -12,6 +14,8 @@
+ #include "content/public/browser/site_instance.h"
+ #include "content/public/common/child_process_id.h"
+ #include "extensions/browser/api/web_request/extension_web_request_event_router.h"
++#include "extensions/browser/api/web_request/web_request_api.h"
++#include "extensions/browser/browser_context_keyed_api_factory.h"
+ #include "extensions/browser/event_router.h"
+ #include "extensions/browser/extension_protocols.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -415,6 +419,43 @@ void IOSContentBrowserClient::
+       base::BindRepeating(&extensions::EventRouter::BindForRenderer,
+                           service_worker_version_info.process_id));
+ }
++
++void IOSContentBrowserClient::WillCreateURLLoaderFactory(
++    content::BrowserContext* browser_context,
++    content::RenderFrameHost* frame,
++    int render_process_id,
++    URLLoaderFactoryType type,
++    const url::Origin& request_initiator,
++    const net::IsolationInfo& isolation_info,
++    std::optional<int64_t> navigation_id,
++    ukm::SourceIdObj ukm_source_id,
++    network::URLLoaderFactoryBuilder& factory_builder,
++    mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>*
++        header_client,
++    bool* bypass_redirect_checks,
++    bool* disable_secure_dns,
++    network::mojom::URLLoaderFactoryOverridePtr* factory_override,
++    scoped_refptr<base::SequencedTaskRunner> navigation_response_task_runner,
++    bool is_for_network_service) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !browser_context || !client->IsValidContext(browser_context)) {
++    return;
++  }
++  auto* web_request_api =
++      extensions::BrowserContextKeyedAPIFactory<extensions::WebRequestAPI>::Get(
++          browser_context);
++  if (web_request_api) {
++    bool use_proxy_for_web_request =
++        web_request_api->MaybeProxyURLLoaderFactory(
++            browser_context, frame, render_process_id, type,
++            std::move(navigation_id), ukm_source_id, factory_builder,
++            header_client, std::move(navigation_response_task_runner),
++            request_initiator);
++    if (bypass_redirect_checks) {
++      *bypass_redirect_checks = use_proxy_for_web_request;
++    }
++  }
++}
+ #endif
+ 
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index d842679..d55931f 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -72,6 +72,23 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+   void RegisterAssociatedInterfaceBindersForServiceWorker(
+       const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
+       blink::AssociatedInterfaceRegistry& associated_registry) override;
++  void WillCreateURLLoaderFactory(
++      content::BrowserContext* browser_context,
++      content::RenderFrameHost* frame,
++      int render_process_id,
++      URLLoaderFactoryType type,
++      const url::Origin& request_initiator,
++      const net::IsolationInfo& isolation_info,
++      std::optional<int64_t> navigation_id,
++      ukm::SourceIdObj ukm_source_id,
++      network::URLLoaderFactoryBuilder& factory_builder,
++      mojo::PendingRemote<network::mojom::TrustedURLLoaderHeaderClient>*
++          header_client,
++      bool* bypass_redirect_checks,
++      bool* disable_secure_dns,
++      network::mojom::URLLoaderFactoryOverridePtr* factory_override,
++      scoped_refptr<base::SequencedTaskRunner> navigation_response_task_runner,
++      bool is_for_network_service) override;
+ #endif
+ };
+ 

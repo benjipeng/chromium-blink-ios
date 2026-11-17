@@ -129,7 +129,7 @@ done
 find "$bundle" -type d -name _CodeSignature -prune -exec rm -rf {} +
 
 if grep -Eq '^enable_extensions_core[[:space:]]*=[[:space:]]*true' "$REPO_ROOT/args/device.gn"; then
-  for resource in manifest.json content.js; do
+  for resource in manifest.json content.js rules_1.json; do
     [ -s "$bundle/bundled_extensions/ios_probe/$resource" ] || {
       echo "error: bundled extension probe resource missing after packaging cleanup: $resource" >&2
       exit 1

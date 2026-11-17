@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -14,6 +17,7 @@ import time
 import urllib.request
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+CONST_ID_RE = re.compile(r'kIOSBundledExtensionId\[\]\s*=\s*"([a-p]{32})"')
 
 
 def collect_upstream_files(patches_dir: pathlib.Path, series_path: pathlib.Path) -> set[str]:
@@ -86,6 +90,40 @@ def collect_upstream_files(patches_dir: pathlib.Path, series_path: pathlib.Path)
     return upstream_files
 
 
+def derive_extension_id_from_b64_key(key_b64: str) -> str:
+    der = base64.b64decode(key_b64, validate=True)
+    digest = hashlib.sha256(der).digest()[:16]
+    return "".join(chr(ord("a") + (b >> 4)) + chr(ord("a") + (b & 0xF)) for b in digest)
+
+
+def validate_patched_probe_identity(patched_src: pathlib.Path) -> str:
+    probe_dir = patched_src / "ios/chrome/app/resources/extensions/ios_probe"
+    for rel in ("manifest.json", "content.js", "rules_1.json"):
+        path = probe_dir / rel
+        if not path.is_file() or path.stat().st_size == 0:
+            raise AssertionError(f"missing or empty bundled probe file: {path}")
+
+    manifest = json.loads((probe_dir / "manifest.json").read_text(encoding="utf-8"))
+    key_b64 = manifest.get("key")
+    if not isinstance(key_b64, str) or not key_b64:
+        raise AssertionError("ios_probe/manifest.json missing non-empty public key")
+    derived_id = derive_extension_id_from_b64_key(key_b64)
+
+    header_path = patched_src / "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+    header_text = header_path.read_text(encoding="utf-8")
+    match = CONST_ID_RE.search(header_text)
+    if not match:
+        raise AssertionError("kIOSBundledExtensionId constant not found in ios_extensions_browser_client.h")
+    source_id = match.group(1)
+    if derived_id != source_id:
+        raise AssertionError(f"manifest key ID {derived_id} != source constant {source_id}")
+
+    rules = json.loads((probe_dir / "rules_1.json").read_text(encoding="utf-8"))
+    if not isinstance(rules, list) or not rules:
+        raise AssertionError("ios_probe/rules_1.json must be a non-empty rule list")
+    return derived_id
+
+
 def main() -> int:
     if os.environ.get("GITHUB_ACTIONS") != "true":
         sys.exit("Run this source-file preflight on GitHub Actions, not locally.")
@@ -115,7 +153,9 @@ def main() -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             size = sum(pool.map(fetch, sorted(files)))
         print(f"Checking the full series against {len(files)} pinned files ({size:,} bytes)", flush=True)
-        subprocess.run([str(root / "scripts/apply_patches.sh"), "--src-dir", str(source), "--check"], check=True)
+        subprocess.run([str(root / "scripts/apply_patches.sh"), "--src-dir", str(source)], check=True)
+        probe_id = validate_patched_probe_identity(source)
+        print(f"Verified bundled probe files and manifest key ID: {probe_id}", flush=True)
     return 0
 
 
