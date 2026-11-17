@@ -10,10 +10,12 @@
 
 ### Implementation checkpoint (November 16)
 
-The experimental branch now contains actual common, renderer, browser, profile,
-and resource integration. This code is **under remote validation**; the latest
-completed C++ evidence remains the three-object probe below. It must not be
-described as a working extension-enabled IPA yet.
+The experimental branch contains actual common, renderer, browser, profile,
+and resource integration. The latest remote probe compiled **all 30 selected
+iOS objects**, including the embedder hooks and every object that failed in the
+first production compile. Production codegen and Apple tools have also passed.
+The final link and runtime behavior remain unverified; this is not yet a
+working extension-enabled IPA.
 
 - Extension flags live in shared, hashed `args/device.gn` for Linux and Mac.
 - Common API/permission providers, renderer dispatcher/frame hooks, extension
@@ -109,6 +111,13 @@ implementation dependencies. It does not add a placeholder backend. A suspected
 and returns the standard API-unavailable error without a provider, so that code
 is preserved. The two patches apply in sequence to pinned source snippets in
 memory; actual compilation remains exclusively on GitHub Actions.
+
+[Run 43987674096](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43987674096)
+successfully compiled all 30 selected objects on `5f8e221`, with 792 cache hits
+and 18 misses (97.78% hits), then saved the updated cache. This validates the
+three compile-failure fixes against real iOS compiler invocations. The next
+[full IPA run 43989071368](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43989071368)
+uses `cc0165e`, which also contains the source-reviewed CPU API exclusion.
 
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
