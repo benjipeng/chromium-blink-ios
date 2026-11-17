@@ -52,8 +52,24 @@
     `StorageFrontend` (`storage_frontend.cc:231-255`) from caching a null `store_factory_`
     in `LocalValueStoreCache` and prevents `RulesRegistryService` (`rules_cache_delegate.cc:79-86`)
     from observing a null `rules_store_` during `CreateBrowserContextServices()`.
-  - **Still unverified / unbuilt:** A clean source-rebuilt IPA incorporating `0060`–`0062`
-    has not yet been built; `chrome.storage` API calls, arbitrary third-party extensions,
+  - **Source-reviewed only (queued for consolidation before next CI compile probe):**
+    `0063` (`0063-ios-extensions-objc-manager-and-disable-prefs.patch`) adds two changes:
+    1. A frozen 2-method Objective-C runtime bridge (`@protocol CrIOSExtensionManagingV1`
+       and private-visibility `@interface CrIOSExtensionManagerV1 +sharedManager` in
+       `ios_extensions_browser_client.mm`, retained in `__objc_classlist` without C export
+       changes) exposing `-extensionsWithError:` (returning immutable Foundation copies with
+       keys `id`, `name`, `version`, `enabled`) and `-setExtensionWithID:enabled:error:`
+       (main-thread only, stateless singleton, reacquires a single valid non-OTR registered
+       context per call, checks `ExtensionSystem::is_ready()`,
+       `ExtensionRegistrar::IsInitialized()`, `extensions_enabled()`, and `ManagementPolicy`,
+       then verifies state via readback).
+    2. `IOSExtensionSystem::RegistrarDelegate::GetDisableReasonsOnInstalled()` override in
+       `ios_extension_system.mm`, delegating to `ExtensionRegistrar::GetDisableReasonsOnInstalled()`
+       so cold-start `UnpackedInstaller` reloads preserve existing `ExtensionPrefs` disable
+       reasons (such as `DISABLE_USER_ACTION`) instead of overwriting them with `{}`.
+  - **Still unverified / unbuilt:** A clean source-rebuilt IPA incorporating `0060`–`0063`
+    has not yet been built (`0063` awaits consolidation with the upcoming DNR hook before the
+    next narrow probe); `chrome.storage` API calls, arbitrary third-party extensions,
     `chrome://extensions` / extension management UI, MV3 service workers, and physical
     iPhone execution remain unverified.
 - **Prior startup failure & CI preflight receipts:**

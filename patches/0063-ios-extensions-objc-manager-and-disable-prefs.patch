@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: add V1 ObjC manager bridge and preserve disable reasons
+
+---
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+index f3b8b68..7c44c5a 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+@@ -8,6 +8,7 @@
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "base/containers/flat_set.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -18,7 +19,9 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "extensions/browser/extension_file_task_runner.h"
++#include "extensions/browser/disable_reason.h"
+ #include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/install_flag.h"
+ #include "extensions/browser/install/crx_install_error.h"
+ #include "extensions/browser/management_policy.h"
+ #include "extensions/browser/null_app_sorting.h"
+@@ -157,6 +160,25 @@ void GrantActivePermissions(const Extension* extension) override {
+ 
+   void UpdateExternalExtensionAlert() override {}
+ 
++  base::flat_set<int> GetDisableReasonsOnInstalled(
++      const Extension* extension,
++      int install_flags) override {
++    if (!extension) {
++      return {};
++    }
++    auto* registrar = ExtensionRegistrar::Get(browser_context_);
++    base::flat_set<int> disable_reasons =
++        registrar ? registrar->GetDisableReasonsOnInstalled(extension)
++                  : base::flat_set<int>();
++    disable_reasons.erase(disable_reason::DISABLE_CORRUPTED);
++    if (install_flags & kInstallFlagHasRequirementErrors) {
++      disable_reasons.insert(disable_reason::DISABLE_UNSUPPORTED_REQUIREMENT);
++    } else {
++      disable_reasons.erase(disable_reason::DISABLE_UNSUPPORTED_REQUIREMENT);
++    }
++    return disable_reasons;
++  }
++
+   void OnExtensionInstalled(const Extension* extension,
+                             const syncer::StringOrdinal& page_ordinal,
+                             int install_flags,
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 1f77de7..6c77c25 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -77,6 +77,7 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+   void RegisterBrowserContext(content::BrowserContext* context,
+                               ProfileIOS* profile);
+   void UnregisterBrowserContext(content::BrowserContext* context);
++  std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
+ 
+   // Records the canonicalized path and derived/manifest ID of the bundled
+   // unpacked fixture once verified on the extension file task runner.
+@@ -239,8 +240,6 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+     const URLPatternSet empty_host_patterns_;
+   };
+ 
+-  std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
+-
+   std::atomic<bool> is_shutting_down_{false};
+   bool initialized_ = false;
+ 
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 83c181c..e3ebf08 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -4,7 +4,11 @@
+ 
+ #import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+ 
++#import <Foundation/Foundation.h>
++
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/base_paths.h"
+ #include "base/check.h"
+@@ -13,6 +17,7 @@
+ #include "base/functional/callback.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
++#include "base/strings/sys_string_conversions.h"
+ #include "base/version.h"
+ #include "components/application_locale_storage/application_locale_storage.h"
+ #include "components/crx_file/id_util.h"
+@@ -33,6 +38,7 @@
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+ #include "extensions/browser/browser_context_keyed_service_factories.h"
+ #include "extensions/browser/event_router.h"
++#include "extensions/browser/disable_reason.h"
+ #include "extensions/browser/extension_host_delegate.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registrar.h"
+@@ -40,10 +46,12 @@
+ #include "extensions/browser/extension_system.h"
+ #include "extensions/browser/extensions_browser_interface_binders.h"
+ #include "extensions/browser/load_error_reporter.h"
++#include "extensions/browser/management_policy.h"
+ #include "extensions/browser/permissions_manager.h"
+ #include "extensions/browser/pref_names.h"
+ #include "extensions/browser/url_request_util.h"
+ #include "extensions/common/extension.h"
++#include "extensions/common/extension_set.h"
+ #include "extensions/common/features/feature_channel.h"
+ #include "extensions/common/manifest_handlers/background_info.h"
+ #include "extensions/common/manifest_handlers/manifest_url_handlers.h"
+@@ -59,8 +67,118 @@
+ #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+ #include "url/gurl.h"
+ 
++// Frozen V1 ObjC runtime bridge contract (~12 lines) for embedded UI helpers.
++@protocol CrIOSExtensionManagingV1 <NSObject>
++- (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
++    (NSError* __autoreleasing*)error;
++- (BOOL)setExtensionWithID:(NSString*)extensionId
++                   enabled:(BOOL)enabled
++                     error:(NSError* __autoreleasing*)error;
++@end
++
++@interface CrIOSExtensionManagerV1 : NSObject <CrIOSExtensionManagingV1>
+++ (instancetype)sharedManager;
++@end
++
+ namespace {
+ 
++NSString* const kCrIOSExtensionManagerErrorDomain =
++    @"CrIOSExtensionManagerErrorDomain";
++
++enum CrIOSExtensionManagerErrorCode : NSInteger {
++  kCrIOSExtensionManagerErrorNotMainThread = 1,
++  kCrIOSExtensionManagerErrorNotInitializedOrShuttingDown = 2,
++  kCrIOSExtensionManagerErrorNoActiveContext = 3,
++  kCrIOSExtensionManagerErrorMultipleContexts = 4,
++  kCrIOSExtensionManagerErrorSystemNotReady = 5,
++  kCrIOSExtensionManagerErrorInvalidArgument = 6,
++  kCrIOSExtensionManagerErrorNotFound = 7,
++  kCrIOSExtensionManagerErrorPolicyDenied = 8,
++  kCrIOSExtensionManagerErrorStateChangeFailed = 9,
++};
++
++void SetBridgeError(NSError* __autoreleasing* error,
++                    NSInteger code,
++                    NSString* description) {
++  if (error) {
++    *error = [NSError
++        errorWithDomain:kCrIOSExtensionManagerErrorDomain
++                   code:code
++               userInfo:@{NSLocalizedDescriptionKey : description ?: @""}];
++  }
++}
++
++bool ResolveExtensionServices(content::BrowserContext** out_context,
++                              extensions::ExtensionSystem** out_system,
++                              extensions::ExtensionRegistry** out_registry,
++                              extensions::ExtensionRegistrar** out_registrar,
++                              NSError* __autoreleasing* error) {
++  if (![NSThread isMainThread] ||
++      !content::BrowserThread::IsThreadInitialized(
++          content::BrowserThread::UI) ||
++      !content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
++    SetBridgeError(
++        error, kCrIOSExtensionManagerErrorNotMainThread,
++        @"CrIOSExtensionManagerV1 must be called on the main UI thread.");
++    return false;
++  }
++
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  if (!client || extensions::ExtensionsBrowserClient::Get() != client ||
++      client->IsShuttingDown()) {
++    SetBridgeError(
++        error, kCrIOSExtensionManagerErrorNotInitializedOrShuttingDown,
++        @"Extension browser client is not active or is shutting down.");
++    return false;
++  }
++
++  std::vector<content::BrowserContext*> valid_contexts;
++  for (content::BrowserContext* candidate :
++       client->GetRegisteredContextsSnapshot()) {
++    if (candidate && !candidate->IsOffTheRecord() &&
++        client->IsValidContext(candidate)) {
++      valid_contexts.push_back(candidate);
++    }
++  }
++  if (valid_contexts.empty()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNoActiveContext,
++                   @"No valid non-OTR extension browser context is registered.");
++    return false;
++  }
++  if (valid_contexts.size() > 1) {
++    SetBridgeError(
++        error, kCrIOSExtensionManagerErrorMultipleContexts,
++        @"Multiple registered non-OTR extension browser contexts exist.");
++    return false;
++  }
++
++  content::BrowserContext* context = valid_contexts.front();
++  extensions::ExtensionSystem* system =
++      extensions::ExtensionSystem::Get(context);
++  if (!system || !system->is_ready() || !system->management_policy()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"ExtensionSystem is not ready.");
++    return false;
++  }
++
++  extensions::ExtensionRegistry* registry =
++      extensions::ExtensionRegistry::Get(context);
++  extensions::ExtensionRegistrar* registrar =
++      extensions::ExtensionRegistrar::Get(context);
++  if (!registry || !registrar || !registrar->IsInitialized() ||
++      !registrar->extensions_enabled()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"ExtensionRegistry or ExtensionRegistrar is not ready.");
++    return false;
++  }
++
++  *out_context = context;
++  *out_system = system;
++  *out_registry = registry;
++  *out_registrar = registrar;
++  return true;
++}
++
+ void EnsureIOSExtensionFactoriesBuilt() {
+   static const bool factories_built = [] {
+     extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
+@@ -157,6 +275,7 @@ bool RestartDevice(std::string* error_message) override {
+ }
+ 
+ void InitializeIOSExtensionsBrowserClient() {
++  (void)[CrIOSExtensionManagerV1 class];
+   auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
+   if (extensions::ExtensionsBrowserClient::Get() != client) {
+     extensions::ExtensionsBrowserClient::Set(client);
+@@ -763,3 +882,120 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+ }
+ 
+ }  // namespace extensions
++
++@implementation CrIOSExtensionManagerV1
++
+++ (instancetype)sharedManager {
++  static CrIOSExtensionManagerV1* instance = nil;
++  static dispatch_once_t once_token;
++  dispatch_once(&once_token, ^{
++    instance = [[self alloc] init];
++  });
++  return instance;
++}
++
++- (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
++    (NSError* __autoreleasing*)error {
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++
++  const extensions::ExtensionSet installed =
++      registry->GenerateInstalledExtensionsSet();
++  NSMutableArray<NSDictionary<NSString*, id>*>* items =
++      [NSMutableArray arrayWithCapacity:installed.size()];
++  for (const scoped_refptr<const extensions::Extension>& extension :
++       installed) {
++    if (!extension) {
++      continue;
++    }
++    NSString* ext_id = base::SysUTF8ToNSString(extension->id()) ?: @"";
++    NSString* ext_name = base::SysUTF8ToNSString(extension->name()) ?: @"";
++    NSString* ext_version =
++        base::SysUTF8ToNSString(extension->VersionString()) ?: @"";
++    const BOOL is_enabled =
++        registrar->IsExtensionEnabled(extension->id()) ? YES : NO;
++    [items addObject:@{
++      @"id" : [ext_id copy],
++      @"name" : [ext_name copy],
++      @"version" : [ext_version copy],
++      @"enabled" : @(is_enabled),
++    }];
++  }
++  return [items copy];
++}
++
++- (BOOL)setExtensionWithID:(NSString*)extensionId
++                   enabled:(BOOL)enabled
++                     error:(NSError* __autoreleasing*)error {
++  if (![extensionId isKindOfClass:[NSString class]] ||
++      extensionId.length == 0) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorInvalidArgument,
++                   @"Extension ID must be a non-empty string.");
++    return NO;
++  }
++
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return NO;
++  }
++
++  const std::string ext_id = base::SysNSStringToUTF8(extensionId);
++  const extensions::Extension* extension =
++      registry->GetInstalledExtension(ext_id);
++  if (!extension) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension is not installed in the active context.");
++    return NO;
++  }
++
++  extensions::ManagementPolicy* policy = system->management_policy();
++  std::u16string policy_error;
++  if (!policy->UserMayModifySettings(extension, &policy_error)) {
++    NSString* detail = policy_error.empty()
++                           ? @"Extension settings may not be modified by policy."
++                           : base::SysUTF16ToNSString(policy_error);
++    SetBridgeError(error, kCrIOSExtensionManagerErrorPolicyDenied, detail);
++    return NO;
++  }
++
++  if (enabled) {
++    if (policy->MustRemainDisabled(extension, nullptr)) {
++      SetBridgeError(error, kCrIOSExtensionManagerErrorPolicyDenied,
++                     @"Extension must remain disabled by policy.");
++      return NO;
++    }
++    registrar->EnableExtension(extension->id());
++  } else {
++    if (policy->MustRemainEnabled(extension, &policy_error)) {
++      NSString* detail = policy_error.empty()
++                             ? @"Extension must remain enabled by policy."
++                             : base::SysUTF16ToNSString(policy_error);
++      SetBridgeError(error, kCrIOSExtensionManagerErrorPolicyDenied, detail);
++      return NO;
++    }
++    registrar->DisableExtension(
++        extension->id(), {extensions::disable_reason::DISABLE_USER_ACTION});
++  }
++
++  const BOOL actual_enabled =
++      registrar->IsExtensionEnabled(extension->id()) ? YES : NO;
++  if (actual_enabled != (enabled ? YES : NO)) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorStateChangeFailed,
++                   enabled ? @"Extension could not be enabled."
++                           : @"Extension could not be disabled.");
++    return NO;
++  }
++  return YES;
++}
++
++@end
