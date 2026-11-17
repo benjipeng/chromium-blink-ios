@@ -46,3 +46,4 @@
 0054-ios-extensions-service-lifetime-order.patch
 0055-ios-extensions-include-boundaries.patch
 0056-ios-production-gn-query-roots.patch
+0057-ios-extensions-core-schema-platform-compat.patch

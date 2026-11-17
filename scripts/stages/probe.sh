@@ -34,6 +34,21 @@ obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system_factory.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_web_contents_observer.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_client.o
+obj/components/policy/core/common/internal/policy_merger.o
+obj/extensions/common/common/command.o
+obj/extensions/common/common/content_script_utils.o
+obj/extensions/common/common/script_serialization.o
+obj/extensions/common/common/content_scripts_handler.o
+obj/extensions/common/common/icon_variants_handler.o
+obj/extensions/browser/browser_sources/execute_code_function.o
+obj/extensions/browser/browser_sources/extension_user_script_loader.o
+obj/extensions/browser/browser_sources/script_executor.o
+obj/extensions/browser/browser_sources/scripting_utils.o
+obj/extensions/browser/browser_sources/user_script_manager.o
+obj/extensions/browser/api/api_registration/generated_api_registration.o
+obj/extensions/browser/api/scripting/scripting/scripting_api.o
+obj/extensions/browser/api/user_scripts/user_scripts/user_scripts_api.o
+obj/extensions/browser/api/system_info/system_info/system_info_provider.o
 EOF
   python3 - <<'PY'
 import os
