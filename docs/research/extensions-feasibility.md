@@ -8,96 +8,44 @@
 
 ## Executive Summary
 
-### Diagnostic Simulator milestone passed (including detached restart) & `0060`–`0062` compile probe succeeded (`44088941518`)
+### Snapshot Matrix (Current Reality as of Run `44107240450` / `e5d03a4`)
 
-- **Demonstrated Simulator runtime milestone (`PID 47357` & detached `PID 55921`):** On the
-  `vtool`-retargeted iPhone Duo CoreSimulator derivative (`C229AC75-8053-4B7F-A2F8-DFE983E26C13`,
-  `com.benjipeng.chromiumblink.chrome.ios.extprobe`) with the two startup fixes patched
-  persistently in `chrome_framework` (`WebstorePrivateApi::EnsureAssociatedFactoryBuilt`
-  returning early and a `112` B trampoline registering `extensions.user_permissions`,
-  `last_restart_was_due_to_delayed_restart_api`, and `last_restart_after_delay_time`
-  with all Pref `CHECK`s active), the app cleared startup and onboarding, loaded
-  `https://example.com/`, verified `chrome.runtime.id` and `chrome.runtime.getManifest()`,
-  logged `[1117/075723.361297:INFO:CONSOLE:22] "CHROMIUM_IOS_EXTENSION_PROBE ilpkfbhghnmiapddaoenpemkcjeknbbo"`
-  from `chrome-extension://ilpkfbhghnmiapddaoenpemkcjeknbbo/content.js`, and rendered the
-  green DOM badge (`example-extension-badge.png`). After detaching and exiting LLDB and
-  terminating `PID 47357`, a fresh launch without any debugger (`PID 55921`) repeated
-  `[1117/080151.419935:INFO:CONSOLE:22] "CHROMIUM_IOS_EXTENSION_PROBE ilpkfbhghnmiapddaoenpemkcjeknbbo"`
-  in restart stderr and visibly re-rendered the green DOM badge (`detached-restart-extension.png`);
-  AXe first observed SpringBoard at `3.052s` (`PID 57486`) and test-app readiness at
-  `8.109s` (`PID 55921`, an observational upper bound including `simctl` and AXe overhead on
-  a post-onboarding process restart, not a cold-install benchmark).
-- **Consolidated `0060`–`0062` narrow compile probe ([run 44088941518](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44088941518), `2f769b4`):**
-  Passed `scripts/check_remote_patches.py` across all `53` patches against `119` pinned
-  upstream files (`3,383,732` bytes), passed the codegen contract (`47,345` codegen roots,
-  `11,143` edges in closure, `0` required-but-unplanned inputs vs. baseline `43944365971`
-  `43,247` filtered roots), and compiled all `35` verified device objects (`[3430/3430]`,
-  `811 / 813` direct `ccache` hits, `99.75%`, `2` misses) including
-  `api_browser_context_keyed_service_factories.o`, `generated_api_registration.o`,
-  `ios_extensions_browser_client.o`, and `ios_extension_system.o` (uploading `graph-diagnosis`
-  artifact `14331527430`, `9,568,116` bytes).
-- **Distinction between verified vs. source-reviewed changes:**
-  - **Demonstrated in Simulator (diagnostic binary copy, with LLDB & detached restart):**
-    `0060` (`webstorePrivate` startup bypass) and `0061` (`PermissionsManager::RegisterProfilePrefs`
-    and `RuntimeAPI::RegisterPrefs` registration before `CreateProfilePrefs` / `CreateProfileServices`),
-    plus bundled `https://example.com/*` content-script injection, `chrome.runtime.id`,
-    `getManifest()`, and DOM badge rendering.
-  - **Compile-verified & source-reviewed only (not yet `chrome.storage` API runtime-verified):**
-    `0062` (`0062-ios-extensions-create-stores-in-system-ctor.patch`) moves `store_factory_`,
-    `state_store_`, `rules_store_`, and `dynamic_user_scripts_store_` creation from
-    `IOSExtensionSystem::InitForRegularProfile()` into `IOSExtensionSystem::IOSExtensionSystem()`
-    (keeping `deferred_load=false`, matching `StateStore::Init()` which only calls
-    `task_queue_->SetReady()`, and relying on `IOSExtensionSystemFactory`'s existing
-    `ExtensionPrefsFactory` and `ExtensionRegistryFactory` dependencies). This prevents
-    `StorageFrontend` (`storage_frontend.cc:231-255`) from caching a null `store_factory_`
-    in `LocalValueStoreCache` and prevents `RulesRegistryService` (`rules_cache_delegate.cc:79-86`)
-    from observing a null `rules_store_` during `CreateBrowserContextServices()`.
-  - **Source-reviewed only (consolidated for narrow compile probe, no full IPA built yet):**
-    - `0063` (`0063-ios-extensions-objc-manager-and-disable-prefs.patch`) adds the frozen
-      2-method Objective-C runtime bridge (`@protocol CrIOSExtensionManagingV1` and
-      private-visibility `@interface CrIOSExtensionManagerV1 +sharedManager` in
-      `ios_extensions_browser_client.mm`, retained in `__objc_classlist` without C export
-      changes) and overrides `IOSExtensionSystem::RegistrarDelegate::GetDisableReasonsOnInstalled()`
-      via `ExtensionRegistrar::GetDisableReasonsOnInstalled()` so cold-start `UnpackedInstaller`
-      reloads preserve existing `ExtensionPrefs` disable reasons instead of resetting to `{}`.
-    - `0064` (`0064-ios-extensions-dnr-network-hook-and-staging.patch`) adds generic static
-      DNR network interception and writable profile staging:
-      1. Overrides the 15-arg `IOSContentBrowserClient::WillCreateURLLoaderFactory()` to
-         call `WebRequestAPI::MaybeProxyURLLoaderFactory()` (with `IsValidContext` gating
-         and `*bypass_redirect_checks = use_proxy_for_web_request`, preserving DNS/override
-         outputs).
-      2. Orders `UserPrefs::Set` and `BrowserContextDependencyManager::MarkBrowserContextLive`
-         before `RegisterBrowserContext` in `InitializeIOSExtensionsForProfile()`.
-      3. Adds RSA `"key"` (`kIOSBundledExtensionId = "bbbobhphejdilhlbomegeajcfbkbkfon"`)
-         and a 1-rule static DNR ruleset (`rules_1.json`, blocking `/dnr-probe-blocked.js`
-         for `127.0.0.1` / `localhost` `script` and `xmlhttprequest` requests, keeping
-         content scripts and no service worker) to `ios_probe`, preseeds only the known ID
-         in `IOSExtensionsBrowserClient` constructor, clears old allowlist sets in
-         `SetAllowedBundledExtension()`, and restages the fixture each cold start into
-         writable `<ProfilePath>/bundled_extensions/ios_probe` via absent `.ios_probe.tmp`
-         with `0755`/`0644` permissions and post-move canonicalization.
-      4. Extends `scripts/stages/probe.sh` with the 6 retained-graph `WebRequest`/DNR `.o`
-         targets (`web_request_api.o`, `web_request_proxying_url_loader_factory.o`,
-         `extension_web_request_event_router.o`, `rules_monitor_service.o`,
-         `ruleset_manager.o`, `declarative_net_request_api.o`), updates
-         `scripts/package_ipa.sh` to verify `rules_1.json`, and checks `ios_probe`
-         key-derived ID parity in `scripts/check_remote_patches.py`.
-  - **Still unverified / unbuilt:** A clean source-rebuilt IPA incorporating `0060`–`0064`
-    has not yet been built; static DNR runtime blocking, `0063` bridge/disable-persistence
-    runtime behavior, `chrome.storage` API calls, arbitrary third-party extensions,
-    `chrome://extensions` / extension management UI, MV3 service workers, and physical
-    iPhone execution remain unverified.
-- **Prior startup failure & CI preflight receipts:**
-  - Initial `vtool` derivative crash (`Chromium-2026-11-17-070110.ips`, PID `21174`, `SIGSEGV`
-    in `PendingApprovalsShutdownNotifierFactory`) resolved by `0060` (narrow compile probe
-    [run 44080808519](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44080808519)
-    `success`, 811/813 `ccache` direct hits).
-  - Second startup abort (`FATAL components/prefs/pref_service.cc:690 unregistered pref
-    extensions.user_permissions`, PID `25608` under LLDB) resolved by `0061`; full IPA
-    [run 44080812979](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44080812979)
-    was cancelled in `1 Codegen (Linux)` and [run 44084451425](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44084451425)
-    exposed a preflight bug in `scripts/check_remote_patches.py` (fixed in `f2ccdc4` by
-    excluding files introduced earlier in `patches/series` from upstream GitHub fetches).
+| Snapshot | Scope Included | Proven Status | Remaining / Unproven |
+| :--- | :--- | :--- | :--- |
+| **Installed diagnostic Simulator app** (`25552fd` base + local binary patches + prototype UI) | `0060`/`0061` binary patches, `ios_probe` content-script fixture (`content.js` + `manifest.json`, no DNR rules), prototype `ChromiumExtensionsUI` | **Simulator runtime proven:** startup, `https://example.com/*` content-script injection, `chrome.runtime.id`/`getManifest()`, DOM badge, detached restart (`PID 55921`), and UI toggle (`PID 94392`) | Does not include `0062`–`0064`, DNR interception, or `CrIOSExtensionManagerV1` core bridge |
+| **Current GitHub snapshot** (`e5d03a4`, `build-ipa.yml` [run 44107240450](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44107240450), artifact `14345375150`) | Source `0060`–`0064` + `helpers/extensions_ui` (`CrIOSExtensionManagerV1` production framework) + 1-rule `ios_probe` static DNR fixture (`rules_1.json`) | **Compiled, linked, symbol-verified, and IPA-packaged:** all 18 shards, zero-recompile `4 Link`, `5 Package IPA` Mach-O/dylib/`--deep --strict` codesign gates passed | **Runtime pending** in Simulator: static DNR blocking, `CrIOSExtensionManagerV1` bridge, disable-reason persistence, and `chrome.storage` not yet exercised on this IPA |
+| **Headless uBOL / real `UnpackedInstaller` experiment** (separate, **not** in `44107240450`) | Real `UnpackedInstaller` loading of official ~9 MB uBOL package | **Not in active build** | Blocked by strict `ios_probe` single-fixture allowlist and unimplemented MV3 service-worker hooks; uBOL install, runtime, and ad-blocking are unproven |
+
+### Full Source-Rebuilt IPA Receipt (`e5d03a4`, Run `44107240450`)
+
+- **Workflow & inputs:** `build-ipa.yml` on `probe/extensions-gn` (`e5d03a4ae8848f15feb44e24adff2d414d2a7c89`), `with_app_groups=false`, `publish_release=false`, `inject_failure=none`, `shards=''` (18 shards), concluding **`success`**.
+- **Stage keys, cache hits, and checkpoints:**
+  - `0 SDK stub (Mac)` (`27A9275-22b39adc55cd`): **reused** (`skipped`, `need_sdk=false`).
+  - `1 Codegen (Linux)` (`c46285f394090979b9e4`, job `134123066896`): `success`; `47,345` codegen roots (`11,143` edges in closure, `26` Apple edges, `32,751` generated inputs required, `0` unplanned); `ccache` **`6,715 / 6,715` (`100.0%`, `6,715` direct, `0` misses)**; OCI `sha256:d4a98b828223850a68bff100051d177211027e3faf041b055aed1c634e2b7b33`.
+  - `2 Apple tools (Mac)` (`3f3c08e4d8076496756b`, job `134140135755`): `success`; `26` Apple tool targets (`17,405` generated inputs required, `286` bundle-ordering-only); `apple_tool_cache.tar.zst` (`36.7 MiB -> 17.0 MiB`); OCI `sha256:8e118b08ae7921d7540d91ea2b15e80c9b9c5b937cac9d47d5decd2f94a5e18b`.
+  - `3 Compile × 18 (Linux)` (`8bd3dac7f997bd5a991f`): **`18 / 18` shards `success`**; combined `ccache` **`37,580 / 37,590` (`99.97%`, `37,578` direct, `2` preprocessed, `10` misses)**.
+  - `4 Link (Linux)` (`e887ede3f9132152a8a5`, job `134159927090`): `success`; **`37,480` verified imported objects** replaced their compile edges across all 18 shards (`106,199` edges loaded); **zero-recompile gate passed** (`0` `C`/`C++`/`ObjC`/`ASM`/`Rust` compile edges across `2,762` link-stage edges); `bundled_extensions/ios_probe/{content.js,manifest.json,rules_1.json}` copied; OCI `sha256:75cfbc8c52e727149d71c837a80fe2447dd4e0fa9a78a32e5d9bd9b328a2b2f3`.
+  - `5 Package IPA (Mac)` (`59aab9a3c03d55653e6c`, job `134165825348`): `success`; verified `CrIOSExtensionManagerV1` availability in `chrome_framework`, built production `ChromiumExtensionsUI` (`arm64`, `platform IOS`, `minos 26.0`, `sdk 27.1`, `78,944` B), appended strong `LC_LOAD_DYLIB` (`88` B, `@rpath/ChromiumExtensionsUI.framework/ChromiumExtensionsUI`) after `libSystem.B.dylib` preserving `EarlyMallocZoneRegistration`-first load order, ad-hoc signed nested frameworks then outer `.app` (`with_app_groups=false`), and passed `codesign --verify --deep --strict`. Final `Chromium.app` size `415M`.
+- **Artifact & linked Mach-O verification (`Chromium-Blink-159.0.8149.0-arm64`, ID [`14345375150`](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44107240450/artifacts/14345375150)):**
+  - Zip size `146,731,499` bytes (`sha256:fece2b8900f2a75c732f6b2cdc3ad5103a4e665bf4dfbe9488de7a820e50d9cf`); extracted `Chromium-Blink-159.0.8149.0-arm64.ipa` `147,008,421` bytes (`140M`, `sha256:2ec447e3293fc5bd0af0a7f5f5e63f13c42ee3c29c79be17c5cdf22ed5f93c32`).
+  - `Payload/Chromium.app/bundled_extensions/ios_probe/` contains `content.js` (`1024` B), `manifest.json` (`811` B), and `rules_1.json` (`312` B).
+  - `chrome_framework` `nm -U` / `otool -oV` confirmed linked (non-dead-stripped) DNR and V1 symbols: `WebRequestAPI::MaybeProxyURLLoaderFactory` (`3` symbols), `WebRequestProxyingURLLoaderFactory::InProgressRequest` (`125` symbols), `declarative_net_request::RulesetManager` (`40` symbols, including `EvaluateRequestInternal` and `EvaluateRequestWithHeaders`), `IOSContentBrowserClient::WillCreateURLLoaderFactory`, `declarative_net_request::RulesMonitorService` (`115` symbols), and `CrIOSExtensionManagerV1` (`14` symbols plus `__OBJC_$_CLASS_METHODS_CrIOSExtensionManagerV1`, `__OBJC_$_INSTANCE_METHODS_CrIOSExtensionManagerV1`, and `__OBJC_CLASS_PROTOCOLS_$_CrIOSExtensionManagerV1`).
+- **Pre-full-run receipts (`0060`–`0064` + package isolation):**
+  - `0060`–`0062` narrow compile probe ([run 44088941518](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44088941518), `2f769b4`): `success` (`[3430/3430]`, `811 / 813` direct `ccache` hits, `99.75%`).
+  - `0063`–`0064` narrow compile probe ([run 44103825076](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44103825076), `532870d`): `success` (`[3436/3436]`), adding the 6 retained-graph `WebRequest`/DNR `.o` targets (`web_request_api.o`, `web_request_proxying_url_loader_factory.o`, `extension_web_request_event_router.o`, `rules_monitor_service.o`, `ruleset_manager.o`, `declarative_net_request_api.o`).
+  - Package-only hybrid UI commits (`f2dff1b`, `e5d03a4`): moved canonical helper into `helpers/extensions_ui/`, isolated `k_package` (`helpers/extensions_ui` + `scripts/package_ipa.sh` + `scripts/stages/package.sh` + `=xcode:{XCODE_BUILD}` + `=prefix:{BUNDLE_ID_PREFIX}` + immutable `=link:{k_link}`) so helper/flag edits re-key only `5 Package IPA`, and verified `python3 scripts/plan_pipeline.py check`.
+- **Diagnostic Simulator & prior startup-failure receipts:**
+  - `vtool`-retargeted iPhone Duo CoreSimulator derivative (`C229AC75-8053-4B7F-A2F8-DFE983E26C13`, `com.benjipeng.chromiumblink.chrome.ios.extprobe`) with persistent binary patches (`WebstorePrivateApi::EnsureAssociatedFactoryBuilt` early `RET` and `112` B `RegisterIOSExtensionPrefs` trampoline) cleared startup (`PID 47357`) and detached restart without LLDB (`PID 55921`, `3.052s` SpringBoard / `8.109s` test-app readiness upper bound including `simctl` + AXe overhead), emitting `CHROMIUM_IOS_EXTENSION_PROBE ilpkfbhghnmiapddaoenpemkcjeknbbo` and rendering the green DOM badge (`example-extension-badge.png`, `detached-restart-extension.png`).
+  - Prior startup crashes (`Chromium-2026-11-17-070110.ips` `SIGSEGV` in `PendingApprovalsShutdownNotifierFactory`; `FATAL components/prefs/pref_service.cc:690` unregistered `extensions.user_permissions`) were resolved by `0060`–`0061`; the `44084451425` preflight 404 in `scripts/check_remote_patches.py` was fixed in `f2ccdc4`.
+
+### Read-Only MV3 Service Worker Gap Analysis (Not in `44107240450`)
+
+- **Not blockers:** `GetProcessManagerDelegate() == nullptr` does not block MV3 service workers (`ProcessManager::CreateBackgroundHost()` null-checks it and is legacy background-host-only). `BaseContentBrowserClient::AllowServiceWorker`, `MayDeleteServiceWorkerRegistration`, and `ShouldTryToUpdateServiceWorkerRegistration` already permit service workers by default without redundant iOS overrides.
+- **Required hooks for future MV3 SW milestone:**
+  1. Renderer: forward the 4 service-worker context/lifecycle callbacks (`DidInitializeServiceWorkerContextOnWorkerThread`, `WillEvaluateServiceWorkerOnWorkerThread`, `DidStartServiceWorkerContextOnWorkerThread`, `WillDestroyServiceWorkerContextOnWorkerThread`) in `IOSContentRendererClient` to `extensions::Dispatcher`.
+  2. Browser: implement the 2 non-network worker / service-worker script `URLLoaderFactory` hooks and `OverrideURLLoaderFactoryParams` forwarding to `extensions::URLLoaderFactoryManager` (including `ignore_factory_reset` for service workers).
+  3. Gate: replace/extend the strict `noSW` / single-fixture check with a controlled single-extension SW allowlist gate.
+- **Additional uBOL dependency:** Even with MV3 service workers active, uBOL separately relies on `chrome.commands.onCommand` module-evaluation support.
 
 ### Implementation checkpoint (November 16)
 
