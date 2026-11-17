@@ -1,19 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: BP <11394934+benjipeng@users.noreply.github.com>
-Date: Tue, 17 Nov 2026 15:11:57 -0500
-Subject: [PATCH] 0069
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: expose optionsPageURL, navigation throttle, and WebPrefs
 
 ---
- .../model/ios_extensions_browser_client.mm    |  29 +++-
- .../init/ios_content_browser_client.cc        | 136 ++++++++++++++++++
- .../content/init/ios_content_browser_client.h |  13 ++
- 3 files changed, 172 insertions(+), 6 deletions(-)
-
 diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
-index 194b294..c14e6a6 100644
+index 33be11e..6c2d559 100644
 --- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
 +++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
-@@ -50,6 +50,7 @@
+@@ -51,6 +51,7 @@
  #include "extensions/browser/extension_registrar.h"
  #include "extensions/browser/extension_registry.h"
  #include "extensions/browser/extension_file_task_runner.h"
@@ -21,15 +15,15 @@ index 194b294..c14e6a6 100644
  #include "extensions/browser/extension_system.h"
  #include "extensions/browser/extensions_browser_interface_binders.h"
  #include "extensions/browser/load_error_reporter.h"
-@@ -65,6 +66,7 @@
+@@ -66,6 +67,7 @@
  #include "extensions/common/features/feature_channel.h"
  #include "extensions/common/manifest_handlers/background_info.h"
  #include "extensions/common/manifest_handlers/manifest_url_handlers.h"
 +#include "extensions/common/manifest_handlers/options_page_info.h"
  #include "extensions/common/mojom/manifest.mojom-shared.h"
  #include "extensions/common/switches.h"
- #include "ios/chrome/browser/extensions/model/ios_command_service.h"
-@@ -141,12 +143,26 @@ void SetBridgeError(NSError* __autoreleasing* error,
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
+@@ -145,12 +147,26 @@ void SetBridgeError(NSError* __autoreleasing* error,
        base::SysUTF8ToNSString(extension->VersionString()) ?: @"";
    const BOOL is_enabled =
        registrar->IsExtensionEnabled(extension->id()) ? YES : NO;
@@ -61,17 +55,17 @@ index 194b294..c14e6a6 100644
 +  return [entry copy];
  }
  
- using InstallCompletionCallback =
-@@ -302,6 +318,7 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+ base::flat_set<base::FilePath>& InFlightTrustedInstalls() {
+@@ -311,6 +327,7 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
  void EnsureIOSExtensionFactoriesBuilt() {
    static const bool factories_built = [] {
      extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
 +    extensions::ExtensionHostRegistry::GetFactory();
      extensions::IOSExtensionSystemFactory::GetInstance();
-     extensions::IOSCommandService::GetFactoryInstance();
      return true;
+   }();
 diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
-index 4802f82..042aa56 100644
+index 4802f82..bec4760 100644
 --- a/ios/web/content/init/ios_content_browser_client.cc
 +++ b/ios/web/content/init/ios_content_browser_client.cc
 @@ -8,6 +8,8 @@
@@ -93,18 +87,17 @@ index 4802f82..042aa56 100644
  #include "extensions/browser/extension_registry.h"
  #include "extensions/browser/extension_web_contents_observer.h"
  #include "extensions/browser/extensions_browser_client.h"
-@@ -26,6 +30,10 @@
+@@ -26,6 +30,9 @@
  #include "extensions/browser/url_loader_factory_manager.h"
  #include "extensions/browser/service_worker/service_worker_host.h"
  #include "extensions/common/constants.h"
 +#include "extensions/common/extension.h"
 +#include "extensions/common/extension_id.h"
 +#include "extensions/common/extension_set.h"
-+#include "extensions/common/manifest_handlers/sandboxed_page_info.h"
  #include "extensions/common/mojom/event_router.mojom.h"
  #include "extensions/common/mojom/frame.mojom.h"
  #include "extensions/common/mojom/renderer_host.mojom.h"
-@@ -134,6 +142,40 @@ CreateWebUIURLLoaderFactory(content::BrowserContext* context) {
+@@ -134,6 +141,40 @@ CreateWebUIURLLoaderFactory(content::BrowserContext* context) {
    return factory;
  }
  
@@ -145,7 +138,7 @@ index 4802f82..042aa56 100644
  }  // namespace
  
  bool IOSContentBrowserClient::IsHandledURL(const GURL& url) {
-@@ -226,6 +268,9 @@ void IOSContentBrowserClient::OverrideWebPreferences(
+@@ -226,6 +267,9 @@ void IOSContentBrowserClient::OverrideWebPreferences(
    // mode). They were always light.
    prefs->preferred_color_scheme = GetWebColorScheme();
    prefs->preferred_root_scrollbar_color_scheme = prefs->preferred_color_scheme;
@@ -155,7 +148,7 @@ index 4802f82..042aa56 100644
  }
  
  bool IOSContentBrowserClient::
-@@ -308,6 +353,97 @@ void IOSContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
+@@ -308,6 +352,64 @@ void IOSContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
  }
  
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
@@ -194,39 +187,6 @@ index 4802f82..042aa56 100644
 +             effective_site_url) != nullptr;
 +}
 +
-+bool IOSContentBrowserClient::CanCommitURL(
-+    content::RenderProcessHost* process_host,
-+    const GURL& url) {
-+  if (!process_host) {
-+    return true;
-+  }
-+  content::BrowserContext* browser_context = process_host->GetBrowserContext();
-+  auto* client = extensions::ExtensionsBrowserClient::Get();
-+  if (!client || !browser_context || !client->IsValidContext(browser_context)) {
-+    return true;
-+  }
-+  extensions::ExtensionRegistry* registry =
-+      extensions::ExtensionRegistry::Get(browser_context);
-+  if (!registry || !url.SchemeIs(extensions::kExtensionScheme)) {
-+    return true;
-+  }
-+  const extensions::Extension* extension =
-+      registry->enabled_extensions().GetExtensionOrAppByURL(url);
-+  if (!extension) {
-+    return true;
-+  }
-+  extensions::ProcessMap* process_map =
-+      extensions::ProcessMap::Get(browser_context);
-+  if (process_map &&
-+      process_map->Contains(extension->id(), process_host->GetID())) {
-+    return true;
-+  }
-+  if (extensions::SandboxedPageInfo::IsSandboxedPage(extension, url.GetPath())) {
-+    return true;
-+  }
-+  return false;
-+}
-+
 +bool IOSContentBrowserClient::OverrideWebPreferencesAfterNavigation(
 +    content::WebContents* web_contents,
 +    content::SiteInstance& main_frame_site,
@@ -254,10 +214,10 @@ index 4802f82..042aa56 100644
      content::SiteInstance* site_instance) {
    if (!site_instance || !site_instance->HasProcess()) {
 diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
-index f04d1fb..d3210cd 100644
+index f04d1fb..6ac2605 100644
 --- a/ios/web/content/init/ios_content_browser_client.h
 +++ b/ios/web/content/init/ios_content_browser_client.h
-@@ -57,6 +57,19 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+@@ -57,6 +57,17 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
        const std::optional<url::Origin>& request_initiator_origin,
        NonNetworkURLLoaderFactoryMap* factories) override;
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
@@ -266,8 +226,6 @@ index f04d1fb..d3210cd 100644
 +  bool DoesSiteRequireDedicatedProcess(
 +      content::BrowserContext* browser_context,
 +      const GURL& effective_site_url) override;
-+  bool CanCommitURL(content::RenderProcessHost* process_host,
-+                    const GURL& url) override;
 +  bool OverrideWebPreferencesAfterNavigation(
 +      content::WebContents* web_contents,
 +      content::SiteInstance& main_frame_site,
