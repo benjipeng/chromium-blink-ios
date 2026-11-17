@@ -17,7 +17,7 @@ index e7eb2a3..09d4252 100644
      outputs = [
        "{{bundle_resources_dir}}/bundled_extensions/ios_probe/{{source_file_part}}",
 diff --git a/ios/chrome/app/resources/extensions/ios_probe/content.js b/ios/chrome/app/resources/extensions/ios_probe/content.js
-index 64da109..4dd4a4e 100644
+index 64da109..78404ea 100644
 --- a/ios/chrome/app/resources/extensions/ios_probe/content.js
 +++ b/ios/chrome/app/resources/extensions/ios_probe/content.js
 @@ -13,6 +13,7 @@
@@ -33,7 +33,7 @@ index 64da109..4dd4a4e 100644
    (document.body || document.documentElement).appendChild(badge);
    console.info('CHROMIUM_IOS_EXTENSION_PROBE', id);
 +
-+  const nonce = 'probe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
++  const nonce = 'probe_' + (globalThis.crypto?.randomUUID?.() || (Date.now() + '_' + Math.random().toString(36).slice(2, 10)));
 +  try {
 +    chrome.runtime.sendMessage({type: 'ios_probe_ping', nonce}, (reply) => {
 +      const lastErr = chrome.runtime.lastError;
@@ -120,10 +120,10 @@ index 2dda84d..48d4e33 100644
  }
 diff --git a/ios/chrome/app/resources/extensions/ios_probe/sw.js b/ios/chrome/app/resources/extensions/ios_probe/sw.js
 new file mode 100644
-index 0000000..45178ad
+index 0000000..06ca153
 --- /dev/null
 +++ b/ios/chrome/app/resources/extensions/ios_probe/sw.js
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,92 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -153,32 +153,38 @@ index 0000000..45178ad
 +      return;
 +    }
 +    const probeNonce =
-+        typeof message.nonce === 'string' ? message.nonce : 'default';
-+    const roundtripKey = 'ios_probe_last_ping';
-+    await chrome.storage.local.set({
-+      [roundtripKey]: {nonce: probeNonce, moduleMarker: SW_MODULE_MARKER},
-+    });
-+    const readback =
-+        await chrome.storage.local.get([STORAGE_KEY, roundtripKey]);
-+    const pingBack = readback?.[roundtripKey];
-+    const stateBack = readback?.[STORAGE_KEY];
-+    if (!pingBack || pingBack.nonce !== probeNonce ||
-+        pingBack.moduleMarker !== SW_MODULE_MARKER ||
-+        !stateBack || stateBack.moduleMarker !== SW_MODULE_MARKER) {
-+      sendResponse({
-+        ok: false,
-+        error: 'storage.local message roundtrip verification failed',
++        typeof message.nonce === 'string' && message.nonce.length > 0
++            ? message.nonce
++            : 'default_' + Math.random().toString(36).slice(2, 10);
++    const roundtripKey = 'ios_probe_ping_' + probeNonce;
++    try {
++      await chrome.storage.local.set({
++        [roundtripKey]: {nonce: probeNonce, moduleMarker: SW_MODULE_MARKER},
 +      });
-+      return;
++      const readback =
++          await chrome.storage.local.get([STORAGE_KEY, roundtripKey]);
++      const pingBack = readback?.[roundtripKey];
++      const stateBack = readback?.[STORAGE_KEY];
++      if (!pingBack || pingBack.nonce !== probeNonce ||
++          pingBack.moduleMarker !== SW_MODULE_MARKER ||
++          !stateBack || stateBack.moduleMarker !== SW_MODULE_MARKER) {
++        sendResponse({
++          ok: false,
++          error: 'storage.local message roundtrip verification failed',
++        });
++        return;
++      }
++      sendResponse({
++        ok: true,
++        runtimeId: chrome.runtime.id,
++        moduleMarker: SW_MODULE_MARKER,
++        bootCount: stateBack.bootCount,
++        echoNonce: pingBack.nonce,
++        senderUrl: sender?.url || null,
++      });
++    } finally {
++      await chrome.storage.local.remove(roundtripKey).catch(() => {});
 +    }
-+    sendResponse({
-+      ok: true,
-+      runtimeId: chrome.runtime.id,
-+      moduleMarker: SW_MODULE_MARKER,
-+      bootCount: stateBack.bootCount,
-+      echoNonce: pingBack.nonce,
-+      senderUrl: sender?.url || null,
-+    });
 +  })().catch((err) => {
 +    sendResponse({
 +      ok: false,
