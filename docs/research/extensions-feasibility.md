@@ -11,11 +11,11 @@
 ### Implementation checkpoint (November 16)
 
 The experimental branch contains actual common, renderer, browser, profile,
-and resource integration. The latest remote probe compiled **all 30 selected
-iOS objects**, including the embedder hooks and every object that failed in the
-first production compile. Production codegen and Apple tools have also passed.
-The final link and runtime behavior remain unverified; this is not yet a
-working extension-enabled IPA.
+and resource integration, and has now completed a full end-to-end production
+compile, link, and IPA package on `25552fd` ([run 44004466870](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44004466870)).
+Device sideloading and runtime verification remain pending; this establishes
+build/link/packaging readiness for the bundled `https://example.com/*`
+content-script fixture, not yet runtime execution on iOS.
 
 - Extension flags live in shared, hashed `args/device.gn` for Linux and Mac.
 - Common API/permission providers, renderer dispatcher/frame hooks, extension
@@ -143,6 +143,52 @@ matching unattached helper semantics and granting no tab-specific privileges. Un
 full `SetTabId` IPC and navigation/close cleanup are wired, `activeTab`, tab-ID
 scripting targets, `MessageSender.tab`, and `chrome.runtime` tab/window IDs remain
 unsupported on iOS while validating the bundled content-script fixture.
+
+### Link and IPA packaging checkpoint (`25552fd`)
+
+After [run 43998457806](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43998457806)
+(`e92328d`) passed Codegen (`6,715 / 6,715`), Apple tools, and 17 of 18 compile shards
+(`37,638` hits + `4` misses = `37,642` cacheable calls; `1` uncacheable, `11` ccache errors)
+but failed on shard 15 (`runtime_api.cc`: incomplete `content::WebContents` after guarding
+`session_tab_helper.h`), `0059` added an explicit `#include "content/public/browser/web_contents.h"`
+in `25552fd`. That revision passed the 34-object `graph-diagnose.yml` probe
+([run 44004726159](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44004726159),
+`[3522/3522]`, `808 / 814` cacheable hits) and then completed all stages of full IPA
+[run 44004466870](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44004466870):
+
+- **Codegen & Apple tools:** `1 Codegen (Linux)` (`133776442427`) hit `6,715 / 6,715` (`100.0%`,
+  `codegen-640f9d4b496a8a91876d` -> `sha256:3e3ed3c780c98bf4b681063598873286fdd1a97805b86da4f97404cc73387c94`);
+  `2 Apple tools (Mac)` (`133782943531`) persisted `apple-3d361daef8a91c6ad7c2` ->
+  `sha256:d4afe464c9c303eb4e14c43ce836a69fe28a3f4927bc9a35a39d6ef06db53c9b`.
+- **All 18 compile shards:** 18/18 succeeded with `37,642` hits and `1` miss (shard 15) across
+  `37,643` cacheable calls (`99.997%`), `0` uncacheable calls, and `11` non-fatal ccache errors
+  (`37,654` total calls).
+- **Zero-recompile link (`133794101975`):** Verified all 18 shard manifests (`37,533` imported objects
+  replaced their compile edges across `5,475` rewritten ninja files; `restored_work` confirmed
+  zero remaining compile, Rust, or host-tool edges in the `2,761`-step link plan), copied
+  `Chromium.app/bundled_extensions/ios_probe/{content.js,manifest.json}`, and persisted
+  `stage-cache:link-2f2c6f4a5ea86043bcd2` ->
+  `sha256:bbe1b764627ac6caa018ea788457b804204eb2bfd31df0564d32232c0bf13ee5`.
+- **Packaging & Mach-O validation (`133798522525`):** Removed unused `.appex` `Extensions/`,
+  verified `bundled_extensions/ios_probe/{manifest.json,content.js}` survived cleanup, validated
+  Mach-O headers for `Chromium` and `chrome_framework` (`arm64`, `platform IOS`, `minos 26.0`,
+  `sdk 27.1`), and uploaded artifact `Chromium-Blink-159.0.8149.0-arm64` (ID `14296203868`,
+  `145,930,009` bytes, expires `2026-12-17T03:37:10Z`, ZIP artifact digest
+  `sha256:3aed7c3817645124285f02028828b2605182ec67f49e8f59d889ce9c24763283`; inner
+  `Chromium-Blink-159.0.8149.0-arm64.ipa` SHA-256
+  `a0e40c0524e8d22c490776ee5a73970bd98b11a97ceb97e8a7c416eabb72858b`).
+
+**Remaining runtime and feature limitations:**
+- **Device execution unverified:** The packaged IPA has not been sideloaded or run on iOS hardware;
+  `https://example.com` content-script injection, renderer `WebViewCreated` helper lifecycle, and
+  `--single-process --jitless` stability remain to be verified on device.
+- **No tab/window identity or `activeTab`:** With `SessionTabHelper` absent on iOS (`0059` returns
+  `-1`), `activeTab`, tab-ID `scripting` targets, `MessageSender.tab`, and `chrome.runtime`
+  tab/window IDs remain unsupported until `SetTabId` IPC and navigation/close cleanup are wired.
+- **No MV3 service workers or platform-gated APIs:** Background hosts, MV3 service workers,
+  multi-extension security isolation, `chrome.system.cpu` (`0058`), `chrome.system.storage` (`0057`),
+  `ExtensionSettings` enterprise policy merging (`0057`), and native `chrome.commands` shortcut
+  registration remain unsupported.
 
 1. **Core-only graph generation and three representative iOS object compilations pass with two narrow dependency guards.** [Run 43940083679](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43940083679) (`442b330`) passed `gn gen` and the codegen contract with `enable_extensions_core = true`; [run 43944365971](https://github.com/benjipeng/chromium-blink-ios/actions/runs/43944365971) (`632a261`) also compiled `extension.cc`, `process_manager.cc`, and `dispatcher.cc`. Unpatched Chromium still fails. The full extensions libraries, embedder integration, linking, and runtime behavior remain unverified.
 2. **Turning on GN flags alone would not wire extensions into the browser anyway.** `benjipeng/chromium-blink-ios` builds `//ios/chrome/app:chrome`, which uses the `//ios/chrome/browser` embedder (`ProfileIOS`, `Browser`, `WebStateList`) rather than `//chrome/browser` (`Profile`, `BrowserWindowInterface`, `TabModel`). Desktop Android succeeded by running inside `//chrome/browser`, whereas `//chrome` asserts `!is_ios` in multiple GN files (`//chrome/BUILD.gn:77`, `//chrome/chrome_repack_locales.gni:10`).
