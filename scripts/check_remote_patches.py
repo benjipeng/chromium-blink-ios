@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -138,23 +140,26 @@ def main() -> int:
     lock = dict(line.split("=", 1) for line in (root / "version.lock").read_text().splitlines()
                 if "=" in line and not line.lstrip().startswith("#"))
     files = collect_upstream_files(root / "patches", root / "patches/series")
-    base = f"https://raw.githubusercontent.com/chromium/chromium/{lock['CHROMIUM_REV']}/"
+    base = f"https://chromium.googlesource.com/chromium/src/+/{lock['CHROMIUM_REV']}/"
     with tempfile.TemporaryDirectory(prefix="patch-preflight-") as directory:
         source = pathlib.Path(directory)
 
         def fetch(relative: str) -> int:
+            url = f"{base}{urllib.parse.quote(relative)}?format=TEXT"
             for attempt in range(3):
                 try:
-                    with urllib.request.urlopen(base + relative, timeout=30) as response:
-                        data = response.read()
-                    destination = source / relative
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(data)
-                    return len(data)
-                except OSError:
-                    if attempt == 2:
-                        raise
+                    with urllib.request.urlopen(url, timeout=30) as response:
+                        data = base64.b64decode(response.read(), validate=True)
+                except OSError as error:
+                    if attempt == 2 or (isinstance(error, urllib.error.HTTPError)
+                                        and error.code in (400, 401, 403, 404)):
+                        raise RuntimeError(f"Cannot fetch pinned file {relative}: {error}") from error
                     time.sleep(attempt + 1)
+                    continue
+                destination = source / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+                return len(data)
             raise AssertionError("unreachable")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
