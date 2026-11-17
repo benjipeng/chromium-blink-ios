@@ -50,7 +50,7 @@ STAGE_FILES = {
     "apple": ["scripts/stages/apple.sh", "scripts/bootstrap_macos_host_tools.sh"],
     "compile": ["scripts/stages/compile.sh", "scripts/shard_artifact.py"],
     "link": ["scripts/stages/link.sh", "scripts/shard_artifact.py"],
-    "package": ["scripts/stages/package.sh", "scripts/package_ipa.sh"],
+    "package": ["scripts/stages/package.sh", "scripts/package_ipa.sh", "helpers/extensions_ui"],
 }
 # Never part of a key: transport, reporting, budgets, audits, and the producers
 # of the source/SDK artifacts (which enter keys by digest instead).
@@ -81,7 +81,8 @@ def check_classification() -> None:
     on_disk = {p.relative_to(ROOT).as_posix() for d in ("scripts", "scripts/stages", "ci") for p in (ROOT / d).iterdir()
                if p.is_file() and p.name != "__pycache__" and not p.name.endswith(".pyc")}
     unclassified = sorted(on_disk - keyed - NON_OUTPUT)
-    stale = sorted((keyed | NON_OUTPUT) - on_disk - {"patches", "args"})
+    dir_inputs = {p for p in keyed if (p in {"patches", "args"} or p.startswith("helpers/")) and (ROOT / p).is_dir()}
+    stale = sorted((keyed | NON_OUTPUT) - on_disk - dir_inputs)
     if unclassified or stale:
         sys.exit(f"::error::plan_pipeline.py file classification is out of date: "
                  f"unclassified {unclassified}, missing {stale}")
@@ -166,13 +167,20 @@ def plan(repo: str, with_app_groups: str) -> None:
     k_apple = stage_key("apple", f"=codegen:{k_codegen}", f"=xcode:{lock['XCODE_BUILD']}")
     k_compile = stage_key("compile", f"=codegen:{k_codegen}", f"=apple:{k_apple}", f"=shards:{SHARD_COUNT}")
     k_link = stage_key("link", f"=compile:{k_compile}")
-    k_package = stage_key("package", f"=link:{k_link}", f"=app_groups:{with_app_groups}")
+    k_package = stage_key(
+        "package",
+        f"=link:{k_link}",
+        f"=app_groups:{with_app_groups}",
+        f"=xcode:{lock['XCODE_BUILD']}",
+        f"=prefix:{lock['BUNDLE_ID_PREFIX']}",
+    )
 
     cache = f"{refs.base}/stage-cache"
     codegen_ref, apple_ref, link_ref = f"{cache}:codegen-{k_codegen}", f"{cache}:apple-{k_apple}", f"{cache}:link-{k_link}"
     compile_prefix = f"{cache}:compile-{k_compile}"
 
-    has_link = exists(link_ref)
+    link_rc, link_sha = oci("resolve", link_ref)
+    has_link = link_rc == 0
     has_codegen = has_link or exists(codegen_ref)
     has_apple = has_link or exists(apple_ref)
     missing = [] if has_link else [i for i in range(SHARD_COUNT) if not exists(f"{compile_prefix}-{i}")]
@@ -202,7 +210,7 @@ def plan(repo: str, with_app_groups: str) -> None:
         "codegen_ref": codegen_ref,
         "apple_ref": apple_ref,
         "compile_prefix": compile_prefix,
-        "link_ref": link_ref,
+        "link_ref": refs.pinned(link_ref, link_sha) if has_link else link_ref,
         "ccache_repo": f"{refs.base}/chromium-ios-ccache",
         "shard_count": str(SHARD_COUNT),
         # A placeholder keeps the matrix valid when compile is skipped.
