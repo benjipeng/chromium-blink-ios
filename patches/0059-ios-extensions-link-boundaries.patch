@@ -80,7 +80,7 @@ diff --git a/extensions/browser/script_injection_tracker.cc b/extensions/browser
 diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/api/runtime/runtime_api.cc
 --- a/extensions/browser/api/runtime/runtime_api.cc
 +++ b/extensions/browser/api/runtime/runtime_api.cc
-@@ -25,9 +25,12 @@
+@@ -25,12 +25,16 @@
  #include "base/task/single_thread_task_runner.h"
  #include "base/values.h"
  #include "base/version.h"
@@ -93,7 +93,11 @@ diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/
  #include "components/user_prefs/user_prefs.h"
  #include "content/public/browser/browser_context.h"
  #include "content/public/browser/child_process_security_policy.h"
-@@ -1294,7 +1297,11 @@
++#include "content/public/browser/web_contents.h"
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+ #include "extensions/browser/blocklist_extension_prefs.h"
+ #include "extensions/browser/event_router.h"
+@@ -1294,7 +1298,11 @@
      return -1;
    }
  
@@ -105,7 +109,7 @@ diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/
  }
  
  int RuntimeGetContextsFunction::GetFrameId(content::RenderFrameHost& host) {
-@@ -1312,8 +1319,12 @@
+@@ -1312,8 +1320,12 @@
    mojom::ViewType view_type = extensions::GetViewType(&web_contents);
  
    if (view_type != extensions::mojom::ViewType::kDeveloperTools) {
