@@ -61,6 +61,26 @@ obj/extensions/browser/browser_sources/rules_monitor_service.o
 obj/extensions/browser/browser_sources/ruleset_manager.o
 obj/extensions/browser/api/declarative_net_request/declarative_net_request/declarative_net_request_api.o
 obj/content/browser/browser/render_frame_host_impl.o
+obj/extensions/browser/api/messaging/messaging/message_service.o
+obj/extensions/browser/api/messaging/messaging/messaging_delegate.o
+obj/extensions/renderer/renderer/service_worker_data.o
+obj/extensions/renderer/renderer/worker_thread_dispatcher.o
+obj/extensions/browser/browser_sources/service_worker_host.o
+obj/extensions/browser/browser_sources/url_loader_factory_manager.o
+obj/extensions/browser/browser_sources/unpacked_installer.o
+obj/extensions/browser/browser_sources/extension_host_registry.o
+obj/extensions/browser/browser_sources/extension_navigation_throttle.o
+obj/extensions/browser/browser_sources/extension_webkit_preferences.o
+obj/extensions/common/common/options_page_info.o
+obj/extensions/common/common/sandboxed_page_info.o
+obj/ios/web/content/init/extensions/clients/ios_extensions_api_provider.o
+obj/ios/web/content/init/extensions/ios_api_features/ios_api_features.o
+obj/ios/web/content/init/extensions/ios_api_json_strings/generated_schemas.o
+obj/ui/base/base/accelerator.o
+obj/ui/base/base/command.o
+obj/ios/chrome/browser/extensions/model/model/ios_command_service.o
+obj/ios/chrome/browser/extensions/model/model/ios_commands_api.o
+obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_api_provider.o
 EOF
   python3 - <<'PY'
 import os
