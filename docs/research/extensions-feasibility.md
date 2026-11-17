@@ -8,6 +8,46 @@
 
 ## Executive Summary
 
+### Second startup failure confirmed (`0061`) & narrow `0060` probe passed
+
+- **Status:** **Runtime failure confirmed** (no runtime pass claimed). With
+  `WebstorePrivateApi::EnsureAssociatedFactoryBuilt()` bypassed in LLDB on the
+  iPhone Duo Simulator (`C229AC75-8053-4B7F-A2F8-DFE983E26C13`, PID `25608`),
+  startup hit a genuine second `FATAL` abort in
+  `components/prefs/pref_service.cc:690` (`unregistered pref extensions.user_permissions`).
+- **Stack & root cause:** `ProfileIOSImpl::PrefsInitStage3` ->
+  `InitializeIOSExtensionsForProfile(ProfileIOS*)` ->
+  `BrowserContextDependencyManager::CreateBrowserContextServices` ->
+  `PermissionsEventRouter` -> `PermissionsManager::PermissionsManager` ->
+  `extensions::GetSitesFromPrefs` -> `PrefService::GetDict`. `PermissionsManagerFactory`
+  (`extensions/browser/permissions_manager.cc:213-255`) does not override
+  `BrowserContextKeyedServiceFactory::RegisterProfilePrefs`, so
+  `BrowserContextDependencyManager::RegisterProfilePrefsForServices` in
+  `RegisterIOSExtensionPrefs` never calls `PermissionsManager::RegisterProfilePrefs`;
+  upstream `chrome/browser/prefs/browser_prefs.cc:2278-2285` invokes both
+  `extensions::PermissionsManager::RegisterProfilePrefs` and
+  `extensions::RuntimeAPI::RegisterPrefs` directly under `#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)`.
+- **Patch `0061` (`0061-ios-extensions-register-missing-profile-prefs.patch`):**
+  Calls `extensions::PermissionsManager::RegisterProfilePrefs(registry)` and
+  `extensions::RuntimeAPI::RegisterPrefs(registry)` inside
+  `RegisterIOSExtensionPrefs` (`ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm`),
+  preserving existing `ProfileIOSImpl` pref-registration timing and service creation order.
+  `//extensions/browser` already exports `//extensions/browser/api/runtime` and
+  `//extensions/browser:browser_sources` via `public_deps`.
+- **Probe & cancelled build tracking:** Narrow `0060` compile probe
+  ([run 44080808519](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44080808519))
+  completed `success` (`api_browser_context_keyed_service_factories.o` and
+  `generated_api_registration.o`, 811/813 `ccache` direct hits); full IPA
+  [run 44080812979](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44080812979)
+  was cancelled in `1 Codegen (Linux)` once the unregistered-pref blocker was confirmed.
+- **Open lifecycle review (held pending review):** `IOSExtensionSystem` currently creates
+  `store_factory_`, `state_store_`, `rules_store_`, and `dynamic_user_scripts_store_`
+  inside `InitForRegularProfile()`, which runs after `CreateBrowserContextServices()`;
+  during `CreateBrowserContextServices()`, `StorageFrontend` (`storage_frontend.cc:231-255`)
+  caches `ExtensionSystem::Get(context)->store_factory()` in `LocalValueStoreCache`, and
+  `RulesRegistryService` (`rules_cache_delegate.cc:79-81`) calls `rules_store()->RegisterKey(...)`.
+  Held out of `0061` pending coordinator/Oracle lifecycle review.
+
 ### Runtime failure confirmed on simulator derivative (`25552fd` -> `0060`)
 
 - **Status:** **Runtime failure confirmed** (no runtime pass claimed). An experimental `vtool`

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: register missing static profile prefs
+
+---
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -29,6 +29,7 @@
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "extensions/browser/api/core_extensions_browser_api_provider.h"
+ #include "extensions/browser/api/extensions_api_client.h"
++#include "extensions/browser/api/runtime/runtime_api.h"
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+ #include "extensions/browser/browser_context_keyed_service_factories.h"
+ #include "extensions/browser/event_router.h"
+@@ -39,6 +40,7 @@
+ #include "extensions/browser/extension_system.h"
+ #include "extensions/browser/extensions_browser_interface_binders.h"
+ #include "extensions/browser/load_error_reporter.h"
++#include "extensions/browser/permissions_manager.h"
+ #include "extensions/browser/pref_names.h"
+ #include "extensions/browser/url_request_util.h"
+ #include "extensions/common/extension.h"
+@@ -172,6 +174,8 @@
+ void RegisterIOSExtensionPrefs(user_prefs::PrefRegistrySyncable* registry) {
+   CHECK(registry);
+   EnsureIOSExtensionFactoriesBuilt();
+   extensions::ExtensionPrefs::RegisterProfilePrefs(registry);
++  extensions::PermissionsManager::RegisterProfilePrefs(registry);
++  extensions::RuntimeAPI::RegisterPrefs(registry);
+   BrowserContextDependencyManager::GetInstance()
+       ->RegisterProfilePrefsForServices(registry);
+ }
