@@ -56,3 +56,4 @@
 0064-ios-extensions-dnr-network-hook-and-staging.patch
 0065-ios-extensions-in-process-factory-monitor.patch
 0066-ios-extensions-service-worker-and-messaging.patch
+0067-ios-extensions-trusted-unpacked-installer.patch

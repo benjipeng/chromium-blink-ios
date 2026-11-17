@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: add trusted-profile-directory unpacked installer to V1 bridge
+
+---
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 182ca13..cf45ce9 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -82,8 +82,8 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+   void UnregisterBrowserContext(content::BrowserContext* context);
+   std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
+ 
+-  // Records the canonicalized path and derived/manifest ID of the bundled
+-  // unpacked fixture once verified on the extension file task runner.
++  // Records a canonicalized path and derived/manifest ID for an allowed
++  // bundled or profile-trusted unpacked extension.
+   void SetAllowedBundledExtension(const base::FilePath& canonical_path,
+                                   const ExtensionId& extension_id);
+   bool IsAllowedBundledExtension(const Extension& extension) const;
+@@ -251,7 +251,7 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+       registered_contexts_ GUARDED_BY(context_lock_);
+ 
+   mutable base::Lock bundled_allowlist_lock_;
+-  base::flat_set<base::FilePath> allowed_bundled_paths_
++  base::flat_map<base::FilePath, ExtensionId> allowed_extensions_
+       GUARDED_BY(bundled_allowlist_lock_);
+   base::flat_set<ExtensionId> allowed_bundled_ids_
+       GUARDED_BY(bundled_allowlist_lock_);
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 67230ae..e3d6989 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -6,6 +6,7 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++#include <memory>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -13,11 +14,14 @@
+ #include "base/base_paths.h"
+ #include "base/check.h"
+ #include "base/command_line.h"
++#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
+ #include "base/strings/sys_string_conversions.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/version.h"
+ #include "components/application_locale_storage/application_locale_storage.h"
+ #include "components/crx_file/id_util.h"
+@@ -44,14 +48,18 @@
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registrar.h"
+ #include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_file_task_runner.h"
+ #include "extensions/browser/extension_system.h"
+ #include "extensions/browser/extensions_browser_interface_binders.h"
+ #include "extensions/browser/load_error_reporter.h"
+ #include "extensions/browser/management_policy.h"
+ #include "extensions/browser/permissions_manager.h"
+ #include "extensions/browser/pref_names.h"
++#include "extensions/browser/unpacked_installer.h"
+ #include "extensions/browser/url_request_util.h"
++#include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
++#include "extensions/common/file_util.h"
+ #include "extensions/common/extension_set.h"
+ #include "extensions/common/features/feature_channel.h"
+ #include "extensions/common/manifest_handlers/background_info.h"
+@@ -75,6 +83,14 @@ @protocol CrIOSExtensionManagingV1 <NSObject>
+ - (BOOL)setExtensionWithID:(NSString*)extensionId
+                    enabled:(BOOL)enabled
+                      error:(NSError* __autoreleasing*)error;
++@optional
++- (NSString*)trustedUnpackedExtensionsDirectoryWithError:
++    (NSError* __autoreleasing*)error;
++- (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
++                                  completion:
++                                      (void (^)(NSDictionary<NSString*, id>*
++                                                    extension,
++                                                NSError* error))completion;
+ @end
+ 
+ @interface CrIOSExtensionManagerV1 : NSObject <CrIOSExtensionManagingV1>
+@@ -98,15 +114,90 @@ + (instancetype)sharedManager;
+   kCrIOSExtensionManagerErrorStateChangeFailed = 9,
+ };
+ 
++NSError* MakeBridgeError(NSInteger code, NSString* description) {
++  return [NSError
++      errorWithDomain:kCrIOSExtensionManagerErrorDomain
++                 code:code
++             userInfo:@{NSLocalizedDescriptionKey : description ?: @""}];
++}
++
+ void SetBridgeError(NSError* __autoreleasing* error,
+                     NSInteger code,
+                     NSString* description) {
+   if (error) {
+-    *error = [NSError
+-        errorWithDomain:kCrIOSExtensionManagerErrorDomain
+-                   code:code
+-               userInfo:@{NSLocalizedDescriptionKey : description ?: @""}];
++    *error = MakeBridgeError(code, description);
++  }
++}
++
++NSDictionary<NSString*, id>* MakeExtensionEntryDictionary(
++    const extensions::Extension* extension,
++    extensions::ExtensionRegistrar* registrar) {
++  NSString* ext_id = base::SysUTF8ToNSString(extension->id()) ?: @"";
++  NSString* ext_name = base::SysUTF8ToNSString(extension->name()) ?: @"";
++  NSString* ext_version =
++      base::SysUTF8ToNSString(extension->VersionString()) ?: @"";
++  const BOOL is_enabled =
++      registrar->IsExtensionEnabled(extension->id()) ? YES : NO;
++  return @{
++    @"id" : [ext_id copy],
++    @"name" : [ext_name copy],
++    @"version" : [ext_version copy],
++    @"enabled" : @(is_enabled),
++  };
++}
++
++struct TrustedDirectoryResolution {
++  base::FilePath canonical_dir;
++  extensions::ExtensionId extension_id;
++  std::string error;
++};
++
++TrustedDirectoryResolution ResolveTrustedExtensionOnFileThread(
++    const base::FilePath& trusted_root,
++    const base::FilePath& candidate_path) {
++  TrustedDirectoryResolution result;
++  if (trusted_root.empty() || candidate_path.empty() ||
++      !base::DirectoryExists(trusted_root)) {
++    result.error = "TrustedUnpackedExtensions root directory does not exist.";
++    return result;
++  }
++  const base::FilePath canonical_root =
++      base::MakeAbsoluteFilePath(trusted_root);
++  if (canonical_root.empty()) {
++    result.error =
++        "Failed to canonicalize TrustedUnpackedExtensions root directory.";
++    return result;
++  }
++  if (!base::DirectoryExists(candidate_path)) {
++    result.error = "Requested extension directory does not exist.";
++    return result;
++  }
++  const base::FilePath canonical_dir =
++      base::MakeAbsoluteFilePath(candidate_path);
++  if (canonical_dir.empty() || !canonical_root.IsParent(canonical_dir)) {
++    result.error =
++        "Extension directory must resolve strictly inside "
++        "TrustedUnpackedExtensions.";
++    return result;
++  }
++  if (!base::PathExists(canonical_dir.Append(extensions::kManifestFilename))) {
++    result.error = "Extension directory is missing manifest.json.";
++    return result;
++  }
++  std::u16string load_error;
++  scoped_refptr<const extensions::Extension> extension =
++      extensions::file_util::LoadExtension(
++          canonical_dir, extensions::mojom::ManifestLocation::kUnpacked,
++          extensions::Extension::NO_FLAGS, &load_error);
++  if (!extension) {
++    result.error = load_error.empty()
++                       ? "Failed to parse unpacked extension manifest."
++                       : base::UTF16ToUTF8(load_error);
++    return result;
+   }
++  result.canonical_dir = canonical_dir;
++  result.extension_id = extension->id();
++  return result;
+ }
+ 
+ bool ResolveExtensionServices(content::BrowserContext** out_context,
+@@ -396,13 +487,13 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+     const base::FilePath& canonical_path,
+     const ExtensionId& extension_id) {
+   base::AutoLock lock(bundled_allowlist_lock_);
+-  allowed_bundled_paths_.clear();
+-  allowed_bundled_ids_.clear();
+-  if (!canonical_path.empty()) {
+-    allowed_bundled_paths_.insert(canonical_path);
++  if (!canonical_path.empty() && !extension_id.empty()) {
++    allowed_extensions_[canonical_path] = extension_id;
+   }
+-  if (!extension_id.empty()) {
+-    allowed_bundled_ids_.insert(extension_id);
++  allowed_bundled_ids_.clear();
++  allowed_bundled_ids_.insert(kIOSBundledExtensionId);
++  for (const auto& [_, allowed_id] : allowed_extensions_) {
++    allowed_bundled_ids_.insert(allowed_id);
+   }
+ }
+ 
+@@ -413,17 +504,13 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+     return false;
+   }
+   // Legacy MV2 background pages remain unsupported on iOS. MV3 service
+-  // workers are allowed only for the verified bundled fixture path and ID.
++  // workers are allowed only for explicitly verified bundled or trusted paths.
+   if (BackgroundInfo::HasBackgroundPage(&extension)) {
+     return false;
+   }
+-  if (BackgroundInfo::IsServiceWorkerBased(&extension) &&
+-      extension.id() != kIOSBundledExtensionId) {
+-    return false;
+-  }
+   base::AutoLock lock(bundled_allowlist_lock_);
+-  return allowed_bundled_paths_.contains(extension.path()) &&
+-         allowed_bundled_ids_.contains(extension.id());
++  auto it = allowed_extensions_.find(extension.path());
++  return it != allowed_extensions_.end() && it->second == extension.id();
+ }
+ 
+ bool IOSExtensionsBrowserClient::IsAllowedBundledExtensionId(
+@@ -933,18 +1020,7 @@ + (instancetype)sharedManager {
+     if (!extension) {
+       continue;
+     }
+-    NSString* ext_id = base::SysUTF8ToNSString(extension->id()) ?: @"";
+-    NSString* ext_name = base::SysUTF8ToNSString(extension->name()) ?: @"";
+-    NSString* ext_version =
+-        base::SysUTF8ToNSString(extension->VersionString()) ?: @"";
+-    const BOOL is_enabled =
+-        registrar->IsExtensionEnabled(extension->id()) ? YES : NO;
+-    [items addObject:@{
+-      @"id" : [ext_id copy],
+-      @"name" : [ext_name copy],
+-      @"version" : [ext_version copy],
+-      @"enabled" : @(is_enabled),
+-    }];
++    [items addObject:MakeExtensionEntryDictionary(extension.get(), registrar)];
+   }
+   return [items copy];
+ }
+@@ -1017,4 +1093,206 @@ - (BOOL)setExtensionWithID:(NSString*)extensionId
+   return YES;
+ }
+ 
++- (NSString*)trustedUnpackedExtensionsDirectoryWithError:
++    (NSError* __autoreleasing*)error {
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++
++  const base::FilePath profile_path = context->GetPath();
++  if (profile_path.empty()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"Active extension browser context has no profile path.");
++    return nil;
++  }
++
++  return base::SysUTF8ToNSString(
++      profile_path.AppendASCII("TrustedUnpackedExtensions").value());
++}
++
++- (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
++                                  completion:
++                                      (void (^)(NSDictionary<NSString*, id>*
++                                                    extension,
++                                                NSError* error))completion {
++  using InstallCompletionCallback =
++      base::OnceCallback<void(NSDictionary<NSString*, id>*, NSError*)>;
++
++  InstallCompletionCallback finish =
++      completion ? base::BindOnce(completion)
++                 : base::OnceCallback<void(NSDictionary<NSString*, id>*,
++                                           NSError*)>(base::DoNothing());
++
++  if (![directoryPath isKindOfClass:[NSString class]] ||
++      directoryPath.length == 0) {
++    std::move(finish).Run(
++        nil, MakeBridgeError(kCrIOSExtensionManagerErrorInvalidArgument,
++                             @"Directory path must be a non-empty string."));
++    return;
++  }
++
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  NSError* resolve_error = nil;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                &resolve_error)) {
++    std::move(finish).Run(nil, resolve_error);
++    return;
++  }
++
++  const base::FilePath profile_path = context->GetPath();
++  const base::FilePath requested_path(base::SysNSStringToUTF8(directoryPath));
++  if (profile_path.empty()) {
++    std::move(finish).Run(
++        nil,
++        MakeBridgeError(kCrIOSExtensionManagerErrorSystemNotReady,
++                        @"Active extension browser context has no profile path."));
++    return;
++  }
++  if (requested_path.empty()) {
++    std::move(finish).Run(
++        nil, MakeBridgeError(kCrIOSExtensionManagerErrorInvalidArgument,
++                             @"Directory path could not be decoded."));
++    return;
++  }
++
++  const base::FilePath trusted_root =
++      profile_path.AppendASCII("TrustedUnpackedExtensions");
++  const base::FilePath candidate_path =
++      requested_path.IsAbsolute() ? requested_path
++                                  : trusted_root.Append(requested_path);
++
++  extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&ResolveTrustedExtensionOnFileThread, trusted_root,
++                     candidate_path),
++      base::BindOnce(
++          [](content::BrowserContext* original_context,
++             InstallCompletionCallback finish_cb,
++             TrustedDirectoryResolution resolved) {
++            content::BrowserContext* live_context = nullptr;
++            extensions::ExtensionSystem* live_system = nullptr;
++            extensions::ExtensionRegistry* live_registry = nullptr;
++            extensions::ExtensionRegistrar* live_registrar = nullptr;
++            NSError* live_error = nil;
++            if (!ResolveExtensionServices(&live_context, &live_system,
++                                          &live_registry, &live_registrar,
++                                          &live_error)) {
++              std::move(finish_cb).Run(nil, live_error);
++              return;
++            }
++            if (live_context != original_context) {
++              std::move(finish_cb).Run(
++                  nil,
++                  MakeBridgeError(
++                      kCrIOSExtensionManagerErrorNotInitializedOrShuttingDown,
++                      @"Active extension browser context changed."));
++              return;
++            }
++            if (!resolved.error.empty() || resolved.canonical_dir.empty() ||
++                resolved.extension_id.empty()) {
++              NSString* detail =
++                  resolved.error.empty()
++                      ? @"Trusted extension directory validation failed."
++                      : base::SysUTF8ToNSString(resolved.error);
++              std::move(finish_cb).Run(
++                  nil, MakeBridgeError(
++                           kCrIOSExtensionManagerErrorInvalidArgument, detail));
++              return;
++            }
++
++            extensions::IOSExtensionsBrowserClient::GetInstance()
++                ->SetAllowedBundledExtension(resolved.canonical_dir,
++                                             resolved.extension_id);
++
++            auto shared_cb = std::make_shared<InstallCompletionCallback>(
++                std::move(finish_cb));
++            base::ScopedClosureRunner shutdown_guard(base::BindOnce(
++                [](std::shared_ptr<InstallCompletionCallback> cb) {
++                  if (cb && *cb) {
++                    std::move(*cb).Run(
++                        nil,
++                        MakeBridgeError(
++                            kCrIOSExtensionManagerErrorNotInitializedOrShuttingDown,
++                            @"Extension installation canceled during "
++                            @"shutdown."));
++                  }
++                },
++                shared_cb));
++
++            scoped_refptr<extensions::UnpackedInstaller> installer =
++                extensions::UnpackedInstaller::Create(live_context);
++            installer->set_be_noisy_on_failure(false);
++            installer->set_completion_callback(base::BindOnce(
++                [](content::BrowserContext* expected_context,
++                   extensions::ExtensionId expected_id,
++                   std::shared_ptr<InstallCompletionCallback> cb,
++                   base::ScopedClosureRunner guard,
++                   const extensions::Extension* extension,
++                   const base::FilePath& /*path*/,
++                   const std::u16string& install_error) {
++                  (void)guard.Release();
++                  if (!cb || !*cb) {
++                    return;
++                  }
++                  content::BrowserContext* final_context = nullptr;
++                  extensions::ExtensionSystem* final_system = nullptr;
++                  extensions::ExtensionRegistry* final_registry = nullptr;
++                  extensions::ExtensionRegistrar* final_registrar = nullptr;
++                  NSError* final_error = nil;
++                  if (!ResolveExtensionServices(&final_context, &final_system,
++                                                &final_registry,
++                                                &final_registrar,
++                                                &final_error)) {
++                    std::move(*cb).Run(nil, final_error);
++                    return;
++                  }
++                  if (final_context != expected_context) {
++                    std::move(*cb).Run(
++                        nil,
++                        MakeBridgeError(
++                            kCrIOSExtensionManagerErrorNotInitializedOrShuttingDown,
++                            @"Active extension browser context changed."));
++                    return;
++                  }
++                  if (!install_error.empty() || !extension) {
++                    NSString* detail =
++                        install_error.empty()
++                            ? @"Unpacked extension installation failed."
++                            : base::SysUTF16ToNSString(install_error);
++                    std::move(*cb).Run(
++                        nil,
++                        MakeBridgeError(
++                            kCrIOSExtensionManagerErrorStateChangeFailed,
++                            detail));
++                    return;
++                  }
++                  const extensions::Extension* installed =
++                      final_registry->GetInstalledExtension(expected_id);
++                  if (!installed || installed->id() != extension->id()) {
++                    std::move(*cb).Run(
++                        nil,
++                        MakeBridgeError(
++                            kCrIOSExtensionManagerErrorStateChangeFailed,
++                            @"Installed extension not found in registry."));
++                    return;
++                  }
++                  std::move(*cb).Run(
++                      MakeExtensionEntryDictionary(installed, final_registrar),
++                      nil);
++                },
++                live_context, resolved.extension_id, shared_cb,
++                std::move(shutdown_guard)));
++            installer->Load(resolved.canonical_dir);
++          },
++          context, std::move(finish)));
++}
++
+ @end
