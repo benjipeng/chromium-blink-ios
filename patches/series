@@ -48,3 +48,4 @@
 0056-ios-production-gn-query-roots.patch
 0057-ios-extensions-core-schema-platform-compat.patch
 0058-ios-extensions-exclude-unsupported-cpu-api.patch
+0059-ios-extensions-link-boundaries.patch

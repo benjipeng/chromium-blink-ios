@@ -45,6 +45,10 @@ obj/extensions/browser/browser_sources/extension_user_script_loader.o
 obj/extensions/browser/browser_sources/script_executor.o
 obj/extensions/browser/browser_sources/scripting_utils.o
 obj/extensions/browser/browser_sources/user_script_manager.o
+obj/extensions/browser/browser_sources/extension_web_contents_observer.o
+obj/extensions/browser/browser_sources/script_injection_tracker.o
+obj/extensions/browser/browser_sources/site_permissions_helper.o
+obj/extensions/browser/api/runtime/runtime/runtime_api.o
 obj/extensions/browser/api/api_registration/generated_api_registration.o
 obj/extensions/browser/api/scripting/scripting/scripting_api.o
 obj/extensions/browser/api/user_scripts/user_scripts/user_scripts_api.o
