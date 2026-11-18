@@ -82,7 +82,7 @@ index 89b6511..ffeff17 100644
        continue;
      }
 -    [items addObject:MakeExtensionEntryDictionary(extension.get(), registrar)];
-+    auto* entry =
++    NSMutableDictionary<NSString*, id>* entry =
 +        [MakeExtensionEntryDictionary(extension.get(), registrar) mutableCopy];
 +    entry[@"removable"] =
 +        @(SignedImportOnUIThread().installed_paths.contains(extension->path()));
