@@ -21,6 +21,24 @@ xcrun simctl launch "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.ext
 
 Set `simulator_udid` to the intended simulator before running the install and launch commands. A simulator pass is evidence about that runtime. The original artifact remains a device build.
 
+## Current lifecycle build
+
+[Actions run 44222828561](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44222828561)
+built `probe/extensions-gn` at `a18ce74`. Artifact `14395797087` contains
+the device IPA with SHA-256
+`5992706567550591465f1790aa6a77ef8ef6e50da8ed886df2ecd480728145bd`.
+The checksum was verified and the simulator copy launched with the
+production bridge. The native Store flow installed uBlock Origin Lite
+`2026.1116.1650` in the simulator; the extension registry UI showed it
+enabled and exposed **Manage**. Filtering, removal, and reinstall still
+need their own acceptance checks.
+
+Start in **Settings → Extensions → + → From Chrome Web Store Link…** and
+paste the extension's listing URL. The native review verifies the package and
+shows its requested access before installation. Google's in-page **Add to
+Desktop** action is separate and cannot install into this app. This build
+keeps a confirmed installation for the current session only.
+
 ## Verify the extension lifecycle
 
 Use a real Chrome Web Store listing and a publisher-signed CRX of the same extension. Keep neither package in the repository. For Files testing, copy the fixture into `Documents` of the isolated app's data container, found with `xcrun simctl get_app_container "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.extlifetest data`.

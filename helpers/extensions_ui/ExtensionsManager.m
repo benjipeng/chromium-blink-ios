@@ -324,6 +324,7 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
 @property(nonatomic, copy) NSArray<ExtensionEntryModel *> *entries;
 @property(nonatomic, copy) NSString *statusError;
 @property(nonatomic, assign) BOOL importInProgress;
+@property(nonatomic, strong) UIBarButtonItem *addButton;
 @end
 
 static NSString *StoreIDFromListingURL(NSString *input) {
@@ -395,6 +396,7 @@ static NSString *StoreIDFromListingURL(NSString *input) {
       importButton.accessibilityLabel = @"Add Extension";
       importButton.accessibilityIdentifier = @"kExtensionsAddButtonId";
     }
+    self.addButton = importButton;
     self.navigationItem.rightBarButtonItems = @[doneButton, importButton];
   }
 
@@ -545,6 +547,15 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   [self presentViewController:prompt animated:YES completion:nil];
 }
 
+- (void)setStoreDownloadVisible:(BOOL)visible {
+  self.navigationItem.prompt = visible ? @"Downloading and verifying extension…" : nil;
+  self.addButton.enabled = !visible;
+  if (visible && UIAccessibilityIsVoiceOverRunning()) {
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification,
+                                    self.navigationItem.prompt);
+  }
+}
+
 - (void)prepareStoreID:(NSString *)extensionID {
   if (self.importInProgress || !self.viewIfLoaded.window) return;
   if (!extensionID) {
@@ -556,10 +567,12 @@ static NSString *StoreIDFromListingURL(NSString *input) {
     return;
   }
   self.importInProgress = YES;
+  [self setStoreDownloadVisible:YES];
   __weak ExtensionsManagerViewController *weakSelf = self;
   [manager prepareStoreExtensionWithID:extensionID
       completion:^(NSDictionary *prepared, NSError *error) {
     ExtensionsManagerViewController *view = weakSelf;
+    [view setStoreDownloadVisible:NO];
     if (!view) {
       if (prepared[@"token"]) [manager cancelPreparedExtensionWithToken:prepared[@"token"] error:nil];
     } else if (error || !prepared) {
