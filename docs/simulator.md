@@ -1,0 +1,28 @@
+# Test a GitHub IPA on the simulator
+
+Use the IPA and checksum from the same successful Actions run. Record the branch, commit, and run ID alongside any screenshots. This procedure prepares a simulator copy on an Apple silicon Mac; it does not compile Chromium or change the original IPA.
+
+From the repository, with Xcode selected:
+
+```sh
+ipa=/path/to/Chromium-Blink-version-arm64.ipa
+checksum="$(awk 'NR == 1 { print $1 }' "${ipa}.sha256")"
+test_dir="$(mktemp -d "${TMPDIR%/}/chromium-ios-test.XXXXXX")"
+tools/simulator/prepare-ipa.sh "$ipa" "$checksum" "$test_dir/Chromium.app"
+```
+
+The tool verifies the checksum, retargets the app and embedded frameworks for the arm64 simulator, and signs from the inside out. It prints the bundle ID and uses an isolated app identity with Files access for test fixtures.
+
+```sh
+xcrun simctl list devices booted
+xcrun simctl install "$simulator_udid" "$test_dir/Chromium.app"
+xcrun simctl launch "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.extlifetest
+```
+
+Set `simulator_udid` to the intended simulator before running the install and launch commands. A simulator pass is evidence about that runtime. The original artifact remains a device build.
+
+## Where changes live
+
+- Put native browser behavior and layout fixes in `patches/`. They ship through the ordinary build.
+- Keep separately compiled production UI code in `helpers/`. The packaging job builds and embeds it, so a helper-only change can reuse the matching link checkpoint.
+- Keep small simulator tools here under `tools/simulator/`. Historical tweak folders and external diagnostic overlays are not build inputs.

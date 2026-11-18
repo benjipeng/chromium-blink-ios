@@ -2,6 +2,8 @@
 
 Zero-local-checkout build pipeline for **Chromium on iOS (`use_blink = true`)** targeting non-jailbroken devices (sideloading / LiveContainer) using 100% free public GitHub Actions infrastructure.
 
+Build and package in GitHub Actions. For local verification on Apple silicon, use the [simulator guide](docs/simulator.md) to prepare a disposable copy of an Actions IPA. Neither path needs a sibling project or a local Chromium source tree.
+
 ---
 
 ## Architecture
@@ -76,4 +78,6 @@ Each stage (and each compile partition) publishes one **write-once** checkpoint 
 | `scripts/run_with_budget.py` | Runs a build under a deadline and stops its whole process group cleanly |
 | `scripts/overlay_linux_host_deps.py` | Fetches Linux-host-only DEPS (`lss`, Dawn's Go) missing from the iOS snapshot |
 | `scripts/package_ipa.sh` | Post-link `Metadata.appintents` extraction, `.appex` pruning, and IPA build |
+| `helpers/extensions_ui/` | UI framework compiled and embedded by the Mac packaging job |
+| `tools/simulator/` | Local tools for verifying an Actions IPA without rebuilding Chromium |
 | `.github/workflows/` | `sync-source.yml`, `build-ipa.yml`, `graph-diagnose.yml`, and `bump-pin.yml` |
