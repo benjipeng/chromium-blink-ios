@@ -56,6 +56,7 @@ obj/extensions/browser/api/runtime/runtime/runtime_api.o
 obj/extensions/browser/api/api_keyed_service_factories/api_browser_context_keyed_service_factories.o
 obj/extensions/browser/api/api_registration/generated_api_registration.o
 obj/extensions/browser/api/scripting/scripting/scripting_api.o
+obj/extensions/browser/api/storage/storage/local_value_store_cache.o
 obj/extensions/browser/api/user_scripts/user_scripts/user_scripts_api.o
 obj/extensions/browser/api/system_info/system_info/system_info_provider.o
 obj/extensions/browser/browser_sources/web_request_api.o

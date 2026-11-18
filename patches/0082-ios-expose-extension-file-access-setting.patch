@@ -1,0 +1,109 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+index f0ece009db4f56d4a6421ba29c0dd5003ad37db6..02256153d7c1a8eacc376b07cef7d4d1c2ccd8dc 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+@@ -18,6 +18,7 @@ void IOSExtensionsBrowserAPIProvider::RegisterExtensionFunctions(
+   registry->RegisterFunction<CommandsGetAllFunction>();
+   registry->RegisterFunction<IOSTabsQueryFunction>();
+   registry->RegisterFunction<IOSTabsGetFunction>();
++  registry->RegisterFunction<IOSIsAllowedFileSchemeAccessFunction>();
+ }
+
+ }  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.h b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+index a38bba27c5cdd28ecb8200cfdd75b27afe9a273a..cdd8739bb8211645d532f1980f884aeaab8af8ee 100644
+--- a/ios/chrome/browser/extensions/model/ios_tabs_api.h
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+@@ -35,6 +35,16 @@ class IOSTabsGetFunction final : public ExtensionFunction {
+   ResponseAction Run() override;
+ };
+
++class IOSIsAllowedFileSchemeAccessFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("extension.isAllowedFileSchemeAccess",
++                             EXTENSION_ISALLOWEDFILESCHEMEACCESS)
++
++ private:
++  ~IOSIsAllowedFileSchemeAccessFunction() override = default;
++  ResponseAction Run() override;
++};
++
+ // Publishes tab lifecycle events for this regular profile.
+ class IOSTabEvents {
+  public:
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.mm b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+index d99dbeb0f38c13b589b95349ec941afa2cafaf83..98c3e01a070daeefdc0b12b2222b2476c7b6bf30 100644
+--- a/ios/chrome/browser/extensions/model/ios_tabs_api.mm
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+@@ -18,6 +18,7 @@
+ #include "base/values.h"
+ #include "content/public/browser/web_contents.h"
+ #include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_event_histogram_value.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/event_args.h"
+@@ -174,6 +175,13 @@ int GetWindowID(Browser& browser) {
+   return RespondNow(Error("No tab with that ID."));
+ }
+
++ExtensionFunction::ResponseAction IOSIsAllowedFileSchemeAccessFunction::Run() {
++  const auto* prefs = ExtensionPrefs::Get(browser_context());
++  return RespondNow(
++      WithArguments(extension() && prefs &&
++                    prefs->AllowFileAccess(extension()->id())));
++}
++
+ class IOSTabEvents::Observer final : public BrowserListObserver,
+                                      public WebStateListObserver {
+  public:
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index c698a64b11926df082316183d6c3da55631282b2..f70353fd58666eec839ee17ba9937b3880805a8d 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -19,6 +19,7 @@ json_features("ios_api_features") {
+ generated_json_strings("ios_api_json_strings") {
+   sources = [
+     "//chrome/common/extensions/api/commands.json",
++    "extension.json",
+     "tabs.json",
+   ]
+   root = "//"
+diff --git a/ios/web/content/init/extensions/extension.json b/ios/web/content/init/extensions/extension.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b906b956df5fea46ce49a97308505856821fe13
+--- /dev/null
++++ b/ios/web/content/init/extensions/extension.json
+@@ -0,0 +1,17 @@
++[
++  {
++    "namespace": "extension",
++    "description": "Reads the extension's file URL access setting.",
++    "functions": [
++      {
++        "name": "isAllowedFileSchemeAccess",
++        "type": "function",
++        "parameters": [],
++        "returns_async": {
++          "name": "callback",
++          "parameters": [{"name": "isAllowedAccess", "type": "boolean"}]
++        }
++      }
++    ]
++  }
++]
+diff --git a/ios/web/content/init/extensions/ios_api_features.json b/ios/web/content/init/extensions/ios_api_features.json
+index 2a153c9812fd56f24cae601c701a7bdc3b239ae7..aeeac0bcf24cfc84eed9bd5d2c8900775dc9e15e 100644
+--- a/ios/web/content/init/extensions/ios_api_features.json
++++ b/ios/web/content/init/extensions/ios_api_features.json
+@@ -7,6 +7,10 @@
+     "dependencies": ["manifest:commands"],
+     "contexts": ["privileged_extension"]
+   },
++  "extension": {
++    "channel": "stable",
++    "contexts": ["privileged_extension"]
++  },
+   "tabs": {
+     "channel": "stable",
+     "contexts": ["privileged_extension"]

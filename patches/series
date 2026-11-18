@@ -74,3 +74,5 @@
 0079-ios-expose-per-page-dnr-block-count.patch
 0080-ios-report-extension-runtime-platform.patch
 0081-ios-bridge-extension-tab-queries-and-close-events.patch
+0082-ios-expose-extension-file-access-setting.patch
+0083-ios-enable-offline-extension-sync-storage.patch
