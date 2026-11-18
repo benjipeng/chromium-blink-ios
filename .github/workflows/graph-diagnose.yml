@@ -21,6 +21,10 @@ on:
         description: Compile extension core and iOS client objects after graph checks (no link)
         default: false
         type: boolean
+      capture_interfaces:
+        description: Upload the small, fixed set of Chromium extension interfaces used for source review
+        default: false
+        type: boolean
       comparison_mode:
         description: Report feature changes, or require identical graphs for a refactor
         default: report
@@ -79,6 +83,31 @@ jobs:
         run: ./scripts/stage.sh diagnose prepare
       - name: Check bundled probe in the patched source snapshot
         run: python3 scripts/check_remote_patches.py --patched-source /tmp/cb_work/src
+
+      - name: Capture pinned Chromium interfaces
+        if: inputs.capture_interfaces
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/chromium-interfaces"
+          mkdir -p "$out"
+          cp "$RUNNER_TEMP/graph-diagnosis/probe-context.json" "$out/"
+          paths="$GITHUB_WORKSPACE/.github/diagnostics/extension-interfaces.txt"
+          cd /tmp/cb_work/src
+          while IFS= read -r file; do
+            if [[ -f "$file" ]]; then
+              cp --parents -- "$file" "$out"
+            else
+              printf '%s\n' "$file" >> "$out/missing.txt"
+            fi
+          done < "$paths"
+          test "$(du -sb "$out" | cut -f1)" -lt 1048576
+      - name: Upload pinned interfaces
+        if: inputs.capture_interfaces
+        uses: actions/upload-artifact@v6
+        with:
+          name: chromium-interfaces
+          path: ${{ runner.temp }}/chromium-interfaces/
+          retention-days: 14
 
       - name: Plan codegen & audit against the stage contract
         run: |
