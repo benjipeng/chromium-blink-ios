@@ -1,0 +1,220 @@
+diff --git a/ios/chrome/browser/tab_switcher/tab_grid/base_grid/ui/base_grid_view_controller.mm b/ios/chrome/browser/tab_switcher/tab_grid/base_grid/ui/base_grid_view_controller.mm
+--- a/ios/chrome/browser/tab_switcher/tab_grid/base_grid/ui/base_grid_view_controller.mm
++++ b/ios/chrome/browser/tab_switcher/tab_grid/base_grid/ui/base_grid_view_controller.mm
+@@ -269,6 +269,17 @@
+   self.collectionView = collectionView;
+   self.view = collectionView;
+
++  if (@available(iOS 27.1, *)) {
++    // A fold can move a reserved region without resizing the collection view.
++    UIHingeInteraction* hinge = [[UIHingeInteraction alloc]
++        initWithUpdateHandler:^(__unused UIHingeInteraction* interaction,
++                                __unused UIHingeInteractionUpdate* update) {
++          [weakSelf.gridLayout invalidateLayoutIfDivisionChanged];
++          [weakSelf.collectionView setNeedsLayout];
++        }];
++    [collectionView addInteraction:hinge];
++  }
++
+   // A single selection collection view's default behavior is to momentarily
+   // deselect the selected cell on touch down then select the new cell on touch
+   // up. In this tab grid, the selection ring should stay visible on the
+@@ -291,6 +302,11 @@
+ - (void)viewWillAppear:(BOOL)animated {
+   [super viewWillAppear:animated];
+   [self contentWillAppearAnimated:animated];
++}
++
++- (void)viewDidLayoutSubviews {
++  [super viewDidLayoutSubviews];
++  [self.gridLayout invalidateLayoutIfDivisionChanged];
+ }
+
+ - (void)viewWillDisappear:(BOOL)animated {
+diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.h b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.h
+--- a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.h
++++ b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.h
+@@ -53,6 +53,9 @@
+
+ - (instancetype)init NS_DESIGNATED_INITIALIZER;
+
++// Updates the tab layout when the active division in the viewport changes.
++- (void)invalidateLayoutIfDivisionChanged;
++
+ #pragma mark - Unavailable initializers
+
+ - (instancetype)initWithSection:(NSCollectionLayoutSection*)section
+diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
+--- a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
++++ b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
+@@ -214,24 +214,110 @@
+   return section;
+ }
+
++// Report a vertical reserved region in resting viewport coordinates. A page in
++// the tab grid's paging scroll view shares the scroll view's resting viewport.
++CGRect ActiveVerticalDivision(UICollectionView* collection_view) {
++  if (@available(iOS 27.1, *)) {
++    UIWindow* window = collection_view.window;
++    if (!window) {
++      return CGRectZero;
++    }
++    UIView* viewport = collection_view;
++    for (UIView* ancestor = collection_view.superview; ancestor;
++         ancestor = ancestor.superview) {
++      UIScrollView* scroll_view = [ancestor isKindOfClass:UIScrollView.class]
++                                      ? (UIScrollView*)ancestor
++                                      : nil;
++      if (scroll_view.isPagingEnabled &&
++          CGRectGetWidth(scroll_view.bounds) ==
++              CGRectGetWidth(collection_view.bounds)) {
++        viewport = scroll_view;
++        break;
++      }
++    }
++    const CGRect viewport_rect = [viewport convertRect:viewport.bounds
++                                                toView:window];
++    for (UIViewReservedRegion* division in [window
++             reservedRegionsOfKind:UIViewReservedRegionKind.divisionRegionKind]) {
++      const CGRect frame = division.frame;
++      if (!division.isActive || CGRectGetHeight(frame) <= CGRectGetWidth(frame)) {
++        continue;
++      }
++      const CGRect overlap = CGRectIntersection(frame, viewport_rect);
++      if (!CGRectIsEmpty(overlap)) {
++        return CGRectOffset(overlap, -CGRectGetMinX(viewport_rect), 0);
++      }
++    }
++  }
++  return CGRectZero;
++}
++
+ // Returns a compositional layout grid section for opened tabs.
+ NSCollectionLayoutSection* TabsSection(
+     id<NSCollectionLayoutEnvironment> layout_environment,
+     TabsSectionHeaderType tabs_section_header_type,
+     NSDirectionalEdgeInsets section_insets,
+-    UIWindowScene* window_scene) {
++    UIWindowScene* window_scene,
++    CGRect division) {
+   // Determine the number of columns.
+   NSInteger count = TabGridColumnsCount(
+       layout_environment.container.effectiveContentSize,
+       layout_environment.traitCollection.preferredContentSizeCategory);
+
++  const CGFloat item_aspect_ratio = TabGridItemAspectRatio(
++      layout_environment.container.effectiveContentSize, window_scene);
++  const CGFloat spacing = Spacing(layout_environment);
++  CGFloat gap = spacing;
++  CGFloat divided_item_width = 0;
++  if (!CGRectIsEmpty(division)) {
++    const CGFloat width = layout_environment.container.contentSize.width;
++    const BOOL rtl = UseRTLLayout();
++    // A group lays out in leading-to-trailing order before UIKit mirrors it.
++    const CGFloat first =
++        rtl ? width - CGRectGetMaxX(division) : CGRectGetMinX(division);
++    const CGFloat last =
++        rtl ? width - CGRectGetMinX(division) : CGRectGetMaxX(division);
++    const CGFloat start = section_insets.leading + spacing;
++    const CGFloat end = width - section_insets.trailing - spacing;
++    const CGFloat group_width = end - start;
++    const CGFloat normal_width = (group_width - spacing * (count - 1)) / count;
++    for (NSInteger column = 0; normal_width > 0 && column < count; ++column) {
++      const CGFloat x = start + column * (normal_width + spacing);
++      if (x >= last || x + normal_width <= first) {
++        continue;
++      }
++      // Keep the original layout when a column gap already clears the fold.
++      // Otherwise use equally sized cards and a gap that covers the fold even
++      // when a system rail makes the safe area asymmetric.
++      const CGFloat center = start + group_width / 2;
++      const CGFloat fold_gap = 2 * MAX(center - first, last - center);
++      if (count >= 2 && group_width - fold_gap >= 2 * normal_width) {
++        count = 2;
++        gap = MAX(spacing, fold_gap);
++        divided_item_width = (group_width - gap) / count;
++      } else if (MAX(first - start, end - last) > 0) {
++        // Keep a single column in the wider pane when pairing would make the
++        // cards smaller than the ordinary layout.
++        count = 1;
++        if (first - start >= end - last) {
++          section_insets.trailing += end - first;
++          divided_item_width = first - start;
++        } else {
++          section_insets.leading += last - start;
++          divided_item_width = end - last;
++        }
++      }
++      break;
++    }
++  }
++
+   // Configure the layout item.
+   NSCollectionLayoutDimension* item_width_dimension =
+       FractionalWidth(1. / count);
+-  const CGFloat item_aspect_ratio = TabGridItemAspectRatio(
+-      layout_environment.container.effectiveContentSize, window_scene);
+   NSCollectionLayoutDimension* item_height_dimension =
+-      FractionalWidth(item_aspect_ratio / count);
++      divided_item_width > 0
++          ? AbsoluteDimension(item_aspect_ratio * divided_item_width)
++          : FractionalWidth(item_aspect_ratio / count);
+   NSCollectionLayoutSize* item_size =
+       [NSCollectionLayoutSize sizeWithWidthDimension:item_width_dimension
+                                      heightDimension:item_height_dimension];
+@@ -242,7 +328,9 @@
+   const CGFloat width = layout_environment.container.effectiveContentSize.width;
+   // Estimate the height of the group by ignoring spacings.
+   NSCollectionLayoutDimension* group_height_dimension =
+-      EstimatedDimension(item_aspect_ratio * width / count);
++      divided_item_width > 0
++          ? item_height_dimension
++          : EstimatedDimension(item_aspect_ratio * width / count);
+   NSCollectionLayoutSize* group_size =
+       [NSCollectionLayoutSize sizeWithWidthDimension:FractionalWidth(1.)
+                                      heightDimension:group_height_dimension];
+@@ -251,7 +339,7 @@
+                                             repeatingSubitem:item
+                                                        count:count];
+   const CGFloat spacing = Spacing(layout_environment);
+-  group.interItemSpacing = [NSCollectionLayoutSpacing fixedSpacing:spacing];
++  group.interItemSpacing = [NSCollectionLayoutSpacing fixedSpacing:gap];
+
+   // Configure the layout section.
+   NSCollectionLayoutSection* section =
+@@ -371,6 +459,7 @@
+ @implementation GridLayout {
+   NSArray<NSIndexPath*>* _indexPathsOfDeletingItems;
+   NSArray<NSIndexPath*>* _indexPathsOfInsertingItems;
++  CGRect _verticalDivision;
+ }
+
+ @synthesize sectionInsets = _sectionInsets;
+@@ -401,6 +490,14 @@
+   }
+   _sectionInsets = sectionInsets;
+   [self invalidateLayout];
++}
++
++- (void)invalidateLayoutIfDivisionChanged {
++  const CGRect division = ActiveVerticalDivision(self.collectionView);
++  if (!CGRectEqualToRect(division, _verticalDivision)) {
++    _verticalDivision = division;
++    [self invalidateLayout];
++  }
+ }
+
+ #pragma mark - UICollectionViewLayout
+@@ -526,9 +623,11 @@
+     return TabGroupHeaderSection(layoutEnvironment, self.sectionInsets);
+   } else if ([sectionIdentifier
+                  isEqualToString:kGridOpenTabsSectionIdentifier]) {
++    _verticalDivision = ActiveVerticalDivision(self.collectionView);
+     return TabsSection(layoutEnvironment, self.tabsSectionHeaderType,
+                        self.sectionInsets,
+-                       self.collectionView.window.windowScene);
++                       self.collectionView.window.windowScene,
++                       _verticalDivision);
+   } else if ([sectionIdentifier
+                  isEqualToString:kSuggestedActionsSectionIdentifier]) {
+     return SuggestedActionsSection(layoutEnvironment, self.sectionInsets);
