@@ -441,13 +441,13 @@ index 6da38b5..e589d92 100644
 +                             reply(nil, SignedImportError(@"The profile closed."));
 +                             return;
 +                           }
-+                           auto& state = SignedImportOnUIThread();
-+                           state.busy = false;
++                           auto& live_import = SignedImportOnUIThread();
++                           live_import.busy = false;
                             if (failure || !entry) {
                               DeleteImportDirectory(target);
                             } else {
 -                             SignedImportOnUIThread().installed_paths.insert(target);
-+                             state.installed_paths.emplace(target, verified_id);
++                             live_import.installed_paths.emplace(target, verified_id);
                             }
                             reply(entry, failure);
                           }];
