@@ -1,0 +1,182 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+index 5d462ccc7f979d283b4eb30bde34f54149abcdc9..7486d3f9f01078954f7cbef9000217f86349016a 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+@@ -5,6 +5,8 @@
+ #ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
+ #define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
+
++#include <memory>
++
+ #include "base/memory/raw_ptr.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "extensions/browser/extension_web_contents_observer.h"
+@@ -18,6 +20,8 @@ class WebContents;
+
+ namespace extensions {
+
++class ScriptExecutor;
++
+ class IOSExtensionWebContentsObserver final
+     : public ExtensionWebContentsObserver,
+       public content::WebContentsUserData<IOSExtensionWebContentsObserver> {
+@@ -28,6 +32,8 @@ class IOSExtensionWebContentsObserver final
+       const IOSExtensionWebContentsObserver&) = delete;
+   ~IOSExtensionWebContentsObserver() override;
+
++  ScriptExecutor* script_executor() const { return script_executor_.get(); }
++
+   static void CreateForWebContents(content::WebContents* web_contents);
+
+  private:
+@@ -35,7 +41,11 @@ class IOSExtensionWebContentsObserver final
+
+   explicit IOSExtensionWebContentsObserver(content::WebContents* web_contents);
+
++  void RenderFrameCreated(content::RenderFrameHost* frame) override;
++  void SetFrameTabId(content::RenderFrameHost* frame);
++
+   int tab_id_ = 0;
++  std::unique_ptr<ScriptExecutor> script_executor_;
+   raw_ptr<content::WebContents> tracked_web_contents_ = nullptr;
+
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+index 64415b709f51c5958fc9c67048ea46d2a2efd51d..ac5d10ca2cb5f21def412a842c25cf11a0b7fe0a 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+@@ -5,6 +5,7 @@
+ #import "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
+
+ #include "content/public/browser/web_contents.h"
++#include "extensions/browser/script_executor.h"
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+ #include "ios/web/content/web_state/content_web_state.h"
+
+@@ -18,7 +19,9 @@
+   }
+   content::WebContentsUserData<
+       IOSExtensionWebContentsObserver>::CreateForWebContents(web_contents);
+-  FromWebContents(web_contents)->Initialize();
++  auto* observer = FromWebContents(web_contents);
++  observer->Initialize();
++  observer->SetFrameTabId(web_contents->GetPrimaryMainFrame());
+ }
+
+ IOSExtensionWebContentsObserver::IOSExtensionWebContentsObserver(
+@@ -31,6 +34,7 @@
+   if (id.valid()) {
+     tab_id_ = id.identifier();
+     tracked_web_contents_ = web_contents;
++    script_executor_ = std::make_unique<ScriptExecutor>(web_contents);
+     IOSExtensionsBrowserClient::GetInstance()->RegisterTabWebContents(
+         tab_id_, web_contents);
+   }
+@@ -43,6 +47,20 @@
+   }
+ }
+
++void IOSExtensionWebContentsObserver::RenderFrameCreated(
++    content::RenderFrameHost* frame) {
++  SetFrameTabId(frame);
++}
++
++void IOSExtensionWebContentsObserver::SetFrameTabId(
++    content::RenderFrameHost* frame) {
++  if (tab_id_ > 0) {
++    if (auto* extension_frame = GetLocalFrame(frame)) {
++      extension_frame->SetTabId(tab_id_);
++    }
++  }
++}
++
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(IOSExtensionWebContentsObserver);
+
+ }  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index fede851d6624d0a11d3f70d458a12fa74013e4f1..5f53e66b7976039159bc043b965ea936d93735fd 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -205,6 +205,8 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+                     int tab_id,
+                     bool include_incognito,
+                     content::WebContents** web_contents) const override;
++  ScriptExecutor* GetScriptExecutorForTab(
++      content::WebContents& web_contents) override;
+   void CreateExtensionWebContentsObserver(
+       content::WebContents* web_contents) override;
+   ExtensionWebContentsObserver* GetExtensionWebContentsObserver(
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 33d60995e327298065928b6e88333e0ca8cca49f..7aaaf0f5dbfffaae7508f6ffcb04d9bbc4e8a8cd 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -1330,6 +1330,13 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   return true;
+ }
+
++ScriptExecutor* IOSExtensionsBrowserClient::GetScriptExecutorForTab(
++    content::WebContents& web_contents) {
++  auto* observer =
++      IOSExtensionWebContentsObserver::FromWebContents(&web_contents);
++  return observer ? observer->script_executor() : nullptr;
++}
++
+ void IOSExtensionsBrowserClient::CreateExtensionWebContentsObserver(
+     content::WebContents* web_contents) {
+   IOSExtensionWebContentsObserver::CreateForWebContents(web_contents);
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.mm b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+index d177b48438c488abf1906ea896855ef19790d184..9005a91b0e79281fbf66515f019c90007d18ebbd 100644
+--- a/ios/chrome/browser/extensions/model/ios_tabs_api.mm
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+@@ -100,6 +100,7 @@ int GetWindowID(Browser& browser) {
+   result.Set("highlighted", active);
+   result.Set("pinned", index < tabs->pinned_tabs_count());
+   result.Set("incognito", false);
++  result.Set("discarded", !tab.IsRealized());
+   result.Set("status", tab.IsLoading() ? "loading" : "complete");
+   const GURL& url = tab.GetLastCommittedURL();
+   if (extension && url.is_valid() &&
+@@ -164,6 +165,7 @@ int GetWindowID(Browser& browser) {
+     return RespondNow(Error("No extension found."));
+   }
+   const std::optional<bool> active = query.FindBool("active");
++  const std::optional<bool> discarded = query.FindBool("discarded");
+   const std::optional<bool> current = query.FindBool("currentWindow");
+   const std::optional<bool> focused = query.FindBool("lastFocusedWindow");
+   base::ListValue matches;
+@@ -188,10 +190,12 @@ int GetWindowID(Browser& browser) {
+     }
+     auto* tabs = browser->GetWebStateList();
+     for (int i = 0; i < tabs->count(); ++i) {
+-      if (!active ||
+-          *active == (tabs->GetWebStateAt(i) == tabs->GetActiveWebState())) {
+-        matches.Append(MakeTab(*browser, i, extension()));
++      const auto* tab = tabs->GetWebStateAt(i);
++      if ((active && *active != (tab == tabs->GetActiveWebState())) ||
++          (discarded && *discarded == tab->IsRealized())) {
++        continue;
+       }
++      matches.Append(MakeTab(*browser, i, extension()));
+     }
+   }
+   return RespondNow(WithArguments(std::move(matches)));
+diff --git a/ios/web/content/init/extensions/tabs.json b/ios/web/content/init/extensions/tabs.json
+index e8a3b796e6041767b241c62ee8ea7e3ee71bc822..705a63fa379a44c36510feb6204d26162220b284 100644
+--- a/ios/web/content/init/extensions/tabs.json
++++ b/ios/web/content/init/extensions/tabs.json
+@@ -18,6 +18,7 @@
+           "active": {"type": "boolean"},
+           "highlighted": {"type": "boolean"},
+           "pinned": {"type": "boolean"},
++          "discarded": {"type": "boolean"},
+           "incognito": {"type": "boolean"},
+           "status": {"$ref": "TabStatus"},
+           "url": {"type": "string", "optional": true},
+@@ -36,6 +37,7 @@
+             "type": "object",
+             "properties": {
+               "active": {"type": "boolean", "optional": true},
++              "discarded": {"type": "boolean", "optional": true},
+               "currentWindow": {"type": "boolean", "optional": true},
+               "lastFocusedWindow": {"type": "boolean", "optional": true},
+               "windowType": {"type": "string", "optional": true}
