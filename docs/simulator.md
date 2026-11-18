@@ -39,6 +39,13 @@ shows its requested access before installation. Google's in-page **Add to
 Desktop** action is separate and cannot install into this app. This build
 keeps a confirmed installation for the current session only.
 
+The updated package helper presents the listing field on its own navigation
+screen. On the iPhone Duo simulator, the form and help text shared 16 pt
+side margins in a 466 pt sheet; Review was disabled for empty input and
+submitted the verified listing ID once after a valid URL was entered.
+This component check used the compiled production helper in a small UIKit
+harness; it did not exercise the network download again.
+
 ## Verify the extension lifecycle
 
 Use a real Chrome Web Store listing and a publisher-signed CRX of the same extension. Keep neither package in the repository. For Files testing, copy the fixture into `Documents` of the isolated app's data container, found with `xcrun simctl get_app_container "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.extlifetest data`.

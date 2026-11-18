@@ -328,6 +328,7 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
 @end
 
 static NSString *StoreIDFromListingURL(NSString *input) {
+  if (!input.length) return nil;
   NSURLComponents *url = [NSURLComponents componentsWithString:
       [input stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
   if (![url.scheme.lowercaseString isEqualToString:@"https"] ||
@@ -347,6 +348,106 @@ static NSString *StoreIDFromListingURL(NSString *input) {
       [extensionID rangeOfCharacterFromSet:invalid].location == NSNotFound
       ? extensionID : nil;
 }
+
+@interface StoreLinkViewController : UIViewController <UITextFieldDelegate>
+@property(nonatomic, copy) void (^submit)(NSString *extensionID);
+@end
+
+@implementation StoreLinkViewController {
+  UITextField *_linkField;
+}
+
+- (void)viewDidLoad {
+  [super viewDidLoad];
+  self.title = @"Chrome Web Store Link";
+  self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+  UILabel *instruction = [[UILabel alloc] init];
+  instruction.text = @"Paste the link to an extension’s Chrome Web Store listing.";
+  instruction.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+  instruction.adjustsFontForContentSizeCategory = YES;
+  instruction.textColor = UIColor.secondaryLabelColor;
+  instruction.numberOfLines = 0;
+
+  _linkField = [[UITextField alloc] init];
+  _linkField.borderStyle = UITextBorderStyleRoundedRect;
+  _linkField.placeholder = @"Paste listing link";
+  _linkField.accessibilityLabel = @"Chrome Web Store listing link";
+  _linkField.accessibilityIdentifier = @"kExtensionsStoreLinkFieldId";
+  _linkField.keyboardType = UIKeyboardTypeURL;
+  _linkField.returnKeyType = UIReturnKeyGo;
+  _linkField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+  _linkField.autocorrectionType = UITextAutocorrectionTypeNo;
+  _linkField.spellCheckingType = UITextSpellCheckingTypeNo;
+  _linkField.clearButtonMode = UITextFieldViewModeWhileEditing;
+  _linkField.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+  _linkField.adjustsFontForContentSizeCategory = YES;
+  _linkField.delegate = self;
+  [_linkField addTarget:self action:@selector(linkDidChange)
+       forControlEvents:UIControlEventEditingChanged];
+
+  UIStackView *fields = [[UIStackView alloc] initWithArrangedSubviews:@[instruction, _linkField]];
+  fields.axis = UILayoutConstraintAxisVertical;
+  fields.spacing = 8;
+  fields.translatesAutoresizingMaskIntoConstraints = NO;
+  UIScrollView *scroll = [[UIScrollView alloc] init];
+  scroll.translatesAutoresizingMaskIntoConstraints = NO;
+  scroll.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(12, 16, 16, 16);
+  scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+  scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+  [self.view addSubview:scroll];
+  [scroll addSubview:fields];
+  UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+  UILayoutGuide *column = scroll.layoutMarginsGuide;
+  UILayoutGuide *content = scroll.contentLayoutGuide;
+  [NSLayoutConstraint activateConstraints:@[
+    [scroll.topAnchor constraintEqualToAnchor:safe.topAnchor],
+    [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+    [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+    [scroll.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor],
+    [fields.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
+    [fields.leadingAnchor constraintEqualToAnchor:column.leadingAnchor],
+    [fields.trailingAnchor constraintEqualToAnchor:column.trailingAnchor],
+    [fields.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:16],
+    [fields.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-16],
+    [fields.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-16],
+    [_linkField.heightAnchor constraintGreaterThanOrEqualToConstant:44],
+  ]];
+
+  UIBarButtonItem *review = [[UIBarButtonItem alloc] initWithTitle:@"Review"
+      style:UIBarButtonItemStyleProminent target:self action:@selector(reviewLink)];
+  review.accessibilityIdentifier = @"kExtensionsStoreLinkReviewId";
+  self.navigationItem.rightBarButtonItem = review;
+  [self linkDidChange];
+}
+
+- (void)linkDidChange {
+  self.navigationItem.rightBarButtonItem.enabled = StoreIDFromListingURL(_linkField.text) != nil;
+}
+
+- (BOOL)textFieldShouldReturn:(__unused UITextField *)textField {
+  [self reviewLink];
+  return NO;
+}
+
+- (void)reviewLink {
+  NSString *extensionID = StoreIDFromListingURL(_linkField.text);
+  UINavigationController *nav = self.navigationController;
+  void (^submit)(NSString *) = self.submit;
+  if (!extensionID || !submit || nav.topViewController != self) return;
+  self.submit = nil;
+  [_linkField resignFirstResponder];
+  [nav popViewControllerAnimated:YES];
+  id<UIViewControllerTransitionCoordinator> transition = nav.transitionCoordinator;
+  if (![transition animateAlongsideTransition:nil
+      completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+    if (!context.isCancelled) submit(extensionID);
+  }]) {
+    submit(extensionID);
+  }
+}
+
+@end
 
 @implementation ExtensionsManagerViewController
 
@@ -520,31 +621,11 @@ static NSString *StoreIDFromListingURL(NSString *input) {
 }
 
 - (void)promptForStoreLink {
-  if (self.importInProgress || self.presentedViewController) return;
-  UIAlertController *prompt = [UIAlertController
-      alertControllerWithTitle:@"Chrome Web Store Link"
-      message:@"Paste a link to the extension’s Store listing."
-      preferredStyle:UIAlertControllerStyleAlert];
-  [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
-    field.placeholder = @"https://chromewebstore.google.com/detail/…";
-    field.keyboardType = UIKeyboardTypeURL;
-    field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    field.autocorrectionType = UITextAutocorrectionTypeNo;
-  }];
-  [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-  __weak UIAlertController *weakPrompt = prompt;
+  if (self.importInProgress || self.presentedViewController || !self.navigationController) return;
+  StoreLinkViewController *form = [[StoreLinkViewController alloc] init];
   __weak ExtensionsManagerViewController *weakSelf = self;
-  [prompt addAction:[UIAlertAction actionWithTitle:@"Review" style:UIAlertActionStyleDefault
-      handler:^(__unused UIAlertAction *action) {
-    NSString *extensionID = StoreIDFromListingURL(weakPrompt.textFields.firstObject.text);
-    void (^start)(void) = ^{ [weakSelf prepareStoreID:extensionID]; };
-    id<UIViewControllerTransitionCoordinator> transition = weakPrompt.transitionCoordinator;
-    if (!transition ||
-        ![transition animateAlongsideTransition:nil completion:^(__unused id context) { start(); }]) {
-      dispatch_async(dispatch_get_main_queue(), start);
-    }
-  }]];
-  [self presentViewController:prompt animated:YES completion:nil];
+  form.submit = ^(NSString *extensionID) { [weakSelf prepareStoreID:extensionID]; };
+  [self.navigationController pushViewController:form animated:YES];
 }
 
 - (void)setStoreDownloadVisible:(BOOL)visible {
