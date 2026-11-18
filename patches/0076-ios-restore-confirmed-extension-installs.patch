@@ -211,7 +211,7 @@ diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/c
 +    }
 +    auto previous = client->RegisterTrustedExtensionCandidate(extension->path(),
 +                                                              extension->id());
-+    if (!management_policy_->UserMayLoad(extension.get(), nullptr)) {
++    if (!management_policy_->UserMayLoad(extension.get())) {
 +      client->RestoreTrustedExtensionCandidate(extension->path(),
 +                                               extension->id(), previous);
 +      continue;
