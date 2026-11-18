@@ -6,6 +6,17 @@
 - (BOOL)setExtensionWithID:(NSString *)extensionId
                    enabled:(BOOL)enabled
                      error:(NSError *__autoreleasing *)error;
+@optional
+- (void)prepareSignedExtensionAtPath:(NSString *)path
+                          completion:
+                              (void (^)(NSDictionary<NSString *, id> *prepared,
+                                        NSError *error))completion;
+- (void)confirmPreparedExtensionWithToken:(NSString *)token
+                               completion:(void (^)(NSDictionary<NSString *, id>
+                                                        *extension,
+                                                    NSError *error))completion;
+- (BOOL)cancelPreparedExtensionWithToken:(NSString *)token
+                                   error:(NSError *__autoreleasing *)error;
 @end
 
 @interface CrIOSExtensionManagerV1 : NSObject <CrIOSExtensionManagingV1>

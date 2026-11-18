@@ -1,0 +1,1185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: prepare and import a publisher-signed CRX
+
+Verify a private CRX3 snapshot with Chromium publisher proof, then stage
+bounded Manifest V3 contents with the signing key bound to the ID.
+Expose a one-time review token before calling the trusted installer.
+The install is session-only until the profile supports restoration.
+
+---
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 90e0cd4..83ab1c6 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -20,6 +20,8 @@ source_set("model") {
+     "ios_extensions_browser_api_provider.h",
+     "ios_extensions_browser_client.h",
+     "ios_extensions_browser_client.mm",
++    "ios_signed_extension_package.cc",
++    "ios_signed_extension_package.h",
+   ]
+ 
+   public_deps = [
+@@ -52,6 +54,7 @@ source_set("model") {
+     "//ios/web/content",
+     "//services/network/public/mojom",
+     "//third_party/blink/public/common",
++    "//third_party/zlib/google:zip",
+     "//ui/base",
+     "//ui/base/mojom",
+     "//url",
+diff --git a/ios/chrome/browser/extensions/model/DEPS b/ios/chrome/browser/extensions/model/DEPS
+index 74ad1d8..140a0a1 100644
+--- a/ios/chrome/browser/extensions/model/DEPS
++++ b/ios/chrome/browser/extensions/model/DEPS
+@@ -11,4 +11,5 @@ include_rules = [
+   "+ios/web/content",
+   "+third_party/blink/public/common",
+   "+third_party/blink/public/mojom",
++  "+third_party/zlib/google",
+ ]
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 6c2d559..adfbe1d 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -8,7 +8,9 @@
+ 
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -17,6 +19,7 @@
+ #include "base/command_line.h"
+ #include "base/containers/flat_set.h"
+ #include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
+@@ -24,6 +27,9 @@
+ #include "base/path_service.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "base/uuid.h"
++#include "base/values.h"
+ #include "base/version.h"
+ #include "components/application_locale_storage/application_locale_storage.h"
+ #include "components/crx_file/id_util.h"
+@@ -65,6 +71,7 @@
+ #include "extensions/common/file_util.h"
+ #include "extensions/common/extension_set.h"
+ #include "extensions/common/features/feature_channel.h"
++#include "extensions/common/manifest.h"
+ #include "extensions/common/manifest_handlers/background_info.h"
+ #include "extensions/common/manifest_handlers/manifest_url_handlers.h"
+ #include "extensions/common/manifest_handlers/options_page_info.h"
+@@ -74,6 +81,7 @@
+ #include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
++#include "ios/chrome/browser/extensions/model/ios_signed_extension_package.h"
+ #include "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #include "ios/chrome/browser/shared/model/paths/paths.h"
+ #include "ios/chrome/browser/shared/model/profile/profile_ios.h"
+@@ -82,7 +90,7 @@
+ #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+ #include "url/gurl.h"
+ 
+-// Frozen V1 ObjC runtime bridge contract (~12 lines) for embedded UI helpers.
++// Required V1 selectors remain stable; the UI probes optional capabilities.
+ @protocol CrIOSExtensionManagingV1 <NSObject>
+ - (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
+     (NSError* __autoreleasing*)error;
+@@ -100,10 +108,22 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+ - (BOOL)dispatchCommandNamed:(NSString*)commandName
+            toExtensionWithID:(NSString*)extensionId
+                        error:(NSError* __autoreleasing*)error;
++- (void)prepareSignedExtensionAtPath:(NSString*)path
++                          completion:(void (^)(NSDictionary<NSString*, id>*,
++                                               NSError*))completion;
++- (void)confirmPreparedExtensionWithToken:(NSString*)token
++                               completion:(void (^)(NSDictionary<NSString*, id>*,
++                                                    NSError*))completion;
++- (BOOL)cancelPreparedExtensionWithToken:(NSString*)token
++                                   error:(NSError* __autoreleasing*)error;
+ @end
+ 
+ @interface CrIOSExtensionManagerV1 : NSObject <CrIOSExtensionManagingV1>
+ + (instancetype)sharedManager;
++- (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
++                                 requiringID:(NSString*)expectedID
++                                  completion:(void (^)(NSDictionary<NSString*, id>*,
++                                                       NSError*))completion;
+ @end
+ 
+ namespace {
+@@ -324,6 +344,158 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+   return true;
+ }
+ 
++struct PreparedSignedImport {
++  base::FilePath profile_path;
++  base::FilePath staging_path;
++  std::string token;
++  std::string id;
++  std::string name;
++  std::string version;
++  std::vector<std::string> permissions;
++  std::vector<std::string> host_permissions;
++  std::string error;
++};
++
++struct SignedImportState {
++  bool busy = false;
++  std::optional<PreparedSignedImport> prepared;
++};
++
++SignedImportState& SignedImportOnUIThread() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  static base::NoDestructor<SignedImportState> state;
++  return *state;
++}
++
++NSError* SignedImportError(NSString* message) {
++  return MakeBridgeError(kCrIOSExtensionManagerErrorStateChangeFailed, message);
++}
++
++void DeleteImportDirectory(base::FilePath directory) {
++  if (!directory.empty()) {
++    extensions::GetExtensionFileTaskRunner()->PostTask(
++        FROM_HERE, base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively),
++                                 std::move(directory)));
++  }
++}
++
++bool ResolveSignedImportProfile(base::FilePath* profile_path,
++                                extensions::ExtensionRegistry** registry,
++                                NSError* __autoreleasing* error) {
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, registry, &registrar,
++                                error)) {
++    return false;
++  }
++  *profile_path = context->GetPath();
++  if (profile_path->empty()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"The active profile has no directory.");
++    return false;
++  }
++  return true;
++}
++
++std::vector<std::string> ManifestStrings(const base::DictValue& manifest,
++                                         std::string_view field) {
++  std::vector<std::string> result;
++  if (const auto* values = manifest.FindList(field)) {
++    for (const auto& value : *values) {
++      if (const auto* text = value.GetIfString()) {
++        result.push_back(*text);
++      }
++    }
++  }
++  return result;
++}
++
++std::vector<std::string> DeclaredHostPatterns(const base::DictValue& manifest) {
++  const auto declared = ManifestStrings(manifest, "host_permissions");
++  std::set<std::string> hosts(declared.begin(), declared.end());
++  if (const auto* scripts = manifest.FindList("content_scripts")) {
++    for (const auto& script : *scripts) {
++      if (const auto* dict = script.GetIfDict()) {
++        const auto matches = ManifestStrings(*dict, "matches");
++        hosts.insert(matches.begin(), matches.end());
++      }
++    }
++  }
++  return {hosts.begin(), hosts.end()};
++}
++
++NSArray<NSString*>* BridgeStrings(const std::vector<std::string>& values) {
++  NSMutableArray<NSString*>* result = [NSMutableArray array];
++  for (const auto& value : values) {
++    if (NSString* text = base::SysUTF8ToNSString(value)) {
++      [result addObject:text];
++    }
++  }
++  return [result copy];
++}
++
++PreparedSignedImport PrepareSignedImportOnFileThread(
++    base::FilePath profile_path,
++    base::FilePath input_path) {
++  PreparedSignedImport result;
++  const base::FilePath import_root =
++      profile_path.AppendASCII("PendingSignedExtension");
++  base::ScopedTempDir workspace;
++  // There is at most one live preparation. Discard any prior session's draft.
++  if (!base::DeletePathRecursively(import_root) ||
++      !base::CreateDirectory(import_root) ||
++      !workspace.CreateUniqueTempDirUnderPath(import_root)) {
++    result.error = "Could not create a private extension staging directory.";
++    return result;
++  }
++
++  const auto payload = workspace.GetPath().AppendASCII("extension");
++  if (!base::CreateDirectory(payload) ||
++      !extensions::PrepareSignedExtensionPackage(input_path, payload, &result.id,
++                                                 &result.error)) {
++    if (result.error.empty()) {
++      result.error = "Could not stage the verified extension.";
++    }
++    return result;
++  }
++  if (result.id == extensions::kIOSBundledExtensionId) {
++    result.error = "The package conflicts with a bundled extension.";
++    return result;
++  }
++  std::u16string parse_error;
++  auto extension = extensions::file_util::LoadExtension(
++      payload, extensions::mojom::ManifestLocation::kUnpacked,
++      extensions::Extension::REQUIRE_MODERN_MANIFEST_VERSION, &parse_error);
++  if (!extension || extension->id() != result.id) {
++    result.error = parse_error.empty() ? "The manifest ID does not match the signature."
++                                      : base::UTF16ToUTF8(parse_error);
++    return result;
++  }
++
++  result.name = extension->name();
++  result.version = extension->VersionString();
++  const auto& manifest = *extension->manifest()->value();
++  result.permissions = ManifestStrings(manifest, "permissions");
++  result.host_permissions = DeclaredHostPatterns(manifest);
++  result.profile_path = std::move(profile_path);
++  result.token = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  result.staging_path = workspace.Take();
++  return result;
++}
++
++base::FilePath PromoteSignedImportOnFileThread(base::FilePath profile_path,
++                                               base::FilePath staging_path,
++                                               std::string token) {
++  const auto root = profile_path.AppendASCII("TrustedUnpackedExtensions");
++  const auto target = root.AppendASCII(token);
++  const bool moved = base::CreateDirectory(root) && !base::IsLink(root) &&
++                     !base::PathExists(target) &&
++                     base::Move(staging_path.AppendASCII("extension"), target);
++  base::DeletePathRecursively(staging_path);
++  return moved ? target : base::FilePath();
++}
++
+ void EnsureIOSExtensionFactoriesBuilt() {
+   static const bool factories_built = [] {
+     extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
+@@ -1214,6 +1386,15 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                                       (void (^)(NSDictionary<NSString*, id>*
+                                                     extension,
+                                                 NSError* error))completion {
++  [self installExtensionFromTrustedDirectory:directoryPath
++                                  requiringID:nil
++                                   completion:completion];
++}
++
++- (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
++                                  requiringID:(NSString*)expectedID
++                                   completion:(void (^)(NSDictionary<NSString*, id>*,
++                                                        NSError*))completion {
+   InstallCompletionCallback finish =
+       completion ? base::BindOnce(completion)
+                  : InstallCompletionCallback(base::DoNothing());
+@@ -1267,6 +1448,7 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                      candidate_path),
+       base::BindOnce(
+           [](content::BrowserContext* original_context,
++             std::string verified_id,
+              InstallCompletionCallback finish_cb,
+              TrustedDirectoryResolution resolved) {
+             DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+@@ -1301,6 +1483,15 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+               return;
+             }
+ 
++            if (!verified_id.empty() &&
++                (resolved.extension_id != verified_id ||
++                 live_registry->GetInstalledExtension(verified_id))) {
++              std::move(finish_cb).Run(
++                  nil, SignedImportError(
++                           @"The verified ID changed or is already installed."));
++              return;
++            }
++
+             if (InFlightTrustedInstalls().contains(resolved.canonical_dir)) {
+               std::move(finish_cb).Run(
+                   nil,
+@@ -1430,7 +1621,171 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                 previous_id, shared_cb, std::move(shutdown_guard)));
+             installer->Load(resolved.canonical_dir);
+           },
+-          context, std::move(finish)));
++          context, expectedID ? base::SysNSStringToUTF8(expectedID)
++                              : std::string(),
++          std::move(finish)));
++}
++
++- (void)prepareSignedExtensionAtPath:(NSString*)path
++                          completion:(void (^)(NSDictionary<NSString*, id>*,
++                                               NSError*))completion {
++  if (!completion) {
++    return;
++  }
++  InstallCompletionCallback finish = base::BindOnce(completion);
++  base::FilePath profile;
++  extensions::ExtensionRegistry* registry = nullptr;
++  NSError* error = nil;
++  if (!ResolveSignedImportProfile(&profile, &registry, &error)) {
++    PostInstallCompletionOnMainThread(std::move(finish), nil, error);
++    return;
++  }
++  if (![path isKindOfClass:[NSString class]] || !path.isAbsolutePath ||
++      [path.pathExtension caseInsensitiveCompare:@"crx"] != NSOrderedSame) {
++    PostInstallCompletionOnMainThread(
++        std::move(finish), nil, SignedImportError(@"Choose a signed CRX file."));
++    return;
++  }
++  auto& state = SignedImportOnUIThread();
++  if (state.busy || state.prepared) {
++    PostInstallCompletionOnMainThread(
++        std::move(finish), nil,
++        SignedImportError(@"Finish or cancel the current extension review first."));
++    return;
++  }
++  state.busy = true;
++  extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&PrepareSignedImportOnFileThread, profile,
++                     base::FilePath(base::SysNSStringToUTF8(path))),
++      base::BindOnce(
++          [](InstallCompletionCallback reply, PreparedSignedImport result) {
++            auto& state = SignedImportOnUIThread();
++            state.busy = false;
++            if (!result.error.empty()) {
++              std::move(reply).Run(
++                  nil, SignedImportError(base::SysUTF8ToNSString(result.error)));
++              return;
++            }
++            base::FilePath active_profile;
++            extensions::ExtensionRegistry* registry = nullptr;
++            NSError* error = nil;
++            if (!ResolveSignedImportProfile(&active_profile, &registry, &error) ||
++                active_profile != result.profile_path ||
++                registry->GetInstalledExtension(result.id)) {
++              DeleteImportDirectory(std::move(result.staging_path));
++              std::move(reply).Run(
++                  nil, error ?: SignedImportError(
++                      @"The active profile changed or this extension is already installed."));
++              return;
++            }
++            NSDictionary* receipt = @{
++              @"token" : base::SysUTF8ToNSString(result.token),
++              @"id" : base::SysUTF8ToNSString(result.id),
++              @"name" : base::SysUTF8ToNSString(result.name),
++              @"version" : base::SysUTF8ToNSString(result.version),
++              @"permissions" : BridgeStrings(result.permissions),
++              @"hostPermissions" : BridgeStrings(result.host_permissions),
++            };
++            content::GetUIThreadTaskRunner({})->PostDelayedTask(
++                FROM_HERE,
++                base::BindOnce(
++                    [](const std::string& token) {
++                      auto& prepared = SignedImportOnUIThread().prepared;
++                      if (prepared && prepared->token == token) {
++                        DeleteImportDirectory(std::move(prepared->staging_path));
++                        prepared.reset();
++                      }
++                    },
++                    result.token),
++                base::Minutes(5));
++            state.prepared.emplace(std::move(result));
++            std::move(reply).Run(receipt, nil);
++          },
++          std::move(finish)));
++}
++
++- (BOOL)cancelPreparedExtensionWithToken:(NSString*)token
++                                   error:(NSError* __autoreleasing*)error {
++  base::FilePath profile;
++  extensions::ExtensionRegistry* registry = nullptr;
++  if (!ResolveSignedImportProfile(&profile, &registry, error)) {
++    return NO;
++  }
++  auto& prepared = SignedImportOnUIThread().prepared;
++  if (![token isKindOfClass:[NSString class]] || !prepared ||
++      prepared->profile_path != profile ||
++      prepared->token != base::SysNSStringToUTF8(token)) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"The extension review has expired.");
++    return NO;
++  }
++  DeleteImportDirectory(std::move(prepared->staging_path));
++  prepared.reset();
++  return YES;
++}
++
++- (void)confirmPreparedExtensionWithToken:(NSString*)token
++                               completion:(void (^)(NSDictionary<NSString*, id>*,
++                                                    NSError*))completion {
++  if (!completion) {
++    return;
++  }
++  base::FilePath profile;
++  extensions::ExtensionRegistry* registry = nullptr;
++  NSError* error = nil;
++  if (!ResolveSignedImportProfile(&profile, &registry, &error)) {
++    PostInstallCompletionOnMainThread(base::BindOnce(completion), nil, error);
++    return;
++  }
++  auto& state = SignedImportOnUIThread();
++  if (![token isKindOfClass:[NSString class]] || !state.prepared ||
++      state.prepared->profile_path != profile ||
++      state.prepared->token != base::SysNSStringToUTF8(token)) {
++    PostInstallCompletionOnMainThread(
++        base::BindOnce(completion), nil,
++        SignedImportError(@"The extension review has expired."));
++    return;
++  }
++  auto prepared = std::move(*state.prepared);
++  state.prepared.reset();
++  state.busy = true;
++  extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&PromoteSignedImportOnFileThread, profile,
++                     std::move(prepared.staging_path), std::move(prepared.token)),
++      base::BindOnce(
++          [](CrIOSExtensionManagerV1* manager,
++             base::FilePath original_profile, std::string verified_id,
++             void (^reply)(NSDictionary<NSString*, id>*, NSError*),
++             base::FilePath target) {
++            base::FilePath active_profile;
++            extensions::ExtensionRegistry* registry = nullptr;
++            NSError* error = nil;
++            if (target.empty() ||
++                !ResolveSignedImportProfile(&active_profile, &registry, &error) ||
++                active_profile != original_profile ||
++                registry->GetInstalledExtension(verified_id)) {
++              SignedImportOnUIThread().busy = false;
++              DeleteImportDirectory(std::move(target));
++              reply(nil, error ?: SignedImportError(
++                  @"Could not install the prepared extension in this profile."));
++              return;
++            }
++            [manager installExtensionFromTrustedDirectory:
++                         base::SysUTF8ToNSString(target.value())
++                                             requiringID:
++                         base::SysUTF8ToNSString(verified_id)
++                                              completion:
++                         ^(NSDictionary<NSString*, id>* entry, NSError* failure) {
++                           SignedImportOnUIThread().busy = false;
++                           if (failure || !entry) {
++                             DeleteImportDirectory(target);
++                           }
++                           reply(entry, failure);
++                         }];
++          },
++          self, profile, std::move(prepared.id), [completion copy]));
+ }
+ 
+ - (BOOL)dispatchCommandNamed:(NSString*)commandName
+diff --git a/ios/chrome/browser/extensions/model/ios_signed_extension_package.cc b/ios/chrome/browser/extensions/model/ios_signed_extension_package.cc
+new file mode 100644
+index 0000000..2171cf2
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_signed_extension_package.cc
+@@ -0,0 +1,643 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_signed_extension_package.h"
++
++#include <sys/stat.h>
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/threading/scoped_blocking_call.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "components/crx_file/crx_verifier.h"
++#include "components/crx_file/id_util.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/manifest_constants.h"
++#include "third_party/zlib/google/zip_reader.h"
++
++namespace extensions {
++
++namespace {
++
++constexpr int64_t kMaxCrxFileSizeBytes = 64LL * 1024 * 1024;
++constexpr uint64_t kMaxUnpackedTotalBytes = 128ULL * 1024 * 1024;
++constexpr uint64_t kMaxSingleFileBytes = 64ULL * 1024 * 1024;
++constexpr size_t kMaxZipEntries = 4096;
++constexpr size_t kMaxPathDepth = 32;
++constexpr size_t kMaxEntryPathBytes = 512;
++constexpr size_t kMaxManifestFileSizeBytes = 1024 * 1024;
++constexpr size_t kCopyBufferSizeBytes = 64 * 1024;
++
++void SetError(std::string* error, std::string_view message) {
++  if (error) {
++    *error = std::string(message);
++  }
++}
++
++std::string VerifierResultToErrorString(crx_file::VerifierResult result) {
++  switch (result) {
++    case crx_file::VerifierResult::OK_FULL:
++      return std::string();
++    case crx_file::VerifierResult::OK_DELTA:
++      return "Delta CRX packages are not supported.";
++    case crx_file::VerifierResult::ERROR_FILE_NOT_READABLE:
++      return "CRX file could not be read.";
++    case crx_file::VerifierResult::ERROR_HEADER_INVALID:
++      return "CRX3 header is invalid.";
++    case crx_file::VerifierResult::ERROR_EXPECTED_HASH_INVALID:
++      return "CRX expected hash is invalid.";
++    case crx_file::VerifierResult::ERROR_FILE_HASH_FAILED:
++      return "CRX file hash verification failed.";
++    case crx_file::VerifierResult::ERROR_SIGNATURE_INITIALIZATION_FAILED:
++      return "CRX signature initialization failed.";
++    case crx_file::VerifierResult::ERROR_SIGNATURE_VERIFICATION_FAILED:
++      return "CRX signature verification failed.";
++    case crx_file::VerifierResult::ERROR_REQUIRED_PROOF_MISSING:
++      return "CRX package is missing a required publisher signature.";
++  }
++  return "CRX verification failed.";
++}
++
++bool CopyBoundedRegularFile(const base::FilePath& source_path,
++                            const base::FilePath& dest_path,
++                            std::string* error) {
++  if (base::IsLink(source_path)) {
++    SetError(error, "Input CRX path must not be a symbolic link.");
++    return false;
++  }
++
++  base::File src_file(source_path,
++                      base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!src_file.IsValid()) {
++    SetError(error, "Unable to open input CRX file.");
++    return false;
++  }
++
++#if BUILDFLAG(IS_POSIX)
++  base::stat_wrapper_t st = {};
++  if (base::File::Fstat(src_file.GetPlatformFile(), &st) != 0 ||
++      !S_ISREG(st.st_mode)) {
++    SetError(error, "Input CRX path must refer to a regular file.");
++    return false;
++  }
++#endif
++
++  base::File::Info info;
++  if (!src_file.GetInfo(&info) || info.is_directory) {
++    SetError(error, "Input CRX path must not be a directory.");
++    return false;
++  }
++  if (info.size <= 0 || info.size > kMaxCrxFileSizeBytes) {
++    SetError(error, "Input CRX file is empty or exceeds the maximum size.");
++    return false;
++  }
++
++  base::File dst_file(dest_path,
++                      base::File::FLAG_CREATE | base::File::FLAG_WRITE);
++  if (!dst_file.IsValid()) {
++    SetError(error, "Failed to create temporary CRX working copy.");
++    return false;
++  }
++
++  std::array<uint8_t, kCopyBufferSizeBytes> buffer = {};
++  int64_t total_copied = 0;
++  while (true) {
++    std::optional<size_t> bytes_read = src_file.ReadAtCurrentPos(buffer);
++    if (!bytes_read.has_value()) {
++      SetError(error, "Failed while reading input CRX file.");
++      return false;
++    }
++    if (*bytes_read == 0) {
++      break;
++    }
++    const int64_t chunk_bytes = base::checked_cast<int64_t>(*bytes_read);
++    if (chunk_bytes > kMaxCrxFileSizeBytes - total_copied) {
++      SetError(error, "Input CRX file exceeds the maximum allowed size.");
++      return false;
++    }
++    if (!dst_file.WriteAtCurrentPosAndCheck(
++            base::span<const uint8_t>(buffer).first(*bytes_read))) {
++      SetError(error, "Failed while writing temporary CRX working copy.");
++      return false;
++    }
++    total_copied += chunk_bytes;
++  }
++
++  if (total_copied <= 0) {
++    SetError(error, "Input CRX file is empty.");
++    return false;
++  }
++
++  dst_file.Close();
++  src_file.Close();
++  return true;
++}
++
++bool HasDisallowedRawPathChar(char ch) {
++  const unsigned char uch = static_cast<unsigned char>(ch);
++  if (uch < 0x20 || uch == 0x7F) {
++    return true;
++  }
++  switch (ch) {
++    case '\\':
++    case ':':
++    case '<':
++    case '>':
++    case '"':
++    case '|':
++    case '?':
++    case '*':
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool ValidateAndSplitOriginalEntryPath(
++    const zip::ZipReader::Entry& entry,
++    std::string* out_clean_rel_path,
++    std::vector<std::string>* out_segments,
++    std::vector<std::string>* out_lower_prefixes) {
++  if (entry.is_unsafe || entry.is_symbolic_link || entry.is_encrypted ||
++      entry.uses_aes_encryption) {
++    return false;
++  }
++  if (entry.path != entry.physical_path) {
++    return false;
++  }
++  if (entry.path.empty() || entry.path.IsAbsolute() ||
++      entry.path.ReferencesParent()) {
++    return false;
++  }
++  if (!entry.is_directory && entry.path.EndsWithSeparator()) {
++    return false;
++  }
++
++  std::string_view raw_path(entry.path_in_original_encoding);
++  if (raw_path.empty() || raw_path.size() > kMaxEntryPathBytes ||
++      !base::IsStringUTF8(raw_path)) {
++    return false;
++  }
++  if (raw_path.front() == '/') {
++    return false;
++  }
++  for (char ch : raw_path) {
++    if (HasDisallowedRawPathChar(ch)) {
++      return false;
++    }
++  }
++
++  if (entry.is_directory) {
++    if (raw_path.back() != '/') {
++      return false;
++    }
++    raw_path.remove_suffix(1);
++    if (raw_path.empty() || raw_path.back() == '/') {
++      return false;
++    }
++  } else if (raw_path.back() == '/') {
++    return false;
++  }
++
++  std::vector<std::string> segments;
++  size_t pos = 0;
++  while (pos <= raw_path.size()) {
++    const size_t slash = raw_path.find('/', pos);
++    const std::string_view seg = (slash == std::string_view::npos)
++                                     ? raw_path.substr(pos)
++                                     : raw_path.substr(pos, slash - pos);
++    if (seg.empty() || seg == "." || seg == "..") {
++      return false;
++    }
++    segments.emplace_back(seg);
++    if (segments.size() > kMaxPathDepth) {
++      return false;
++    }
++    if (slash == std::string_view::npos) {
++      break;
++    }
++    pos = slash + 1;
++  }
++
++  if (segments.empty()) {
++    return false;
++  }
++
++  // Ensure ZipReader's normalized FilePath matches the validated raw segments
++  // without silent rewriting (such as DOT/UP/ROOT/0xFFFD substitution).
++  const std::vector<base::FilePath::StringType> normalized_components =
++      entry.path.StripTrailingSeparators().GetComponents();
++  if (normalized_components.size() != segments.size()) {
++    return false;
++  }
++  for (size_t i = 0; i < segments.size(); ++i) {
++    if (normalized_components[i] !=
++        base::FilePath::FromUTF8Unsafe(segments[i]).value()) {
++      return false;
++    }
++  }
++
++  std::vector<std::string> lower_prefixes;
++  lower_prefixes.reserve(segments.size());
++  std::string cumulative;
++  for (size_t i = 0; i < segments.size(); ++i) {
++    if (i > 0) {
++      cumulative.push_back('/');
++    }
++    cumulative += base::ToLowerASCII(segments[i]);
++    lower_prefixes.push_back(cumulative);
++  }
++
++  *out_clean_rel_path = std::string(raw_path);
++  *out_segments = std::move(segments);
++  *out_lower_prefixes = std::move(lower_prefixes);
++  return true;
++}
++
++class BoundedFileWriterDelegate final : public zip::WriterDelegate {
++ public:
++  BoundedFileWriterDelegate(base::FilePath output_file_path,
++                            uint64_t max_bytes)
++      : output_file_path_(std::move(output_file_path)),
++        max_bytes_(max_bytes) {}
++
++  BoundedFileWriterDelegate(const BoundedFileWriterDelegate&) = delete;
++  BoundedFileWriterDelegate& operator=(const BoundedFileWriterDelegate&) =
++      delete;
++  ~BoundedFileWriterDelegate() override = default;
++
++  bool PrepareOutput() override {
++    const base::FilePath parent_dir = output_file_path_.DirName();
++    if (!parent_dir.empty() && !base::CreateDirectory(parent_dir)) {
++      return false;
++    }
++    if (base::IsLink(output_file_path_)) {
++      return false;
++    }
++    file_.Initialize(output_file_path_,
++                     base::File::FLAG_CREATE | base::File::FLAG_WRITE);
++    return file_.IsValid();
++  }
++
++  bool WriteBytes(base::span<const uint8_t> data) override {
++    const uint64_t chunk_size = base::checked_cast<uint64_t>(data.size());
++    if (chunk_size > max_bytes_ - bytes_written_) {
++      return false;
++    }
++    if (!file_.WriteAtCurrentPosAndCheck(data)) {
++      return false;
++    }
++    bytes_written_ += chunk_size;
++    return true;
++  }
++
++  void OnError() override {
++    file_.Close();
++    base::DeleteFile(output_file_path_);
++    bytes_written_ = 0;
++  }
++
++  uint64_t bytes_written() const { return bytes_written_; }
++
++ private:
++  const base::FilePath output_file_path_;
++  const uint64_t max_bytes_;
++  base::File file_;
++  uint64_t bytes_written_ = 0;
++};
++
++bool ExtractVerifiedCrxArchive(const base::FilePath& crx_path,
++                               const base::FilePath& staging_dir,
++                               std::string* error) {
++  base::File crx_file(crx_path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!crx_file.IsValid()) {
++    SetError(error, "Unable to open verified CRX archive for extraction.");
++    return false;
++  }
++
++  zip::ZipReader reader;
++  if (!reader.OpenFromPlatformFile(crx_file.GetPlatformFile())) {
++    SetError(error, "CRX payload is not a valid ZIP archive.");
++    return false;
++  }
++
++  size_t entry_count = 0;
++  uint64_t total_extracted_bytes = 0;
++  std::set<std::string> seen_files;
++  std::set<std::string> explicit_dirs;
++  std::set<std::string> all_dirs;
++  bool has_manifest_json = false;
++
++  while (const zip::ZipReader::Entry* const entry = reader.Next()) {
++    ++entry_count;
++    if (entry_count > kMaxZipEntries) {
++      SetError(error, "CRX ZIP payload exceeds maximum entry count.");
++      return false;
++    }
++
++    if (entry->is_symbolic_link) {
++      SetError(error, "CRX ZIP payload must not contain symbolic links.");
++      return false;
++    }
++    if (entry->is_encrypted || entry->uses_aes_encryption) {
++      SetError(error, "CRX ZIP payload must not contain encrypted entries.");
++      return false;
++    }
++
++    std::string clean_rel_path;
++    std::vector<std::string> segments;
++    std::vector<std::string> lower_prefixes;
++    if (!ValidateAndSplitOriginalEntryPath(*entry, &clean_rel_path, &segments,
++                                           &lower_prefixes)) {
++      SetError(error, "CRX ZIP payload contains an unsafe or invalid path.");
++      return false;
++    }
++
++    // Verify ancestor directories do not collide with any previously seen file.
++    for (size_t i = 0; i + 1 < lower_prefixes.size(); ++i) {
++      if (seen_files.contains(lower_prefixes[i])) {
++        SetError(error,
++                 "CRX ZIP payload has a path conflict between file and "
++                 "directory.");
++        return false;
++      }
++      all_dirs.insert(lower_prefixes[i]);
++    }
++
++    const std::string& lower_full_path = lower_prefixes.back();
++    if (entry->is_directory) {
++      if (entry->original_size != 0) {
++        SetError(error,
++                 "CRX ZIP directory entry must not contain file payload.");
++        return false;
++      }
++      if (seen_files.contains(lower_full_path)) {
++        SetError(error,
++                 "CRX ZIP directory entry conflicts with an existing file.");
++        return false;
++      }
++      if (explicit_dirs.contains(lower_full_path)) {
++        SetError(error, "CRX ZIP payload contains a duplicate directory.");
++        return false;
++      }
++      explicit_dirs.insert(lower_full_path);
++      all_dirs.insert(lower_full_path);
++
++      const base::FilePath target_dir =
++          staging_dir.Append(entry->path.StripTrailingSeparators());
++      if (base::IsLink(target_dir) || !base::CreateDirectory(target_dir)) {
++        SetError(error, "Failed to create directory during CRX extraction.");
++        return false;
++      }
++      continue;
++    }
++
++    if (seen_files.contains(lower_full_path)) {
++      SetError(error, "CRX ZIP payload contains a duplicate file entry.");
++      return false;
++    }
++    if (all_dirs.contains(lower_full_path)) {
++      SetError(error,
++               "CRX ZIP file entry conflicts with an existing directory.");
++      return false;
++    }
++    seen_files.insert(lower_full_path);
++
++    if (entry->original_size < 0) {
++      SetError(error, "CRX ZIP entry reports an invalid uncompressed size.");
++      return false;
++    }
++
++    const uint64_t remaining_total_budget =
++        kMaxUnpackedTotalBytes - total_extracted_bytes;
++    const uint64_t entry_max_bytes =
++        std::min<uint64_t>(kMaxSingleFileBytes, remaining_total_budget);
++    if (static_cast<uint64_t>(entry->original_size) > entry_max_bytes) {
++      SetError(error, "CRX ZIP payload exceeds unpacked size limit.");
++      return false;
++    }
++
++    const base::FilePath target_file = staging_dir.Append(entry->path);
++    BoundedFileWriterDelegate writer(target_file, entry_max_bytes);
++    // ZipReader::ExtractCurrentEntry requires num_bytes_to_extract >= 1 to
++    // run its read loop (even for 0-byte files). BoundedFileWriterDelegate
++    // strictly enforces `entry_max_bytes`.
++    if (!reader.ExtractCurrentEntry(&writer, entry_max_bytes + 1)) {
++      SetError(error, "Failed to extract CRX ZIP entry within size limits.");
++      return false;
++    }
++
++    total_extracted_bytes += writer.bytes_written();
++    if (total_extracted_bytes > kMaxUnpackedTotalBytes) {
++      SetError(error, "CRX ZIP payload exceeds total unpacked size limit.");
++      return false;
++    }
++
++    if (clean_rel_path == "manifest.json" &&
++        entry->path == base::FilePath(kManifestFilename)) {
++      has_manifest_json = true;
++    }
++  }
++
++  if (!reader.ok()) {
++    SetError(error, "CRX ZIP payload is corrupt or unreadable.");
++    return false;
++  }
++
++  reader.Close();
++  crx_file.Close();
++
++  if (entry_count == 0 || !has_manifest_json) {
++    SetError(error, "CRX package is missing manifest.json.");
++    return false;
++  }
++
++  return true;
++}
++
++bool ValidateAndBindManifest(const base::FilePath& staging_dir,
++                             const std::string& verified_public_key_b64,
++                             const std::string& verified_public_key_bytes,
++                             const std::string& verified_crx_id,
++                             std::string* error) {
++  const base::FilePath manifest_path = staging_dir.Append(kManifestFilename);
++  if (base::IsLink(manifest_path) || !base::PathExists(manifest_path)) {
++    SetError(error, "Extracted extension is missing manifest.json.");
++    return false;
++  }
++
++  std::string manifest_contents;
++  if (!base::ReadFileToStringWithMaxSize(manifest_path, &manifest_contents,
++                                         kMaxManifestFileSizeBytes)) {
++    SetError(error,
++             "Unable to read manifest.json or manifest exceeds size limit.");
++    return false;
++  }
++
++  base::JSONReader::Result parsed_manifest =
++      base::JSONReader::ReadAndReturnValueWithError(
++          manifest_contents, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  if (!parsed_manifest.has_value() || !parsed_manifest->is_dict()) {
++    SetError(error, "Extension manifest.json is not a valid JSON object.");
++    return false;
++  }
++
++  base::DictValue manifest_dict = std::move(*parsed_manifest).TakeDict();
++
++  const std::optional<int> manifest_version =
++      manifest_dict.FindInt(manifest_keys::kManifestVersion);
++  if (!manifest_version.has_value() || *manifest_version != 3) {
++    SetError(error, "Only Manifest V3 extensions are supported.");
++    return false;
++  }
++
++  if (const base::Value* existing_key_value =
++          manifest_dict.Find(manifest_keys::kPublicKey)) {
++    const std::string* existing_key = existing_key_value->GetIfString();
++    if (!existing_key || existing_key->empty()) {
++      SetError(error, "Manifest 'key' must be a non-empty string.");
++      return false;
++    }
++
++    std::string existing_key_bytes;
++    if (!Extension::ParsePEMKeyBytes(*existing_key, &existing_key_bytes) ||
++        existing_key_bytes.empty()) {
++      SetError(error, "Manifest 'key' is not a valid public key.");
++      return false;
++    }
++
++    if (existing_key_bytes != verified_public_key_bytes ||
++        crx_file::id_util::GenerateId(existing_key_bytes) != verified_crx_id) {
++      SetError(error,
++               "Manifest 'key' does not match the verified CRX publisher key.");
++      return false;
++    }
++  }
++
++  manifest_dict.Set(manifest_keys::kPublicKey, verified_public_key_b64);
++
++  std::optional<std::string> rewritten_manifest = base::WriteJsonWithOptions(
++      manifest_dict, base::JSONWriter::OPTIONS_PRETTY_PRINT);
++  if (!rewritten_manifest.has_value()) {
++    SetError(error, "Failed to serialize updated manifest.json.");
++    return false;
++  }
++
++  if (!base::DeleteFile(manifest_path) ||
++      !base::WriteFile(manifest_path, *rewritten_manifest)) {
++    SetError(error, "Failed to write updated manifest.json.");
++    return false;
++  }
++
++  return true;
++}
++
++}  // namespace
++
++bool PrepareSignedExtensionPackage(const base::FilePath& input_crx,
++                                   const base::FilePath& staging_dir,
++                                   std::string* verified_id,
++                                   std::string* error) {
++  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
++                                                base::BlockingType::MAY_BLOCK);
++
++  if (verified_id) {
++    verified_id->clear();
++  }
++  if (error) {
++    error->clear();
++  }
++
++  if (input_crx.empty()) {
++    SetError(error, "Input CRX path must not be empty.");
++    return false;
++  }
++  if (staging_dir.empty()) {
++    SetError(error, "Staging directory path must not be empty.");
++    return false;
++  }
++  if (base::IsLink(staging_dir) || !base::DirectoryExists(staging_dir) ||
++      !base::IsDirectoryEmpty(staging_dir)) {
++    SetError(error,
++             "Staging directory must be an existing empty non-symlink "
++             "directory.");
++    return false;
++  }
++
++  base::ScopedTempDir working_temp_dir;
++  if (!working_temp_dir.CreateUniqueTempDir()) {
++    SetError(error, "Failed to create temporary working directory.");
++    return false;
++  }
++
++  const base::FilePath working_crx_path =
++      working_temp_dir.GetPath().AppendASCII("package.crx");
++  if (!CopyBoundedRegularFile(input_crx, working_crx_path, error)) {
++    return false;
++  }
++
++  std::string verified_public_key_b64;
++  std::string verified_crx_id;
++  const crx_file::VerifierResult verify_result = crx_file::Verify(
++      working_crx_path, crx_file::VerifierFormat::CRX3_WITH_PUBLISHER_PROOF,
++      /*required_key_hashes=*/{}, /*required_file_hash=*/{},
++      &verified_public_key_b64, &verified_crx_id,
++      /*compressed_verified_contents=*/nullptr);
++  if (verify_result != crx_file::VerifierResult::OK_FULL) {
++    SetError(error, VerifierResultToErrorString(verify_result));
++    return false;
++  }
++
++  if (verified_public_key_b64.empty() ||
++      !crx_file::id_util::IdIsValid(verified_crx_id)) {
++    SetError(error, "Verified CRX did not produce a valid extension identity.");
++    return false;
++  }
++
++  std::string verified_public_key_bytes;
++  if (!Extension::ParsePEMKeyBytes(verified_public_key_b64,
++                                    &verified_public_key_bytes) ||
++      verified_public_key_bytes.empty() ||
++      crx_file::id_util::GenerateId(verified_public_key_bytes) !=
++          verified_crx_id) {
++    SetError(error, "Verified CRX public key could not be validated.");
++    return false;
++  }
++
++  if (!ExtractVerifiedCrxArchive(working_crx_path, staging_dir, error)) {
++    return false;
++  }
++
++  if (!ValidateAndBindManifest(staging_dir, verified_public_key_b64,
++                               verified_public_key_bytes, verified_crx_id,
++                               error)) {
++    return false;
++  }
++
++  if (verified_id) {
++    *verified_id = std::move(verified_crx_id);
++  }
++  return true;
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_signed_extension_package.h b/ios/chrome/browser/extensions/model/ios_signed_extension_package.h
+new file mode 100644
+index 0000000..0b059f6
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_signed_extension_package.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_SIGNED_EXTENSION_PACKAGE_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_SIGNED_EXTENSION_PACKAGE_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++#include "extensions/buildflags/buildflags.h"
++
++static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace extensions {
++
++// Verifies a publisher-signed CRX3 package at `input_crx`, safely extracts its
++// payload into `staging_dir`, validates that it is Manifest V3, and enforces
++// manifest `"key"` binding (injecting the verified public key if absent, or
++// requiring an exact match if present).
++//
++// Must be called on a background sequence that allows blocking file I/O.
++// `staging_dir` must be an existing, empty, non-symlink private directory owned
++// by the caller; on failure, the caller is responsible for cleaning it up.
++//
++// On success, returns true, sets `verified_id` (if non-null) to the verified
++// 32-character extension ID, and leaves `staging_dir` ready for
++// `UnpackedInstaller`. On failure, returns false and populates `error` (if
++// non-null).
++bool PrepareSignedExtensionPackage(const base::FilePath& input_crx,
++                                   const base::FilePath& staging_dir,
++                                   std::string* verified_id,
++                                   std::string* error);
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_SIGNED_EXTENSION_PACKAGE_H_

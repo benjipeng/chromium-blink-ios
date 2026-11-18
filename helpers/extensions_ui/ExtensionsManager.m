@@ -1,5 +1,6 @@
 #import "CrIOSExtensionManagingV1.h"
 #import <UIKit/UIKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -313,9 +314,11 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
   return YES;
 }
 
-@interface ExtensionsManagerViewController : UITableViewController
+@interface ExtensionsManagerViewController
+    : UITableViewController <UIDocumentPickerDelegate>
 @property(nonatomic, copy) NSArray<ExtensionEntryModel *> *entries;
 @property(nonatomic, copy) NSString *statusError;
+@property(nonatomic, assign) BOOL importInProgress;
 @end
 
 @implementation ExtensionsManagerViewController
@@ -335,6 +338,20 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
                            action:@selector(handleDoneTapped:)];
   doneButton.accessibilityIdentifier = @"kExtensionsManagerDoneButtonId";
   self.navigationItem.rightBarButtonItem = doneButton;
+
+  id<CrIOSExtensionManagingV1> manager = ResolveExtensionManager(NULL);
+  if ([manager respondsToSelector:@selector(prepareSignedExtensionAtPath:completion:)] &&
+      [manager respondsToSelector:@selector(confirmPreparedExtensionWithToken:completion:)] &&
+      [manager respondsToSelector:@selector(cancelPreparedExtensionWithToken:error:)]) {
+    UIBarButtonItem *importButton = [[UIBarButtonItem alloc]
+        initWithImage:[UIImage systemImageNamed:@"plus"]
+                style:UIBarButtonItemStylePlain
+               target:self
+               action:@selector(pickExtensionFile)];
+    importButton.accessibilityLabel = @"Import from Files";
+    importButton.accessibilityIdentifier = @"kExtensionsImportFromFilesButtonId";
+    self.navigationItem.rightBarButtonItems = @[doneButton, importButton];
+  }
 
   [self reloadSnapshot];
 }
@@ -372,6 +389,99 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
   self.entries = items ?: @[];
   self.statusError = err;
   [self.tableView reloadData];
+}
+
+- (void)pickExtensionFile {
+  if (self.importInProgress || self.presentedViewController) return;
+  UTType *type = [UTType typeWithFilenameExtension:@"crx"];
+  UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+      initForOpeningContentTypes:@[type ?: UTTypeData] asCopy:YES];
+  picker.delegate = self;
+  [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)reviewPreparedImport:(NSDictionary *)prepared
+                     manager:(id<CrIOSExtensionManagingV1>)manager {
+  NSString *token = prepared[@"token"];
+  if (!self.viewIfLoaded.window || self.presentedViewController) {
+    [manager cancelPreparedExtensionWithToken:token error:nil];
+    self.importInProgress = NO;
+    return;
+  }
+  NSString *permissions = [prepared[@"permissions"] componentsJoinedByString:@", "];
+  NSString *hosts = [prepared[@"hostPermissions"] componentsJoinedByString:@", "];
+  NSString *description = [NSString stringWithFormat:
+      @"Version %@ · Chrome Web Store signature verified\n\n"
+       "Requested permissions: %@\n\nSite access: %@\n\n"
+       "This extension is available until Chromium restarts.",
+      prepared[@"version"], permissions.length ? permissions : @"None",
+      hosts.length ? hosts : @"None"];
+  UIAlertController *review = [UIAlertController alertControllerWithTitle:prepared[@"name"]
+      message:description preferredStyle:UIAlertControllerStyleAlert];
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  [review addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel
+      handler:^(__unused UIAlertAction *action) {
+    [manager cancelPreparedExtensionWithToken:token error:nil];
+    weakSelf.importInProgress = NO;
+  }]];
+  [review addAction:[UIAlertAction actionWithTitle:@"Add Extension" style:UIAlertActionStyleDefault
+      handler:^(__unused UIAlertAction *action) {
+    [manager confirmPreparedExtensionWithToken:token
+        completion:^(NSDictionary *entry, NSError *error) {
+      ExtensionsManagerViewController *view = weakSelf;
+      view.importInProgress = NO;
+      [view reloadSnapshot];
+      if ((!entry || error) && view.viewIfLoaded.window) {
+        PresentOptionsAlert(view, @"Could Not Import Extension",
+                            error.localizedDescription ?: @"Chromium could not confirm the install.");
+      }
+    }];
+  }]];
+  [self presentViewController:review animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+  if (self.importInProgress) return;
+  NSURL *url = urls.firstObject;
+  if (!url.isFileURL || [url.pathExtension caseInsensitiveCompare:@"crx"] != NSOrderedSame) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      PresentOptionsAlert(self, @"Could Not Import Extension", @"Choose a signed CRX file.");
+    });
+    return;
+  }
+  id<CrIOSExtensionManagingV1> manager = ResolveExtensionManager(NULL);
+  if (![manager respondsToSelector:@selector(prepareSignedExtensionAtPath:completion:)]) {
+    return;
+  }
+  self.importInProgress = YES;
+  BOOL access = [url startAccessingSecurityScopedResource];
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  [manager prepareSignedExtensionAtPath:url.path
+      completion:^(NSDictionary *prepared, NSError *error) {
+    if (access) [url stopAccessingSecurityScopedResource];
+    void (^show)(void) = ^{
+      ExtensionsManagerViewController *view = weakSelf;
+      if (!view) {
+        if (prepared[@"token"]) [manager cancelPreparedExtensionWithToken:prepared[@"token"] error:nil];
+        return;
+      }
+      if (!prepared || error) {
+        view.importInProgress = NO;
+        if (view.viewIfLoaded.window) {
+          PresentOptionsAlert(view, @"Could Not Import Extension",
+                              error.localizedDescription ?: @"The file could not be verified.");
+        }
+        return;
+      }
+      [view reviewPreparedImport:prepared manager:manager];
+    };
+    id<UIViewControllerTransitionCoordinator> transition = controller.transitionCoordinator;
+    if (!transition ||
+        ![transition animateAlongsideTransition:nil completion:^(__unused id context) { show(); }]) {
+      dispatch_async(dispatch_get_main_queue(), show);
+    }
+  }];
 }
 
 - (void)configureAccessibilityForCell:(UITableViewCell *)cell

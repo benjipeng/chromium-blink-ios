@@ -86,6 +86,7 @@ COMMON_FLAGS=(
   -install_name "$INSTALL_NAME"
   -framework Foundation
   -framework UIKit
+  -framework UniformTypeIdentifiers
 )
 
 SOURCES=("$HERE/ExtensionsManager.m")

@@ -20,6 +20,7 @@ probe_compile() {
   fi
   cat > "$art/compile_targets.txt" <<'EOF'
 obj/extensions/common/common/extension.o
+obj/extensions/common/api/api_features/api_features.o
 obj/extensions/browser/browser_sources/process_manager.o
 obj/extensions/renderer/renderer/dispatcher.o
 obj/extensions/browser/browser_sources/extension_registrar_factory.o
@@ -77,6 +78,7 @@ obj/ios/web/content/init/extensions/ios_api_features/ios_api_features.o
 obj/ios/web/content/init/extensions/ios_api_json_strings/generated_schemas.o
 obj/ios/chrome/browser/extensions/model/model/ios_commands_api.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_api_provider.o
+obj/ios/chrome/browser/extensions/model/model/ios_signed_extension_package.o
 EOF
   python3 - <<'PY'
 import os

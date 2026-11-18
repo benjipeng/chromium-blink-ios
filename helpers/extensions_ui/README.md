@@ -12,6 +12,7 @@ Native UIKit extension manager (`Settings -> Extensions`) compiled as a standalo
 
 - **Known cold-restart reset**: `UnpackedInstaller::AddNewOrUpdatedExtension` reloads unpacked fixtures with default `GetDisableReasonsOnInstalled() == {}`, clearing canonical user-disabled state across cold restarts in the diagnostic build. No `NSUserDefaults` workaround is included.
 - **No uBOL support**: Supports basic extension listing and enable/disable toggling for installed extensions; uBlock Origin Lite (`uBOL`), extension installation, and `chrome://extensions` routing are out of scope.
+- **Optional Files CRX import (`CrIOSExtensionManagingV1.h`, `ExtensionsManager.m`)**: When the active bridge responds to `-prepareSignedExtensionAtPath:completion:`, `-confirmPreparedExtensionWithToken:completion:`, and `-cancelPreparedExtensionWithToken:error:`, `ExtensionsManagerViewController` shows an `Import from Files…` section using `UIDocumentPickerViewController` (`asCopy:YES`, `.crx` validation, app-local path) followed by a session-only permission review sheet (`permissions` and `hostPermissions`). Cancel invokes `-cancelPreparedExtensionWithToken:error:`; confirmation reloads the extension list.
 - **CI integration**: CI patch `0063` provides `CrIOSExtensionManagerV1` natively inside `chrome_framework`; production builds of this helper require `0063` and include no diagnostic fallback.
 
 ## Build
