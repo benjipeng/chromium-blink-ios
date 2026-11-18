@@ -20,6 +20,7 @@ ios/chrome/browser/shared/model/browser/browser_list.h
 ios/chrome/browser/shared/model/browser/browser_list_factory.h
 ios/chrome/browser/shared/model/web_state_list/web_state_list.h
 ios/chrome/browser/tab_switcher/ui_bundled/tab_utils.h
+ios/chrome/browser/toolbar/ui/toolbar_view_controller.mm
 ios/web/public/navigation/navigation_manager.h
 ios/web/public/navigation/reload_type.h
 ios/web/public/web_state.h
