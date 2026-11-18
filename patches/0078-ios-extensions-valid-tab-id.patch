@@ -1,0 +1,208 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+--- a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
+@@ -5,11 +5,16 @@
+ #ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
+ #define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
+
++#include "base/memory/raw_ptr.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "extensions/browser/extension_web_contents_observer.h"
+ #include "extensions/buildflags/buildflags.h"
+
+ static_assert(BUILDFLAG(ENABLE_EXTENSIONS_CORE));
++
++namespace content {
++class WebContents;
++}  // namespace content
+
+ namespace extensions {
+
+@@ -30,6 +35,9 @@
+
+   explicit IOSExtensionWebContentsObserver(content::WebContents* web_contents);
+
++  int tab_id_ = 0;
++  raw_ptr<content::WebContents> tracked_web_contents_ = nullptr;
++
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+--- a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+
+ #import "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
++
++#include "content/public/browser/web_contents.h"
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#include "ios/web/content/web_state/content_web_state.h"
+
+ namespace extensions {
+
+@@ -21,9 +25,23 @@
+     content::WebContents* web_contents)
+     : ExtensionWebContentsObserver(web_contents),
+       content::WebContentsUserData<IOSExtensionWebContentsObserver>(
+-          *web_contents) {}
++          *web_contents) {
++  const auto id =
++      web::ContentWebState::GetUniqueIdentifierForWebContents(*web_contents);
++  if (id.valid()) {
++    tab_id_ = id.identifier();
++    tracked_web_contents_ = web_contents;
++    IOSExtensionsBrowserClient::GetInstance()->RegisterTabWebContents(
++        tab_id_, web_contents);
++  }
++}
+
+-IOSExtensionWebContentsObserver::~IOSExtensionWebContentsObserver() = default;
++IOSExtensionWebContentsObserver::~IOSExtensionWebContentsObserver() {
++  if (tab_id_ > 0) {
++    IOSExtensionsBrowserClient::GetInstance()->UnregisterTabWebContents(
++        tab_id_, tracked_web_contents_);
++  }
++}
+
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(IOSExtensionWebContentsObserver);
+
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+
+ #include "base/containers/flat_map.h"
+@@ -81,6 +82,11 @@
+                               ProfileIOS* profile);
+   void UnregisterBrowserContext(content::BrowserContext* context);
+   std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
++
++  // Tracks live ContentWebState-backed tabs for extension request attribution.
++  void RegisterTabWebContents(int tab_id, content::WebContents* web_contents);
++  void UnregisterTabWebContents(int tab_id,
++                                content::WebContents* web_contents);
+
+   // Records a canonicalized path and derived/manifest ID for an allowed
+   // bundled or profile-trusted unpacked extension.
+@@ -192,6 +198,10 @@
+   void GetTabAndWindowIdForWebContents(content::WebContents* web_contents,
+                                        int* tab_id,
+                                        int* window_id) override;
++  bool IsValidTabId(content::BrowserContext* browser_context,
++                    int tab_id,
++                    bool include_incognito,
++                    content::WebContents** web_contents) const override;
+   void CreateExtensionWebContentsObserver(
+       content::WebContents* web_contents) override;
+   ExtensionWebContentsObserver* GetExtensionWebContentsObserver(
+@@ -258,9 +268,17 @@
+   std::atomic<bool> is_shutting_down_{false};
+   bool initialized_ = false;
+
++  struct RegisteredTab {
++    raw_ptr<content::WebContents> web_contents;
++    raw_ptr<content::BrowserContext> browser_context;
++  };
++
+   mutable base::Lock context_lock_;
+   base::flat_map<content::BrowserContext*, raw_ptr<ProfileIOS>>
+       registered_contexts_ GUARDED_BY(context_lock_);
++
++  std::unordered_map<int, RegisteredTab> registered_tabs_
++      GUARDED_BY(context_lock_);
+
+   mutable base::Lock bundled_allowlist_lock_;
+   base::flat_map<base::FilePath, ExtensionId> allowed_extensions_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -868,6 +868,42 @@
+     content::BrowserContext* context) {
+   base::AutoLock lock(context_lock_);
+   registered_contexts_.erase(context);
++  for (auto it = registered_tabs_.begin(); it != registered_tabs_.end();) {
++    if (it->second.browser_context == context) {
++      it = registered_tabs_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
++void IOSExtensionsBrowserClient::RegisterTabWebContents(
++    int tab_id,
++    content::WebContents* web_contents) {
++  if (tab_id <= 0 || !web_contents) {
++    return;
++  }
++  content::BrowserContext* browser_context = web_contents->GetBrowserContext();
++  if (!browser_context) {
++    return;
++  }
++  base::AutoLock lock(context_lock_);
++  registered_tabs_.insert_or_assign(
++      tab_id, RegisteredTab{web_contents, browser_context});
++}
++
++void IOSExtensionsBrowserClient::UnregisterTabWebContents(
++    int tab_id,
++    content::WebContents* web_contents) {
++  if (tab_id <= 0) {
++    return;
++  }
++  base::AutoLock lock(context_lock_);
++  auto it = registered_tabs_.find(tab_id);
++  if (it != registered_tabs_.end() &&
++      (!web_contents || it->second.web_contents == web_contents)) {
++    registered_tabs_.erase(it);
++  }
+ }
+
+ void IOSExtensionsBrowserClient::SetAllowedBundledExtension(
+@@ -1237,6 +1273,39 @@
+   if (id.valid()) {
+     *tab_id = id.identifier();
+   }
++}
++
++bool IOSExtensionsBrowserClient::IsValidTabId(
++    content::BrowserContext* browser_context,
++    int tab_id,
++    bool include_incognito,
++    content::WebContents** web_contents) const {
++  (void)include_incognito;
++  if (web_contents) {
++    *web_contents = nullptr;
++  }
++  if (!content::BrowserThread::CurrentlyOn(content::BrowserThread::UI) ||
++      is_shutting_down_.load(std::memory_order_relaxed) || !browser_context ||
++      tab_id <= 0) {
++    return false;
++  }
++  base::AutoLock lock(context_lock_);
++  if (!registered_contexts_.contains(browser_context)) {
++    return false;
++  }
++  auto it = registered_tabs_.find(tab_id);
++  if (it == registered_tabs_.end() || !it->second.web_contents ||
++      it->second.web_contents->IsBeingDestroyed()) {
++    return false;
++  }
++  if (it->second.browser_context != browser_context ||
++      it->second.web_contents->GetBrowserContext() != browser_context) {
++    return false;
++  }
++  if (web_contents) {
++    *web_contents = it->second.web_contents;
++  }
++  return true;
+ }
+
+ void IOSExtensionsBrowserClient::CreateExtensionWebContentsObserver(
