@@ -1,0 +1,68 @@
+diff --git a/extensions/browser/api/declarative_net_request/action_tracker.h b/extensions/browser/api/declarative_net_request/action_tracker.h
+--- a/extensions/browser/api/declarative_net_request/action_tracker.h
++++ b/extensions/browser/api/declarative_net_request/action_tracker.h
+@@ -95,6 +95,11 @@
+       const Extension& extension,
+       const std::optional<int>& tab_id,
+       const base::Time& min_time_stamp);
++
++  // Returns network requests blocked or collapsed by `extension_id` on the
++  // tab's current document. Excludes redirects and header modifications.
++  size_t GetBlockedRequestCountForTab(const ExtensionId& extension_id,
++                                      int tab_id) const;
+
+   // Returns the number of matched rules in `rules_tracked_` for the given
+   // `extension_id` and `tab_id`. If `trim_non_active_rules` is true,
+@@ -164,6 +169,7 @@
+     // The number of actions matched. Invalid when the corresponding
+     // TrackedInfoContextKey has a tab_id of -1. Does not include allow rules.
+     size_t action_count = 0;
++    size_t blocked_request_count = 0;
+
+     // The list of rules matched. Includes allow rules.
+     std::list<TrackedRule> matched_rules;
+diff --git a/extensions/browser/api/declarative_net_request/action_tracker.cc b/extensions/browser/api/declarative_net_request/action_tracker.cc
+--- a/extensions/browser/api/declarative_net_request/action_tracker.cc
++++ b/extensions/browser/api/declarative_net_request/action_tracker.cc
+@@ -158,11 +158,16 @@
+       tab_id != extension_misc::kUnknownTabId &&
+       !request_action.IsAllowOrAllowAllRequests();
+
++  const bool blocked_request =
++      tab_id != extension_misc::kUnknownTabId &&
++      request_action.IsBlockOrCollapse();
++
+   if (IsMainFrameNavigationRequest(request_info)) {
+     DCHECK(request_info.navigation_id);
+     TrackedInfo& pending_info = pending_navigation_actions_[{
+         extension_id, *request_info.navigation_id}];
+     add_matched_rule_if_needed(&pending_info, request_action);
++    pending_info.blocked_request_count += blocked_request;
+
+     if (increment_action_count) {
+       pending_info.action_count++;
+@@ -172,6 +177,7 @@
+
+   TrackedInfo& tracked_info = rules_tracked_[{extension_id, tab_id}];
+   add_matched_rule_if_needed(&tracked_info, request_action);
++  tracked_info.blocked_request_count += blocked_request;
+
+   if (!increment_action_count) {
+     return;
+@@ -186,6 +192,16 @@
+   ExtensionsAPIClient::Get()->UpdateActionCount(browser_context_, extension_id,
+                                                 tab_id, action_count,
+                                                 false /* clear_badge_text */);
++}
++
++size_t ActionTracker::GetBlockedRequestCountForTab(
++    const ExtensionId& extension_id,
++    int tab_id) const {
++  if (tab_id == extension_misc::kUnknownTabId) {
++    return 0;
++  }
++  const auto info = rules_tracked_.find({extension_id, tab_id});
++  return info == rules_tracked_.end() ? 0 : info->second.blocked_request_count;
+ }
+
+ void ActionTracker::OnActionCountAsBadgeTextPreferenceEnabled(

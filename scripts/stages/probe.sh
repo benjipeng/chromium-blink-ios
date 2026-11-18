@@ -57,6 +57,7 @@ obj/extensions/browser/api/scripting/scripting/scripting_api.o
 obj/extensions/browser/api/user_scripts/user_scripts/user_scripts_api.o
 obj/extensions/browser/api/system_info/system_info/system_info_provider.o
 obj/extensions/browser/browser_sources/web_request_api.o
+obj/extensions/browser/browser_sources/action_tracker.o
 obj/extensions/browser/browser_sources/web_request_proxying_url_loader_factory.o
 obj/extensions/browser/browser_sources/extension_web_request_event_router.o
 obj/extensions/browser/browser_sources/rules_monitor_service.o
