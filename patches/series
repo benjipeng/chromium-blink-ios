@@ -61,3 +61,4 @@
 0069-ios-extensions-options-and-navigation.patch
 0070-ios-disable-unsupported-management-api.patch
 0071-ios-import-publisher-signed-crx.patch
+0072-ios-prepare-store-download.patch

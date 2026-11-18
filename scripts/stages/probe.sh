@@ -79,6 +79,7 @@ obj/ios/web/content/init/extensions/ios_api_json_strings/generated_schemas.o
 obj/ios/chrome/browser/extensions/model/model/ios_commands_api.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_api_provider.o
 obj/ios/chrome/browser/extensions/model/model/ios_signed_extension_package.o
+obj/ios/chrome/browser/extensions/model/model/ios_store_crx_download.o
 EOF
   python3 - <<'PY'
 import os

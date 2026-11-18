@@ -7,6 +7,10 @@
                    enabled:(BOOL)enabled
                      error:(NSError *__autoreleasing *)error;
 @optional
+- (void)prepareStoreExtensionWithID:(NSString *)storeID
+                          completion:
+                              (void (^)(NSDictionary<NSString *, id> *prepared,
+                                        NSError *error))completion;
 - (void)prepareSignedExtensionAtPath:(NSString *)path
                           completion:
                               (void (^)(NSDictionary<NSString *, id> *prepared,

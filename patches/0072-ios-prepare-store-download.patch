@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: prepare a verified package from the Store
+
+Fetch the full CRX3 from the official updater with no cookies, bounded
+bytes and an exact HTTPS redirect allowlist. Bind the verified package to
+the requested Store ID, then reuse the signed Files import review.
+
+---
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 83ab1c6..58f7546 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -22,6 +22,8 @@ source_set("model") {
+     "ios_extensions_browser_client.mm",
+     "ios_signed_extension_package.cc",
+     "ios_signed_extension_package.h",
++    "ios_store_crx_download.h",
++    "ios_store_crx_download.mm",
+   ]
+ 
+   public_deps = [
+@@ -52,6 +54,8 @@ source_set("model") {
+     "//ios/chrome/browser/shared/model/profile",
+     "//ios/chrome/common",
+     "//ios/web/content",
++    "//net",
++    "//services/network/public/cpp",
+     "//services/network/public/mojom",
+     "//third_party/blink/public/common",
+     "//third_party/zlib/google:zip",
+diff --git a/ios/chrome/browser/extensions/model/DEPS b/ios/chrome/browser/extensions/model/DEPS
+index 140a0a1..b4d99a6 100644
+--- a/ios/chrome/browser/extensions/model/DEPS
++++ b/ios/chrome/browser/extensions/model/DEPS
+@@ -9,6 +9,9 @@ include_rules = [
+   "+extensions/common",
+   "+ios/chrome/browser/extensions/model",
+   "+ios/web/content",
++  "+net",
++  "+services/network/public/cpp",
++  "+services/network/public/mojom",
+   "+third_party/blink/public/common",
+   "+third_party/blink/public/mojom",
+   "+third_party/zlib/google",
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index adfbe1d..89b6511 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -82,6 +82,7 @@
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
+ #include "ios/chrome/browser/extensions/model/ios_signed_extension_package.h"
++#include "ios/chrome/browser/extensions/model/ios_store_crx_download.h"
+ #include "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #include "ios/chrome/browser/shared/model/paths/paths.h"
+ #include "ios/chrome/browser/shared/model/profile/profile_ios.h"
+@@ -108,6 +109,9 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+ - (BOOL)dispatchCommandNamed:(NSString*)commandName
+            toExtensionWithID:(NSString*)extensionId
+                        error:(NSError* __autoreleasing*)error;
++- (void)prepareStoreExtensionWithID:(NSString*)storeID
++                          completion:(void (^)(NSDictionary<NSString*, id>*,
++                                               NSError*))completion;
+ - (void)prepareSignedExtensionAtPath:(NSString*)path
+                           completion:(void (^)(NSDictionary<NSString*, id>*,
+                                                NSError*))completion;
+@@ -359,6 +363,7 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+ struct SignedImportState {
+   bool busy = false;
+   std::optional<PreparedSignedImport> prepared;
++  std::unique_ptr<extensions::IOSStoreCrxDownload> download;
+ };
+ 
+ SignedImportState& SignedImportOnUIThread() {
+@@ -496,6 +501,76 @@ PreparedSignedImport PrepareSignedImportOnFileThread(
+   return moved ? target : base::FilePath();
+ }
+ 
++// A non-empty expected ID denotes an owned Store download. Clean up the
++// temporary file after staging and bind the package to the selected listing.
++void QueueSignedImport(base::FilePath profile,
++                       base::FilePath source,
++                       std::string expected_id,
++                       InstallCompletionCallback finish) {
++  SignedImportOnUIThread().busy = true;
++  extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::FilePath profile, base::FilePath source, std::string expected_id) {
++            PreparedSignedImport result = PrepareSignedImportOnFileThread(
++                std::move(profile), source);
++            if (!expected_id.empty()) {
++              base::DeleteFile(source);
++              if (result.error.empty() && result.id != expected_id) {
++                base::DeletePathRecursively(result.staging_path);
++                result.error = "The signed CRX did not match the Store listing.";
++              }
++            }
++            return result;
++          },
++          std::move(profile), std::move(source), std::move(expected_id)),
++      base::BindOnce(
++          [](InstallCompletionCallback reply, PreparedSignedImport result) {
++            auto& state = SignedImportOnUIThread();
++            state.busy = false;
++            if (!result.error.empty()) {
++              std::move(reply).Run(
++                  nil, SignedImportError(base::SysUTF8ToNSString(result.error)));
++              return;
++            }
++            base::FilePath active_profile;
++            extensions::ExtensionRegistry* registry = nullptr;
++            NSError* error = nil;
++            if (!ResolveSignedImportProfile(&active_profile, &registry, &error) ||
++                active_profile != result.profile_path ||
++                registry->GetInstalledExtension(result.id)) {
++              DeleteImportDirectory(std::move(result.staging_path));
++              std::move(reply).Run(
++                  nil, error ?: SignedImportError(
++                      @"The active profile changed or this extension is already installed."));
++              return;
++            }
++            NSDictionary* receipt = @{
++              @"token" : base::SysUTF8ToNSString(result.token),
++              @"id" : base::SysUTF8ToNSString(result.id),
++              @"name" : base::SysUTF8ToNSString(result.name),
++              @"version" : base::SysUTF8ToNSString(result.version),
++              @"permissions" : BridgeStrings(result.permissions),
++              @"hostPermissions" : BridgeStrings(result.host_permissions),
++            };
++            content::GetUIThreadTaskRunner({})->PostDelayedTask(
++                FROM_HERE,
++                base::BindOnce(
++                    [](const std::string& token) {
++                      auto& prepared = SignedImportOnUIThread().prepared;
++                      if (prepared && prepared->token == token) {
++                        DeleteImportDirectory(std::move(prepared->staging_path));
++                        prepared.reset();
++                      }
++                    },
++                    result.token),
++                base::Minutes(5));
++            state.prepared.emplace(std::move(result));
++            std::move(reply).Run(receipt, nil);
++          },
++          std::move(finish)));
++}
++
+ void EnsureIOSExtensionFactoriesBuilt() {
+   static const bool factories_built = [] {
+     extensions::EnsureBrowserContextKeyedServiceFactoriesBuilt();
+@@ -1626,6 +1701,62 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+           std::move(finish)));
+ }
+ 
++- (void)prepareStoreExtensionWithID:(NSString*)storeID
++                          completion:(void (^)(NSDictionary<NSString*, id>*,
++                                               NSError*))completion {
++  if (!completion) return;
++
++  InstallCompletionCallback finish = base::BindOnce(completion);
++  base::FilePath profile;
++  extensions::ExtensionRegistry* registry = nullptr;
++  NSError* error = nil;
++  if (!ResolveSignedImportProfile(&profile, &registry, &error)) {
++    PostInstallCompletionOnMainThread(std::move(finish), nil, error);
++    return;
++  }
++  const std::string id = [storeID isKindOfClass:[NSString class]]
++      ? base::SysNSStringToUTF8(storeID) : std::string();
++  if (!crx_file::id_util::IdIsValid(id) || registry->GetInstalledExtension(id)) {
++    PostInstallCompletionOnMainThread(
++        std::move(finish), nil,
++        SignedImportError(@"Choose a valid Store listing that is not installed."));
++    return;
++  }
++  auto& state = SignedImportOnUIThread();
++  if (state.busy || state.prepared) {
++    PostInstallCompletionOnMainThread(
++        std::move(finish), nil,
++        SignedImportError(@"Finish or cancel the current extension review first."));
++    return;
++  }
++  state.busy = true;
++  state.download = std::make_unique<extensions::IOSStoreCrxDownload>();
++  state.download->Start(id, base::BindOnce(
++      [](base::FilePath original_profile, std::string expected_id,
++         InstallCompletionCallback finish, base::FilePath downloaded,
++         const char* download_error) {
++        auto& state = SignedImportOnUIThread();
++        state.download.reset();
++        base::FilePath profile;
++        extensions::ExtensionRegistry* registry = nullptr;
++        NSError* error = nil;
++        if (download_error ||
++            !ResolveSignedImportProfile(&profile, &registry, &error) ||
++            profile != original_profile) {
++          state.busy = false;
++          DeleteImportDirectory(std::move(downloaded));
++          PostInstallCompletionOnMainThread(
++              std::move(finish), nil,
++              error ?: SignedImportError(download_error
++                  ? base::SysUTF8ToNSString(download_error)
++                  : @"The active profile changed."));
++          return;
++        }
++        QueueSignedImport(std::move(profile), std::move(downloaded),
++                          std::move(expected_id), std::move(finish));
++      }, profile, id, std::move(finish)));
++}
++
+ - (void)prepareSignedExtensionAtPath:(NSString*)path
+                           completion:(void (^)(NSDictionary<NSString*, id>*,
+                                                NSError*))completion {
+@@ -1653,56 +1784,9 @@ - (void)prepareSignedExtensionAtPath:(NSString*)path
+         SignedImportError(@"Finish or cancel the current extension review first."));
+     return;
+   }
+-  state.busy = true;
+-  extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+-      FROM_HERE,
+-      base::BindOnce(&PrepareSignedImportOnFileThread, profile,
+-                     base::FilePath(base::SysNSStringToUTF8(path))),
+-      base::BindOnce(
+-          [](InstallCompletionCallback reply, PreparedSignedImport result) {
+-            auto& state = SignedImportOnUIThread();
+-            state.busy = false;
+-            if (!result.error.empty()) {
+-              std::move(reply).Run(
+-                  nil, SignedImportError(base::SysUTF8ToNSString(result.error)));
+-              return;
+-            }
+-            base::FilePath active_profile;
+-            extensions::ExtensionRegistry* registry = nullptr;
+-            NSError* error = nil;
+-            if (!ResolveSignedImportProfile(&active_profile, &registry, &error) ||
+-                active_profile != result.profile_path ||
+-                registry->GetInstalledExtension(result.id)) {
+-              DeleteImportDirectory(std::move(result.staging_path));
+-              std::move(reply).Run(
+-                  nil, error ?: SignedImportError(
+-                      @"The active profile changed or this extension is already installed."));
+-              return;
+-            }
+-            NSDictionary* receipt = @{
+-              @"token" : base::SysUTF8ToNSString(result.token),
+-              @"id" : base::SysUTF8ToNSString(result.id),
+-              @"name" : base::SysUTF8ToNSString(result.name),
+-              @"version" : base::SysUTF8ToNSString(result.version),
+-              @"permissions" : BridgeStrings(result.permissions),
+-              @"hostPermissions" : BridgeStrings(result.host_permissions),
+-            };
+-            content::GetUIThreadTaskRunner({})->PostDelayedTask(
+-                FROM_HERE,
+-                base::BindOnce(
+-                    [](const std::string& token) {
+-                      auto& prepared = SignedImportOnUIThread().prepared;
+-                      if (prepared && prepared->token == token) {
+-                        DeleteImportDirectory(std::move(prepared->staging_path));
+-                        prepared.reset();
+-                      }
+-                    },
+-                    result.token),
+-                base::Minutes(5));
+-            state.prepared.emplace(std::move(result));
+-            std::move(reply).Run(receipt, nil);
+-          },
+-          std::move(finish)));
++  QueueSignedImport(std::move(profile),
++                    base::FilePath(base::SysNSStringToUTF8(path)),
++                    /*expected_id=*/{}, std::move(finish));
+ }
+ 
+ - (BOOL)cancelPreparedExtensionWithToken:(NSString*)token
+diff --git a/ios/chrome/browser/extensions/model/ios_store_crx_download.h b/ios/chrome/browser/extensions/model/ios_store_crx_download.h
+new file mode 100644
+index 0000000..afc9117
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_store_crx_download.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_STORE_CRX_DOWNLOAD_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_STORE_CRX_DOWNLOAD_H_
++
++#include <memory>
++#include <string_view>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++
++namespace net {
++struct RedirectInfo;
++}
++namespace network {
++class SimpleURLLoader;
++}
++
++namespace extensions {
++
++// One user-initiated, UI-sequence request. Destroy the owner to cancel it.
++// A successful callback takes ownership of the temporary CRX. It must verify
++// the package and bind its ID to the request before presenting permissions.
++class IOSStoreCrxDownload {
++ public:
++  using Completion = base::OnceCallback<void(base::FilePath, const char*)>;
++
++  IOSStoreCrxDownload();
++  ~IOSStoreCrxDownload();
++  void Start(std::string_view id, Completion callback);
++
++ private:
++  void Redirected(const net::RedirectInfo& redirect);
++  void Completed(base::FilePath path);
++  void Finish(base::FilePath path, const char* error);
++
++  Completion completion_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  int redirects_ = 0;
++  base::WeakPtrFactory<IOSStoreCrxDownload> weak_factory_{this};
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_STORE_CRX_DOWNLOAD_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_store_crx_download.mm b/ios/chrome/browser/extensions/model/ios_store_crx_download.mm
+new file mode 100644
+index 0000000..963f96f
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_store_crx_download.mm
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_store_crx_download.h"
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/time/time.h"
++#include "components/crx_file/id_util.h"
++#include "components/version_info/version_info.h"
++#include "ios/chrome/browser/shared/model/application_context/application_context.h"
++#include "net/base/net_errors.h"
++#include "net/base/url_util.h"
++#include "net/http/http_response_headers.h"
++#include "net/http/http_status_code.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "net/url_request/redirect_info.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/gurl.h"
++
++namespace extensions {
++namespace {
++
++bool IsStoreDownloadURL(const GURL& url) {
++  return url.SchemeIs("https") && !url.has_username() && !url.has_password() &&
++         url.EffectiveIntPort() == 443 &&
++         (url.host() == "clients2.google.com" ||
++          url.host() == "clients2.googleusercontent.com" ||
++          url.host() == "dl.google.com");
++}
++
++const char* DownloadError(int http_status, int net_error) {
++  if (http_status == net::HTTP_NO_CONTENT ||
++      http_status == net::HTTP_NOT_FOUND || http_status == net::HTTP_GONE) {
++    return "The Store did not provide a package for this version of Chromium.";
++  }
++  if (net_error == net::ERR_TIMED_OUT)
++    return "The Store download timed out.";
++  if (net_error == net::ERR_INTERNET_DISCONNECTED)
++    return "Chromium is offline.";
++  if (net_error == net::ERR_INSUFFICIENT_RESOURCES)
++    return "The CRX exceeds 64 MiB.";
++  return "The Store package could not be downloaded.";
++}
++
++}  // namespace
++
++IOSStoreCrxDownload::IOSStoreCrxDownload() = default;
++IOSStoreCrxDownload::~IOSStoreCrxDownload() = default;
++
++void IOSStoreCrxDownload::Start(std::string_view id, Completion callback) {
++  CHECK(!completion_);
++  completion_ = std::move(callback);
++  if (!crx_file::id_util::IdIsValid(id)) {
++    Finish({}, "Choose a valid Chrome Web Store listing.");
++    return;
++  }
++  auto factory = GetApplicationContext()->GetSharedURLLoaderFactory();
++  if (!factory) {
++    Finish({}, "Chromium could not start the Store request.");
++    return;
++  }
++  auto request = std::make_unique<network::ResourceRequest>();
++  GURL url("https://clients2.google.com/service/update2/crx");
++  url = net::AppendQueryParameter(url, "response", "redirect");
++  url = net::AppendQueryParameter(url, "prodversion",
++                                  version_info::GetVersionNumber());
++  url = net::AppendQueryParameter(url, "acceptformat", "crx3");
++  request->url = net::AppendQueryParameter(
++      url, "x", "id=" + std::string(id) + "&installsource=ondemand&uc");
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  loader_ = network::SimpleURLLoader::Create(
++      std::move(request),
++      net::DefineNetworkTrafficAnnotation("ios_user_store_crx", R"(
++        semantics {
++          sender: "iOS extension installer"
++          description: "Downloads the signed package for a user-selected Chrome Web Store extension."
++          trigger: "The user asks to review an extension for installation."
++          data: "The public extension ID and Chromium version. No user data."
++          destination: GOOGLE_OWNED_SERVICE
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "Only sent when the user requests installation."
++          policy_exception_justification: "No policy controls this user-initiated request."
++        })"));
++  loader_->SetTimeoutDuration(base::Seconds(30));
++  loader_->SetOnRedirectCallback(base::BindRepeating(
++      [](base::WeakPtr<IOSStoreCrxDownload> self, const GURL&,
++         const net::RedirectInfo& redirect,
++         const network::mojom::URLResponseHead&, std::vector<std::string>*) {
++        if (self)
++          self->Redirected(redirect);
++      },
++      weak_factory_.GetWeakPtr()));
++  loader_->DownloadToTempFile(factory.get(),
++                              base::BindOnce(&IOSStoreCrxDownload::Completed,
++                                             weak_factory_.GetWeakPtr()),
++                              64 * 1024 * 1024);
++}
++
++void IOSStoreCrxDownload::Redirected(const net::RedirectInfo& redirect) {
++  if (++redirects_ > 3 || redirect.new_method != "GET" ||
++      !IsStoreDownloadURL(redirect.new_url)) {
++    Finish({}, "The Store returned an unexpected download redirect.");
++  }
++}
++
++void IOSStoreCrxDownload::Completed(base::FilePath path) {
++  const auto* response = loader_->ResponseInfo();
++  const int status =
++      response && response->headers ? response->headers->response_code() : 0;
++  // The verifier still owns the trust decision. Hand off any returned path so
++  // the caller can remove it even on a rejected response.
++  const char* error = path.empty() || status != net::HTTP_OK ||
++                              !IsStoreDownloadURL(loader_->GetFinalURL())
++                          ? DownloadError(status, loader_->NetError())
++                          : nullptr;
++  Finish(std::move(path), error);
++}
++
++void IOSStoreCrxDownload::Finish(base::FilePath path, const char* error) {
++  loader_.reset();
++  auto callback = std::move(completion_);
++  std::move(callback).Run(std::move(path), error);
++}
++
++}  // namespace extensions

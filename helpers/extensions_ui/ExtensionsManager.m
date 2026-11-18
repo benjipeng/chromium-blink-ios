@@ -321,6 +321,27 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
 @property(nonatomic, assign) BOOL importInProgress;
 @end
 
+static NSString *StoreIDFromListingURL(NSString *input) {
+  NSURLComponents *url = [NSURLComponents componentsWithString:
+      [input stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
+  if (![url.scheme.lowercaseString isEqualToString:@"https"] ||
+      ![url.host.lowercaseString isEqualToString:@"chromewebstore.google.com"] ||
+      url.user || url.password || (url.port && url.port.integerValue != 443)) {
+    return nil;
+  }
+  NSArray<NSString *> *parts = url.path.pathComponents;
+  if ((parts.count != 3 && parts.count != 4) ||
+      ![parts[1] isEqualToString:@"detail"]) {
+    return nil;
+  }
+  NSString *extensionID = parts.lastObject;
+  NSCharacterSet *invalid =
+      [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnop"].invertedSet;
+  return extensionID.length == 32 &&
+      [extensionID rangeOfCharacterFromSet:invalid].location == NSNotFound
+      ? extensionID : nil;
+}
+
 @implementation ExtensionsManagerViewController
 
 - (instancetype)init {
@@ -350,6 +371,25 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
                action:@selector(pickExtensionFile)];
     importButton.accessibilityLabel = @"Import from Files";
     importButton.accessibilityIdentifier = @"kExtensionsImportFromFilesButtonId";
+    if ([manager respondsToSelector:@selector(prepareStoreExtensionWithID:completion:)]) {
+      __weak ExtensionsManagerViewController *weakSelf = self;
+      importButton = [[UIBarButtonItem alloc]
+          initWithImage:[UIImage systemImageNamed:@"plus"]
+                   menu:[UIMenu menuWithChildren:@[
+        [UIAction actionWithTitle:@"From Chrome Web Store Link…"
+                            image:[UIImage systemImageNamed:@"link"]
+                       identifier:nil handler:^(__unused UIAction *action) {
+          [weakSelf promptForStoreLink];
+        }],
+        [UIAction actionWithTitle:@"Import from Files…"
+                            image:[UIImage systemImageNamed:@"folder"]
+                       identifier:nil handler:^(__unused UIAction *action) {
+          [weakSelf pickExtensionFile];
+        }],
+      ]]];
+      importButton.accessibilityLabel = @"Add Extension";
+      importButton.accessibilityIdentifier = @"kExtensionsAddButtonId";
+    }
     self.navigationItem.rightBarButtonItems = @[doneButton, importButton];
   }
 
@@ -398,6 +438,63 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
       initForOpeningContentTypes:@[type ?: UTTypeData] asCopy:YES];
   picker.delegate = self;
   [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)promptForStoreLink {
+  if (self.importInProgress || self.presentedViewController) return;
+  UIAlertController *prompt = [UIAlertController
+      alertControllerWithTitle:@"Chrome Web Store Link"
+      message:@"Paste a link to the extension’s Store listing."
+      preferredStyle:UIAlertControllerStyleAlert];
+  [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
+    field.placeholder = @"https://chromewebstore.google.com/detail/…";
+    field.keyboardType = UIKeyboardTypeURL;
+    field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    field.autocorrectionType = UITextAutocorrectionTypeNo;
+  }];
+  [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+  __weak UIAlertController *weakPrompt = prompt;
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  [prompt addAction:[UIAlertAction actionWithTitle:@"Review" style:UIAlertActionStyleDefault
+      handler:^(__unused UIAlertAction *action) {
+    NSString *extensionID = StoreIDFromListingURL(weakPrompt.textFields.firstObject.text);
+    void (^start)(void) = ^{ [weakSelf prepareStoreID:extensionID]; };
+    id<UIViewControllerTransitionCoordinator> transition = weakPrompt.transitionCoordinator;
+    if (!transition ||
+        ![transition animateAlongsideTransition:nil completion:^(__unused id context) { start(); }]) {
+      dispatch_async(dispatch_get_main_queue(), start);
+    }
+  }]];
+  [self presentViewController:prompt animated:YES completion:nil];
+}
+
+- (void)prepareStoreID:(NSString *)extensionID {
+  if (self.importInProgress || !self.viewIfLoaded.window) return;
+  if (!extensionID) {
+    PresentOptionsAlert(self, @"Invalid Store Link", @"Choose a Chrome Web Store extension listing.");
+    return;
+  }
+  id<CrIOSExtensionManagingV1> manager = ResolveExtensionManager(NULL);
+  if (![manager respondsToSelector:@selector(prepareStoreExtensionWithID:completion:)]) {
+    return;
+  }
+  self.importInProgress = YES;
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  [manager prepareStoreExtensionWithID:extensionID
+      completion:^(NSDictionary *prepared, NSError *error) {
+    ExtensionsManagerViewController *view = weakSelf;
+    if (!view) {
+      if (prepared[@"token"]) [manager cancelPreparedExtensionWithToken:prepared[@"token"] error:nil];
+    } else if (error || !prepared) {
+      view.importInProgress = NO;
+      if (view.viewIfLoaded.window) {
+        PresentOptionsAlert(view, @"Could Not Prepare Extension",
+                            error.localizedDescription ?: @"The Store did not provide a verified package.");
+      }
+    } else {
+      [view reviewPreparedImport:prepared manager:manager];
+    }
+  }];
 }
 
 - (void)reviewPreparedImport:(NSDictionary *)prepared
