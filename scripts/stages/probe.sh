@@ -18,6 +18,8 @@ probe_compile() {
       log "No usable warm codegen ccache bucket; continuing with compiler verification"
     fi
   fi
+  # Composebox requires Swift-generated headers and is checked by the normal
+  # build after it restores the Apple stage outputs.
   cat > "$art/compile_targets.txt" <<'EOF'
 obj/extensions/common/common/extension.o
 obj/extensions/common/api/api_features/api_features.o
@@ -36,7 +38,6 @@ obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system_factory.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_web_contents_observer.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_client.o
-obj/ios/chrome/browser/composebox/ui/ui/composebox_view_controller.o
 obj/components/policy/core/common/internal/policy_merger.o
 obj/extensions/common/common/command.o
 obj/extensions/common/common/content_script_utils.o
