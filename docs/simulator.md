@@ -21,6 +21,17 @@ xcrun simctl launch "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.ext
 
 Set `simulator_udid` to the intended simulator before running the install and launch commands. A simulator pass is evidence about that runtime. The original artifact remains a device build.
 
+## Verify the extension lifecycle
+
+Use a real Chrome Web Store listing and a publisher-signed CRX of the same extension. Keep neither package in the repository. For Files testing, copy the fixture into `Documents` of the isolated app's data container, found with `xcrun simctl get_app_container "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.extlifetest data`.
+
+1. Open the Store listing and verify the tab stays open. In **Settings → Extensions**, use the official listing link to reach the native review. Cancel and verify the list does not change.
+2. In **Import from Files…**, select a copy of the signed package with a changed archive byte. Verify rejection before the install review. Select the genuine package and confirm. Record the extension's name, version, ID, and declared access from the review.
+3. Open **Options** from Settings and verify it belongs to the installed extension. Run the filtering check below. Then remove the extension, confirm the list changes, and run the same check again.
+4. Reinstall from the official Store link and verify the same ID and renewed filtering. The app should acquire and verify the package without a staging service or diagnostic bridge.
+
+Verify startup restoration separately on a build that implements it: cold-launch with the extension enabled and disabled, then once more after removal. Check the saved state against filtering behavior rather than the row alone.
+
 ## Verify request filtering
 
 From the repository, serve the fixture on loopback:
