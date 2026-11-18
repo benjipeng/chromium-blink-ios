@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Checks the patch series on GitHub using only the pinned files it modifies."""
+"""Validate a pinned patch series or the bundled probe in an applied source tree."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 import concurrent.futures
 import hashlib
@@ -136,6 +137,15 @@ def validate_patched_probe_identity(patched_src: pathlib.Path) -> str:
 def main() -> int:
     if os.environ.get("GITHUB_ACTIONS") != "true":
         sys.exit("Run this source-file preflight on GitHub Actions, not locally.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--patched-source", type=pathlib.Path,
+                        help="check the bundled probe after applying patches to a pinned snapshot")
+    args = parser.parse_args()
+    if args.patched_source is not None:
+        probe_id = validate_patched_probe_identity(args.patched_source)
+        print(f"Verified bundled probe files and manifest key ID: {probe_id}", flush=True)
+        return 0
+
     root = pathlib.Path(__file__).resolve().parent.parent
     lock = dict(line.split("=", 1) for line in (root / "version.lock").read_text().splitlines()
                 if "=" in line and not line.lstrip().startswith("#"))
