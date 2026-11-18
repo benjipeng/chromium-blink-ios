@@ -169,11 +169,12 @@ static BOOL SetExtensionEnabled(NSString *extensionId,
   BOOL ok = [manager setExtensionWithID:extensionId
                                 enabled:targetEnabled
                                   error:&error];
-  BOOL actual = targetEnabled;
+  BOOL actual = outActualEnabled ? *outActualEnabled : !targetEnabled;
   NSString *refreshedOptionsURL = nil;
   BOOL foundInLatest = NO;
+  NSError *readError = nil;
   NSArray<NSDictionary<NSString *, id> *> *latest =
-      [manager extensionsWithError:nil];
+      [manager extensionsWithError:&readError];
   for (id obj in latest) {
     if (![obj isKindOfClass:NSDictionary.class]) continue;
     NSDictionary *dict = (NSDictionary *)obj;
@@ -190,21 +191,23 @@ static BOOL SetExtensionEnabled(NSString *extensionId,
       break;
     }
   }
-  if (!ok && !latest) {
-    actual = !targetEnabled;
-  }
   if (outActualEnabled) *outActualEnabled = actual;
   if (outOptionsPageURL && (foundInLatest || !actual)) {
     *outOptionsPageURL = actual ? refreshedOptionsURL : nil;
   }
-  if (!ok && outError) {
-    *outError = error.localizedDescription.length > 0
-                    ? error.localizedDescription
-                    : @"Failed to update extension state";
+  BOOL confirmed = ok && foundInLatest && actual == targetEnabled;
+  if (!confirmed && outError) {
+    if (!ok) {
+      *outError = error.localizedDescription ?: @"Failed to update extension state";
+    } else if (!foundInLatest) {
+      *outError = readError.localizedDescription ?: @"Could not confirm the extension's state";
+    } else {
+      *outError = @"Chromium did not apply the requested state";
+    }
   }
   NSLog(@"EXTENSIONS_MANAGER toggle id=%@ target=%d actual=%d ok=%d",
-        extensionId, targetEnabled, actual, ok);
-  return ok;
+        extensionId, targetEnabled, actual, confirmed);
+  return confirmed;
 }
 
 static id FindSceneHandlerForViewController(UIViewController *vc) {
@@ -426,16 +429,20 @@ static BOOL OpenOptionsPageInBrowser(UIViewController *fromVC,
     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                   reuseIdentifier:kReuseID];
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    cell.textLabel.adjustsFontForContentSizeCategory = YES;
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    cell.detailTextLabel.adjustsFontForContentSizeCategory = YES;
     cell.detailTextLabel.numberOfLines = 2;
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
   }
 
   ExtensionEntryModel *entry = self.entries[(NSUInteger)indexPath.row];
   cell.textLabel.text = entry.name;
-  cell.detailTextLabel.text =
-      entry.version.length > 0
-          ? [NSString stringWithFormat:@"v%@  %@", entry.version, entry.extensionId]
-          : entry.extensionId;
+  cell.detailTextLabel.text = entry.version.length > 0
+      ? [NSString stringWithFormat:@"Version %@", entry.version]
+      : nil;
 
   [self configureAccessoryForCell:cell atRow:indexPath.row withEntry:entry existingSwitch:nil];
   return cell;
