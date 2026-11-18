@@ -47,7 +47,7 @@ diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layou
 diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
 --- a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
 +++ b/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layout.mm
-@@ -214,24 +214,110 @@
+@@ -214,24 +214,111 @@
    return section;
  }
 
@@ -111,10 +111,11 @@ diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layou
 +    const CGFloat width = layout_environment.container.contentSize.width;
 +    const BOOL rtl = UseRTLLayout();
 +    // A group lays out in leading-to-trailing order before UIKit mirrors it.
++    const CGFloat pixel = 1.0 / MAX(1.0, layout_environment.traitCollection.displayScale);
 +    const CGFloat first =
-+        rtl ? width - CGRectGetMaxX(division) : CGRectGetMinX(division);
++        (rtl ? width - CGRectGetMaxX(division) : CGRectGetMinX(division)) - pixel;
 +    const CGFloat last =
-+        rtl ? width - CGRectGetMinX(division) : CGRectGetMaxX(division);
++        (rtl ? width - CGRectGetMinX(division) : CGRectGetMaxX(division)) + pixel;
 +    const CGFloat start = section_insets.leading + spacing;
 +    const CGFloat end = width - section_insets.trailing - spacing;
 +    const CGFloat group_width = end - start;
@@ -162,7 +163,7 @@ diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layou
    NSCollectionLayoutSize* item_size =
        [NSCollectionLayoutSize sizeWithWidthDimension:item_width_dimension
                                       heightDimension:item_height_dimension];
-@@ -242,7 +328,9 @@
+@@ -242,7 +329,9 @@
    const CGFloat width = layout_environment.container.effectiveContentSize.width;
    // Estimate the height of the group by ignoring spacings.
    NSCollectionLayoutDimension* group_height_dimension =
@@ -173,10 +174,11 @@ diff --git a/ios/chrome/browser/tab_switcher/ui_bundled/tab_grid/grid/grid_layou
    NSCollectionLayoutSize* group_size =
        [NSCollectionLayoutSize sizeWithWidthDimension:FractionalWidth(1.)
                                       heightDimension:group_height_dimension];
-@@ -251,7 +339,7 @@
+@@ -250,8 +339,7 @@
+       [NSCollectionLayoutGroup horizontalGroupWithLayoutSize:group_size
                                              repeatingSubitem:item
                                                         count:count];
-   const CGFloat spacing = Spacing(layout_environment);
+-  const CGFloat spacing = Spacing(layout_environment);
 -  group.interItemSpacing = [NSCollectionLayoutSpacing fixedSpacing:spacing];
 +  group.interItemSpacing = [NSCollectionLayoutSpacing fixedSpacing:gap];
 
