@@ -59,8 +59,6 @@ jobs:
       need_sdk: ${{ steps.preflight.outputs.need_sdk }}
     steps:
       - uses: actions/checkout@v5
-      - name: Check patch series before scheduling build stages
-        run: python3 scripts/check_remote_patches.py
       - id: preflight
         run: ./scripts/stage.sh plan preflight
 
@@ -131,6 +129,9 @@ jobs:
       - name: Prepare tree, plan & audit
         if: steps.check.outputs.done != 'true'
         run: ./scripts/stage.sh codegen prepare
+      - name: Check bundled probe in the patched source snapshot
+        if: steps.check.outputs.done != 'true'
+        run: python3 scripts/check_remote_patches.py --patched-source /tmp/cb_work/src
       - id: build
         name: Build host tools, Rust & generated files
         if: steps.check.outputs.done != 'true'
