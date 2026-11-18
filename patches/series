@@ -63,3 +63,4 @@
 0071-ios-import-publisher-signed-crx.patch
 0072-ios-prepare-store-download.patch
 0073-ios-extension-uninstall.patch
+0074-ios-signed-extension-consent-and-session.patch

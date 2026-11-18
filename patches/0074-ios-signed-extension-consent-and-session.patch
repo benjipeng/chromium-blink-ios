@@ -1,0 +1,460 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 6da38b5..e589d92 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -8,7 +8,6 @@
+ 
+ #include <memory>
+ #include <optional>
+-#include <set>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -17,6 +16,7 @@
+ #include "base/base_paths.h"
+ #include "base/check.h"
+ #include "base/command_line.h"
++#include "base/containers/flat_map.h"
+ #include "base/containers/flat_set.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+@@ -70,6 +70,7 @@
+ #include "extensions/browser/url_request_util.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
++#include "extensions/common/extension_l10n_util.h"
+ #include "extensions/common/file_util.h"
+ #include "extensions/common/extension_set.h"
+ #include "extensions/common/features/feature_channel.h"
+@@ -77,7 +78,10 @@
+ #include "extensions/common/manifest_handlers/background_info.h"
+ #include "extensions/common/manifest_handlers/manifest_url_handlers.h"
+ #include "extensions/common/manifest_handlers/options_page_info.h"
++#include "extensions/common/manifest_handlers/permissions_parser.h"
+ #include "extensions/common/mojom/manifest.mojom-shared.h"
++#include "extensions/common/permissions/manifest_permission.h"
++#include "extensions/common/permissions/permission_set.h"
+ #include "extensions/common/switches.h"
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
+@@ -197,9 +201,9 @@ void SetBridgeError(NSError* __autoreleasing* error,
+   return [entry copy];
+ }
+ 
+-base::flat_set<base::FilePath>& InFlightTrustedInstalls() {
++base::flat_set<extensions::ExtensionId>& InFlightTrustedInstalls() {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+-  static base::NoDestructor<base::flat_set<base::FilePath>> in_flight;
++  static base::NoDestructor<base::flat_set<extensions::ExtensionId>> in_flight;
+   return *in_flight;
+ }
+ 
+@@ -365,9 +369,11 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+ };
+ 
+ struct SignedImportState {
++  size_t generation = 0;
++  base::FilePath profile;
+   bool busy = false;
+   // Only this verified installer can claim ownership of an unpacked copy.
+-  base::flat_set<base::FilePath> installed_paths;
++  base::flat_map<base::FilePath, extensions::ExtensionId> installed_paths;
+   std::optional<PreparedSignedImport> prepared;
+   std::unique_ptr<extensions::IOSStoreCrxDownload> download;
+ };
+@@ -378,6 +384,11 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+   return *state;
+ }
+ 
++bool IsCurrentSignedImport(size_t generation) {
++  return content::BrowserThread::CurrentlyOn(content::BrowserThread::UI) &&
++         SignedImportOnUIThread().generation == generation;
++}
++
+ NSError* SignedImportError(NSString* message) {
+   return MakeBridgeError(kCrIOSExtensionManagerErrorStateChangeFailed, message);
+ }
+@@ -390,6 +401,40 @@ void DeleteImportDirectory(base::FilePath directory) {
+   }
+ }
+ 
++void ResetSignedImports() {
++  auto& state = SignedImportOnUIThread();
++  ++state.generation;
++  state.profile = base::FilePath();
++  state.busy = false;
++  state.download.reset();
++  if (state.prepared) {
++    DeleteImportDirectory(std::move(state.prepared->staging_path));
++    state.prepared.reset();
++  }
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  for (const auto& [path, id] : state.installed_paths) {
++    client->RestoreTrustedExtensionCandidate(path, id, std::nullopt);
++  }
++  state.installed_paths.clear();
++}
++
++void SweepSignedImportDirectories(base::FilePath profile) {
++  // Restoring verified installations is a separate step. Do not accumulate
++  // orphaned copies for the current session-only installer.
++  if (profile.empty() || base::IsLink(profile)) {
++    return;
++  }
++  const auto pending = profile.AppendASCII("PendingSignedExtension");
++  const auto trusted = profile.AppendASCII("TrustedUnpackedExtensions");
++  const auto signed_imports = trusted.AppendASCII("SignedImports");
++  if (!base::IsLink(pending)) {
++    base::DeletePathRecursively(pending);
++  }
++  if (!base::IsLink(trusted) && !base::IsLink(signed_imports)) {
++    base::DeletePathRecursively(signed_imports);
++  }
++}
++
+ bool ResolveSignedImportProfile(base::FilePath* profile_path,
+                                 extensions::ExtensionRegistry** registry,
+                                 NSError* __autoreleasing* error) {
+@@ -406,34 +451,12 @@ bool ResolveSignedImportProfile(base::FilePath* profile_path,
+                    @"The active profile has no directory.");
+     return false;
+   }
+-  return true;
+-}
+-
+-std::vector<std::string> ManifestStrings(const base::DictValue& manifest,
+-                                         std::string_view field) {
+-  std::vector<std::string> result;
+-  if (const auto* values = manifest.FindList(field)) {
+-    for (const auto& value : *values) {
+-      if (const auto* text = value.GetIfString()) {
+-        result.push_back(*text);
+-      }
+-    }
+-  }
+-  return result;
+-}
+-
+-std::vector<std::string> DeclaredHostPatterns(const base::DictValue& manifest) {
+-  const auto declared = ManifestStrings(manifest, "host_permissions");
+-  std::set<std::string> hosts(declared.begin(), declared.end());
+-  if (const auto* scripts = manifest.FindList("content_scripts")) {
+-    for (const auto& script : *scripts) {
+-      if (const auto* dict = script.GetIfDict()) {
+-        const auto matches = ManifestStrings(*dict, "matches");
+-        hosts.insert(matches.begin(), matches.end());
+-      }
+-    }
++  auto& state = SignedImportOnUIThread();
++  if (state.profile != *profile_path) {
++    ResetSignedImports();
++    state.profile = *profile_path;
+   }
+-  return {hosts.begin(), hosts.end()};
++  return true;
+ }
+ 
+ NSArray<NSString*>* BridgeStrings(const std::vector<std::string>& values) {
+@@ -454,7 +477,7 @@ PreparedSignedImport PrepareSignedImportOnFileThread(
+       profile_path.AppendASCII("PendingSignedExtension");
+   base::ScopedTempDir workspace;
+   // There is at most one live preparation. Discard any prior session's draft.
+-  if (!base::DeletePathRecursively(import_root) ||
++  if (base::IsLink(import_root) || !base::DeletePathRecursively(import_root) ||
+       !base::CreateDirectory(import_root) ||
+       !workspace.CreateUniqueTempDirUnderPath(import_root)) {
+     result.error = "Could not create a private extension staging directory.";
+@@ -475,6 +498,11 @@ PreparedSignedImport PrepareSignedImportOnFileThread(
+     return result;
+   }
+   std::u16string parse_error;
++  extensions::file_util::MaybeCleanupMetadataFolder(payload);
++  if (!extensions::file_util::CheckForIllegalFilenames(payload, &parse_error)) {
++    result.error = base::UTF16ToUTF8(parse_error);
++    return result;
++  }
+   auto extension = extensions::file_util::LoadExtension(
+       payload, extensions::mojom::ManifestLocation::kUnpacked,
+       extensions::Extension::REQUIRE_MODERN_MANIFEST_VERSION, &parse_error);
+@@ -484,11 +512,29 @@ PreparedSignedImport PrepareSignedImportOnFileThread(
+     return result;
+   }
+ 
++  if (!extension->is_extension() ||
++      extensions::BackgroundInfo::HasBackgroundPage(extension.get())) {
++    result.error = "Only Manifest V3 browser extensions can be installed.";
++    return result;
++  }
++  if (!extension_l10n_util::ValidateExtensionLocales(
++          payload, *extension->manifest()->value(), &parse_error)) {
++    result.error = base::UTF16ToUTF8(parse_error);
++    return result;
++  }
++
+   result.name = extension->name();
+   result.version = extension->VersionString();
+-  const auto& manifest = *extension->manifest()->value();
+-  result.permissions = ManifestStrings(manifest, "permissions");
+-  result.host_permissions = DeclaredHostPatterns(manifest);
++  const auto& required =
++      extensions::PermissionsParser::GetRequiredPermissions(extension.get());
++  auto permissions = required.GetAPIsAsStrings();
++  for (const auto* permission : required.manifest_permissions()) {
++    permissions.emplace(permission->name());
++  }
++  result.permissions.assign(permissions.begin(), permissions.end());
++  for (const auto& host : required.effective_hosts()) {
++    result.host_permissions.push_back(host.GetAsString());
++  }
+   result.profile_path = std::move(profile_path);
+   result.token = base::Uuid::GenerateRandomV4().AsLowercaseString();
+   result.staging_path = workspace.Take();
+@@ -534,7 +580,8 @@ void QueueSignedImport(base::FilePath profile,
+                        base::FilePath source,
+                        std::string expected_id,
+                        InstallCompletionCallback finish) {
+-  SignedImportOnUIThread().busy = true;
++  auto& state = SignedImportOnUIThread();
++  state.busy = true;
+   extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(
+@@ -552,7 +599,13 @@ void QueueSignedImport(base::FilePath profile,
+           },
+           std::move(profile), std::move(source), std::move(expected_id)),
+       base::BindOnce(
+-          [](InstallCompletionCallback reply, PreparedSignedImport result) {
++          [](size_t generation, InstallCompletionCallback reply,
++             PreparedSignedImport result) {
++            if (!IsCurrentSignedImport(generation)) {
++              DeleteImportDirectory(std::move(result.staging_path));
++              std::move(reply).Run(nil, SignedImportError(@"The profile closed."));
++              return;
++            }
+             auto& state = SignedImportOnUIThread();
+             state.busy = false;
+             if (!result.error.empty()) {
+@@ -573,29 +626,32 @@ void QueueSignedImport(base::FilePath profile,
+               return;
+             }
+             NSDictionary* receipt = @{
+-              @"token" : base::SysUTF8ToNSString(result.token),
+-              @"id" : base::SysUTF8ToNSString(result.id),
+-              @"name" : base::SysUTF8ToNSString(result.name),
+-              @"version" : base::SysUTF8ToNSString(result.version),
++              @"token" : base::SysUTF8ToNSString(result.token) ?: @"",
++              @"id" : base::SysUTF8ToNSString(result.id) ?: @"",
++              @"name" : base::SysUTF8ToNSString(result.name) ?: @"",
++              @"version" : base::SysUTF8ToNSString(result.version) ?: @"",
+               @"permissions" : BridgeStrings(result.permissions),
+               @"hostPermissions" : BridgeStrings(result.host_permissions),
+             };
+             content::GetUIThreadTaskRunner({})->PostDelayedTask(
+                 FROM_HERE,
+                 base::BindOnce(
+-                    [](const std::string& token) {
++                    [](size_t generation, const std::string& token) {
++                      if (!IsCurrentSignedImport(generation)) {
++                        return;
++                      }
+                       auto& prepared = SignedImportOnUIThread().prepared;
+                       if (prepared && prepared->token == token) {
+                         DeleteImportDirectory(std::move(prepared->staging_path));
+                         prepared.reset();
+                       }
+                     },
+-                    result.token),
++                    generation, result.token),
+                 base::Minutes(5));
+             state.prepared.emplace(std::move(result));
+             std::move(reply).Run(receipt, nil);
+           },
+-          std::move(finish)));
++          state.generation, std::move(finish)));
+ }
+ 
+ void EnsureIOSExtensionFactoriesBuilt() {
+@@ -720,6 +776,9 @@ void InitializeIOSExtensionsBrowserClient() {
+ }
+ 
+ void StartTearDownIOSExtensionsBrowserClient() {
++  if (content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
++    ResetSignedImports();
++  }
+   if (auto* client = extensions::ExtensionsBrowserClient::Get()) {
+     client->StartTearDown();
+   }
+@@ -753,6 +812,11 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
+       browser_context);
+ 
+   auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  if (!client->IsValidContext(browser_context)) {
++    extensions::GetExtensionFileTaskRunner()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&SweepSignedImportDirectories, browser_context->GetPath()));
++  }
+   client->RegisterBrowserContext(browser_context, profile);
+   BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
+       browser_context);
+@@ -770,6 +834,10 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   if (!client->IsValidContext(browser_context)) {
+     return;
+   }
++  if (content::BrowserThread::CurrentlyOn(content::BrowserThread::UI) &&
++      SignedImportOnUIThread().profile == browser_context->GetPath()) {
++    ResetSignedImports();
++  }
+   BrowserContextDependencyManager::GetInstance()->DestroyBrowserContextServices(
+       browser_context);
+   client->UnregisterBrowserContext(browser_context);
+@@ -1458,19 +1526,23 @@ - (void)uninstallExtensionWithID:(NSString*)extensionID
+   context->GetDefaultStoragePartition()->ClearDataForOrigin(
+       kExtensionOriginData, extension->url(),
+       base::BindOnce(
+-          [](base::FilePath profile, base::FilePath installed,
+-             void (^reply)(BOOL, NSError*)) {
++          [](size_t generation, base::FilePath profile,
++             base::FilePath installed, void (^reply)(BOOL, NSError*)) {
+             extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+                 FROM_HERE,
+                 base::BindOnce(&DeleteInstalledSignedImport, std::move(profile),
+                                std::move(installed)),
+-                base::BindOnce([](void (^reply)(BOOL, NSError*), bool deleted) {
+-                  SignedImportOnUIThread().busy = false;
++                base::BindOnce([](size_t generation,
++                                   void (^reply)(BOOL, NSError*), bool deleted) {
++                  if (IsCurrentSignedImport(generation)) {
++                    SignedImportOnUIThread().busy = false;
++                  }
+                   reply(YES, deleted ? nil : SignedImportError(
+                       @"The extension was removed, but its files could not be deleted."));
+-                }, std::move(reply)));
++                }, generation, std::move(reply)));
+           },
+-          context->GetPath(), extension->path(), [completion copy]));
++          state.generation, context->GetPath(), extension->path(),
++          [completion copy]));
+ }
+ 
+ - (BOOL)setExtensionWithID:(NSString*)extensionId
+@@ -1674,16 +1746,15 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+               return;
+             }
+ 
+-            if (InFlightTrustedInstalls().contains(resolved.canonical_dir)) {
++            if (InFlightTrustedInstalls().contains(resolved.extension_id)) {
+               std::move(finish_cb).Run(
+                   nil,
+                   MakeBridgeError(
+                       kCrIOSExtensionManagerErrorStateChangeFailed,
+-                      @"An extension installation from this directory is "
+-                      @"already in progress."));
++                      @"An installation of this extension is already in progress."));
+               return;
+             }
+-            InFlightTrustedInstalls().insert(resolved.canonical_dir);
++            InFlightTrustedInstalls().insert(resolved.extension_id);
+ 
+             std::optional<extensions::ExtensionId> previous_id =
+                 extensions::IOSExtensionsBrowserClient::GetInstance()
+@@ -1699,7 +1770,7 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                    std::shared_ptr<InstallCompletionCallback> cb) {
+                   if (content::BrowserThread::CurrentlyOn(
+                           content::BrowserThread::UI)) {
+-                    InFlightTrustedInstalls().erase(canonical_dir);
++                    InFlightTrustedInstalls().erase(candidate_id);
+                   }
+                   extensions::IOSExtensionsBrowserClient::GetInstance()
+                       ->RestoreTrustedExtensionCandidate(canonical_dir,
+@@ -1719,6 +1790,11 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+             scoped_refptr<extensions::UnpackedInstaller> installer =
+                 extensions::UnpackedInstaller::Create(live_context);
+             installer->set_be_noisy_on_failure(false);
++            if (!verified_id.empty()) {
++              // Unpacked developer extensions default to local file access.
++              // Signed user installs must not inherit that developer policy.
++              installer->set_allow_file_access(false);
++            }
+             installer->set_completion_callback(base::BindOnce(
+                 [](content::BrowserContext* expected_context,
+                    base::FilePath canonical_dir,
+@@ -1731,7 +1807,7 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                    const std::u16string& install_error) {
+                   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+                   (void)guard.Release();
+-                  InFlightTrustedInstalls().erase(canonical_dir);
++                  InFlightTrustedInstalls().erase(expected_id);
+                   auto rollback = [&]() {
+                     extensions::IOSExtensionsBrowserClient::GetInstance()
+                         ->RestoreTrustedExtensionCandidate(canonical_dir,
+@@ -1839,9 +1915,14 @@ - (void)prepareStoreExtensionWithID:(NSString*)storeID
+   state.busy = true;
+   state.download = std::make_unique<extensions::IOSStoreCrxDownload>();
+   state.download->Start(id, base::BindOnce(
+-      [](base::FilePath original_profile, std::string expected_id,
+-         InstallCompletionCallback finish, base::FilePath downloaded,
+-         const char* download_error) {
++      [](size_t generation, base::FilePath original_profile,
++         std::string expected_id, InstallCompletionCallback finish,
++         base::FilePath downloaded, const char* download_error) {
++        if (!IsCurrentSignedImport(generation)) {
++          DeleteImportDirectory(std::move(downloaded));
++          std::move(finish).Run(nil, SignedImportError(@"The profile closed."));
++          return;
++        }
+         auto& state = SignedImportOnUIThread();
+         state.download.reset();
+         base::FilePath profile;
+@@ -1861,7 +1942,7 @@ - (void)prepareStoreExtensionWithID:(NSString*)storeID
+         }
+         QueueSignedImport(std::move(profile), std::move(downloaded),
+                           std::move(expected_id), std::move(finish));
+-      }, profile, id, std::move(finish)));
++      }, state.generation, profile, id, std::move(finish)));
+ }
+ 
+ - (void)prepareSignedExtensionAtPath:(NSString*)path
+@@ -1952,10 +2033,15 @@ - (void)confirmPreparedExtensionWithToken:(NSString*)token
+       base::BindOnce(&PromoteSignedImportOnFileThread, profile,
+                      std::move(prepared.staging_path), std::move(prepared.token)),
+       base::BindOnce(
+-          [](CrIOSExtensionManagerV1* manager,
++          [](CrIOSExtensionManagerV1* manager, size_t generation,
+              base::FilePath original_profile, std::string verified_id,
+              void (^reply)(NSDictionary<NSString*, id>*, NSError*),
+              base::FilePath target) {
++            if (!IsCurrentSignedImport(generation)) {
++              DeleteImportDirectory(std::move(target));
++              reply(nil, SignedImportError(@"The profile closed."));
++              return;
++            }
+             base::FilePath active_profile;
+             extensions::ExtensionRegistry* registry = nullptr;
+             NSError* error = nil;
+@@ -1975,16 +2061,23 @@ - (void)confirmPreparedExtensionWithToken:(NSString*)token
+                          base::SysUTF8ToNSString(verified_id)
+                                               completion:
+                          ^(NSDictionary<NSString*, id>* entry, NSError* failure) {
+-                           SignedImportOnUIThread().busy = false;
++                           if (!IsCurrentSignedImport(generation)) {
++                             DeleteImportDirectory(target);
++                             reply(nil, SignedImportError(@"The profile closed."));
++                             return;
++                           }
++                           auto& state = SignedImportOnUIThread();
++                           state.busy = false;
+                            if (failure || !entry) {
+                              DeleteImportDirectory(target);
+                            } else {
+-                             SignedImportOnUIThread().installed_paths.insert(target);
++                             state.installed_paths.emplace(target, verified_id);
+                            }
+                            reply(entry, failure);
+                          }];
+           },
+-          self, profile, std::move(prepared.id), [completion copy]));
++          self, state.generation, profile, std::move(prepared.id),
++          [completion copy]));
+ }
+ 
+ - (BOOL)dispatchCommandNamed:(NSString*)commandName
