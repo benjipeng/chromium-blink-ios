@@ -21,6 +21,18 @@ xcrun simctl launch "$simulator_udid" com.benjipeng.chromiumblink.chrome.ios.ext
 
 Set `simulator_udid` to the intended simulator before running the install and launch commands. A simulator pass is evidence about that runtime. The original artifact remains a device build.
 
+## Verify request filtering
+
+From the repository, serve the fixture on loopback:
+
+```sh
+python3 -m http.server 8765 --bind 127.0.0.1 --directory tools/simulator/extension-filter-check
+```
+
+In Chromium on the simulator, open `http://127.0.0.1:8765/` and tap **Run filter check**. With uBlock Origin Lite and EasyList active, the control loads and the EasyList target does not reach the server. Confirm the request ID against the server log; a network error alone does not prove filtering.
+
+Run the same check after removal and again after reinstalling. Both paths should reach the server while the extension is absent. The EasyList path should stop reaching it after reinstalling, while the control remains reachable. Check on a newly loaded page each time.
+
 ## Where changes live
 
 - Put native browser behavior and layout fixes in `patches/`. They ship through the ordinary build.
