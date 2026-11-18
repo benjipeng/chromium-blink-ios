@@ -494,13 +494,15 @@ static NSString *StoreIDFromListingURL(NSString *input) {
       }
     }]];
   }
-  UIAction *remove = [UIAction actionWithTitle:@"Remove…"
-      image:[UIImage systemImageNamed:@"trash"] identifier:nil
-      handler:^(__unused UIAction *action) {
-    [weakSelf confirmRemovalOfExtension:entry];
-  }];
-  remove.attributes = UIMenuElementAttributesDestructive;
-  [actions addObject:remove];
+  if (entry.removable) {
+    UIAction *remove = [UIAction actionWithTitle:@"Remove…"
+        image:[UIImage systemImageNamed:@"trash"] identifier:nil
+        handler:^(__unused UIAction *action) {
+      [weakSelf confirmRemovalOfExtension:entry];
+    }];
+    remove.attributes = UIMenuElementAttributesDestructive;
+    [actions addObject:remove];
+  }
   button.menu = [UIMenu menuWithChildren:actions];
   button.showsMenuAsPrimaryAction = YES;
   return button;
@@ -656,20 +658,6 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   }];
 }
 
-- (void)configureAccessibilityForCell:(UITableViewCell *)cell
-                            withEntry:(ExtensionEntryModel *)entry {
-  cell.isAccessibilityElement = YES;
-  cell.accessibilityTraits = UIAccessibilityTraitButton;
-  cell.accessibilityLabel =
-      entry.version.length > 0
-          ? [NSString stringWithFormat:@"%@, version %@", entry.name, entry.version]
-          : entry.name;
-  cell.accessibilityValue = entry.enabled ? @"Enabled" : @"Disabled";
-  cell.accessibilityHint = @"Toggles extension enabled state";
-  cell.accessibilityIdentifier =
-      [NSString stringWithFormat:@"kExtensionCell_%@", entry.extensionId];
-}
-
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
   (void)tableView;
   return 1;
@@ -710,7 +698,6 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   if (!cell) {
     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                   reuseIdentifier:kReuseID];
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
     cell.textLabel.adjustsFontForContentSizeCategory = YES;
     cell.textLabel.numberOfLines = 0;
@@ -721,8 +708,9 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   }
 
   ExtensionEntryModel *entry = self.entries[(NSUInteger)indexPath.row];
-  cell.selectionStyle = entry.removable ? UITableViewCellSelectionStyleNone
-                                        : UITableViewCellSelectionStyleDefault;
+  cell.selectionStyle = UITableViewCellSelectionStyleNone;
+  cell.accessibilityIdentifier =
+      [NSString stringWithFormat:@"kExtensionCell_%@", entry.extensionId];
   cell.textLabel.text = entry.name;
   cell.detailTextLabel.text = entry.version.length > 0
       ? [NSString stringWithFormat:@"Version %@", entry.version]
@@ -730,37 +718,6 @@ static NSString *StoreIDFromListingURL(NSString *input) {
 
   [self configureAccessoryForCell:cell atRow:indexPath.row withEntry:entry existingSwitch:nil];
   return cell;
-}
-
-- (UISwitch *)switchInAccessoryView:(UIView *)view {
-  if (!view) return nil;
-  if ([view isKindOfClass:UISwitch.class]) return (UISwitch *)view;
-  for (UIView *sub in view.subviews) {
-    UISwitch *found = [self switchInAccessoryView:sub];
-    if (found) return found;
-  }
-  return nil;
-}
-
-- (UIButton *)buildOptionsButtonForRow:(NSInteger)row
-                             withEntry:(ExtensionEntryModel *)entry {
-  UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-  UIButtonConfiguration *cfg = [UIButtonConfiguration tintedButtonConfiguration];
-  cfg.title = @"Options";
-  cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-  cfg.buttonSize = UIButtonConfigurationSizeSmall;
-  cfg.contentInsets = NSDirectionalEdgeInsetsMake(5, 10, 5, 10);
-  btn.configuration = cfg;
-  btn.tag = row;
-  btn.accessibilityIdentifier =
-      [NSString stringWithFormat:@"kExtensionOptionsButton_%@", entry.extensionId];
-  btn.accessibilityLabel =
-      [NSString stringWithFormat:@"Options for %@", entry.name];
-  [btn addTarget:self
-                action:@selector(handleOptionsTapped:)
-      forControlEvents:UIControlEventTouchUpInside];
-  [btn sizeToFit];
-  return btn;
 }
 
 - (void)configureAccessoryForCell:(UITableViewCell *)cell
@@ -782,9 +739,12 @@ static NSString *StoreIDFromListingURL(NSString *input) {
                 action:@selector(handleExtensionSwitch:)
       forControlEvents:UIControlEventValueChanged];
 
-  if (entry.removable || (entry.enabled && entry.optionsPageURL.length > 0)) {
-    UIButton *manage = entry.removable ? [self buildManageButtonForEntry:entry]
-                                       : [self buildOptionsButtonForRow:row withEntry:entry];
+  NSMutableArray *accessibilityElements = [NSMutableArray arrayWithObject:cell.textLabel];
+  if (cell.detailTextLabel.text.length) {
+    [accessibilityElements addObject:cell.detailTextLabel];
+  }
+  if (entry.removable || entry.optionsPageURL.length > 0) {
+    UIButton *manage = [self buildManageButtonForEntry:entry];
     UIStackView *stack =
         [[UIStackView alloc] initWithArrangedSubviews:@[ manage, toggle ]];
     stack.axis = UILayoutConstraintAxisHorizontal;
@@ -793,24 +753,13 @@ static NSString *StoreIDFromListingURL(NSString *input) {
     CGSize fit = [stack systemLayoutSizeFittingSize:UILayoutFittingCompressedSize];
     stack.frame = CGRectMake(0, 0, ceil(fit.width), ceil(MAX(fit.height, 32.0)));
     cell.accessoryView = stack;
-    cell.isAccessibilityElement = NO;
+    [accessibilityElements addObject:manage];
   } else {
     cell.accessoryView = toggle;
-    [self configureAccessibilityForCell:cell withEntry:entry];
   }
-}
-
-- (void)handleOptionsTapped:(UIButton *)sender {
-  NSInteger row = sender.tag;
-  if (row < 0 || row >= (NSInteger)self.entries.count) return;
-  ExtensionEntryModel *entry = self.entries[(NSUInteger)row];
-  NSString *err = nil;
-  if (!OpenOptionsPageInBrowser(self, entry, &err)) {
-    NSLog(@"EXTENSIONS_MANAGER options id=%@ ok=0 reason=%@",
-          entry.extensionId, err ?: @"unknown");
-    PresentOptionsAlert(self, @"Options Unavailable",
-                        err ?: @"Could not open options page.");
-  }
+  [accessibilityElements addObject:toggle];
+  cell.isAccessibilityElement = NO;
+  cell.accessibilityElements = accessibilityElements;
 }
 
 - (void)applyToggleForRow:(NSInteger)row
@@ -851,21 +800,6 @@ static NSString *StoreIDFromListingURL(NSString *input) {
     self.statusError = err;
     [self.tableView reloadData];
   }
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-  [tableView deselectRowAtIndexPath:indexPath animated:YES];
-  if (self.entries.count == 0) return;
-  NSInteger row = indexPath.row;
-  if (row < 0 || row >= (NSInteger)self.entries.count) return;
-  ExtensionEntryModel *entry = self.entries[(NSUInteger)row];
-  if (entry.removable) return;
-  UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
-  UISwitch *toggle = [self switchInAccessoryView:cell.accessoryView];
-  [self applyToggleForRow:row
-            targetEnabled:!entry.enabled
-                     cell:cell
-               switchView:toggle];
 }
 
 - (void)handleExtensionSwitch:(UISwitch *)sender {
