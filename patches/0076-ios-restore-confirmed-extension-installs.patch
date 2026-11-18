@@ -1,0 +1,425 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.h b/ios/chrome/browser/extensions/model/ios_extension_system.h
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.h
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.h
+@@ -7,6 +7,9 @@
+
+ #include <memory>
+ #include <string>
++#include <vector>
++
++#include "base/containers/flat_map.h"
+
+ #include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+@@ -24,6 +27,7 @@
+
+ namespace extensions {
+
++class Extension;
+ class NullAppSorting;
+
+ class IOSExtensionSystem final : public ExtensionSystem {
+@@ -60,6 +64,11 @@
+       const ExtensionId& extension_id,
+       const base::DictValue& attributes) override;
+
++  bool restoring_signed_imports() const { return restoring_signed_imports_; }
++  bool IsSignedImport(const base::FilePath& path) const;
++  void TrackSignedImport(const Extension& extension);
++  void ForgetSignedImport(const Extension& extension);
++
+  private:
+   class BundledExtensionPolicyProvider;
+   class RegistrarDelegate;
+@@ -68,7 +77,13 @@
+       const base::FilePath& canonical_path,
+       const ExtensionId& expected_id);
+
++  void RestoreSignedImports();
++  void FinishRestoringSignedImports(
++      std::vector<scoped_refptr<const Extension>> restored);
++
+   raw_ptr<content::BrowserContext> browser_context_;
++  bool restoring_signed_imports_ = false;
++  base::flat_map<base::FilePath, ExtensionId> signed_imports_;
+   bool initialized_ = false;
+
+   scoped_refptr<value_store::ValueStoreFactoryImpl> store_factory_;
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+@@ -6,6 +6,7 @@
+
+ #include <optional>
+ #include <utility>
++#include <vector>
+
+ #include "base/check.h"
+ #include "base/check_op.h"
+@@ -15,6 +16,7 @@
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/uuid.h"
+ #include "components/crx_file/id_util.h"
+ #include "components/sync/model/string_ordinal.h"
+ #include "components/value_store/value_store_factory_impl.h"
+@@ -23,7 +25,9 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "extensions/browser/extension_file_task_runner.h"
+ #include "extensions/browser/disable_reason.h"
++#include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/extension_registry.h"
+ #include "extensions/browser/install_flag.h"
+ #include "extensions/browser/install/crx_install_error.h"
+ #include "extensions/browser/management_policy.h"
+@@ -35,13 +39,51 @@
+ #include "extensions/browser/unpacked_installer.h"
+ #include "extensions/browser/user_script_manager.h"
+ #include "extensions/common/constants.h"
++#include "extensions/common/extension.h"
+ #include "extensions/common/file_util.h"
+ #include "extensions/common/manifest_constants.h"
++#include "extensions/common/permissions/permissions_data.h"
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+
+ namespace extensions {
+
+ namespace {
++
++struct SignedImportRecord {
++  ExtensionId id;
++  base::FilePath leaf;
++  int flags;
++};
++
++std::vector<scoped_refptr<const Extension>> LoadSignedImportsOnFileThread(
++    const base::FilePath& profile,
++    std::vector<SignedImportRecord> records) {
++  std::vector<scoped_refptr<const Extension>> restored;
++  const auto trusted = profile.AppendASCII("TrustedUnpackedExtensions");
++  const auto root = trusted.AppendASCII("SignedImports");
++  if (base::IsLink(trusted) || base::IsLink(root)) {
++    return restored;
++  }
++  const auto canonical = base::MakeAbsoluteFilePath(root);
++  if (canonical.empty()) {
++    return restored;
++  }
++  for (const auto& record : records) {
++    const auto path = canonical.Append(record.leaf);
++    if (base::IsLink(path) || base::IsLink(path.Append(kManifestFilename)) ||
++        !base::DirectoryExists(path)) {
++      continue;
++    }
++    std::u16string error;
++    auto extension = file_util::LoadExtension(
++        path, mojom::ManifestLocation::kUnpacked, record.flags, &error);
++    // Preserve the prefs and files for any record that could not be read.
++    if (extension && extension->is_extension() && extension->id() == record.id) {
++      restored.push_back(std::move(extension));
++    }
++  }
++  return restored;
++}
+
+ struct ResolvedBundledExtension {
+   base::FilePath canonical_path;
+@@ -259,6 +301,11 @@
+
+ void IOSExtensionSystem::Shutdown() {
+   weak_factory_.InvalidateWeakPtrs();
++  auto* client = IOSExtensionsBrowserClient::GetInstance();
++  for (const auto& [path, id] : signed_imports_) {
++    client->RestoreTrustedExtensionCandidate(path, id, std::nullopt);
++  }
++  signed_imports_.clear();
+   if (management_policy_ && policy_provider_) {
+     management_policy_->UnregisterProvider(policy_provider_.get());
+   }
+@@ -308,6 +355,7 @@
+     return;
+   }
+
++  RestoreSignedImports();
+   const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
+   const base::FilePath profile_path = browser_context_->GetPath();
+   if (bundled_dir.empty() || profile_path.empty()) {
+@@ -329,6 +377,85 @@
+           weak_factory_.GetWeakPtr()));
+ }
+
++bool IOSExtensionSystem::IsSignedImport(const base::FilePath& path) const {
++  return signed_imports_.contains(path);
++}
++
++void IOSExtensionSystem::TrackSignedImport(const Extension& extension) {
++  signed_imports_.insert_or_assign(extension.path(), extension.id());
++}
++
++void IOSExtensionSystem::ForgetSignedImport(const Extension& extension) {
++  signed_imports_.erase(extension.path());
++}
++
++void IOSExtensionSystem::RestoreSignedImports() {
++  const auto profile = browser_context_->GetPath();
++  auto* prefs = ExtensionPrefs::Get(browser_context_);
++  if (profile.empty() || !prefs) {
++    return;
++  }
++  std::vector<SignedImportRecord> records;
++  for (const auto& record : prefs->GetInstalledExtensionsInfo()) {
++    const auto path = record.extension_path.StripTrailingSeparators();
++    const auto leaf = path.BaseName();
++    const auto parent = path.DirName();
++    // Rebase verified imports when the app container changes. No absolute
++    // recorded path is opened directly.
++    if (record.extension_location != mojom::ManifestLocation::kUnpacked ||
++        record.extension_id == kIOSBundledExtensionId ||
++        parent.BaseName().value() != "SignedImports" ||
++        parent.DirName().BaseName().value() != "TrustedUnpackedExtensions" ||
++        parent.DirName().DirName().BaseName() != profile.BaseName() ||
++        !base::Uuid::ParseLowercase(leaf.value()).is_valid()) {
++      continue;
++    }
++    const int flags = Extension::REQUIRE_KEY |
++                      Extension::REQUIRE_MODERN_MANIFEST_VERSION |
++                      (prefs->GetCreationFlags(record.extension_id) &
++                       Extension::WITHHOLD_PERMISSIONS);
++    records.push_back({record.extension_id, leaf, flags});
++  }
++  if (records.empty()) {
++    return;
++  }
++  restoring_signed_imports_ = true;
++  GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(&LoadSignedImportsOnFileThread, profile, std::move(records)),
++      base::BindOnce(&IOSExtensionSystem::FinishRestoringSignedImports,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void IOSExtensionSystem::FinishRestoringSignedImports(
++    std::vector<scoped_refptr<const Extension>> restored) {
++  auto* registry = ExtensionRegistry::Get(browser_context_);
++  auto* registrar = ExtensionRegistrar::Get(browser_context_);
++  auto* client = IOSExtensionsBrowserClient::GetInstance();
++  for (const auto& extension : restored) {
++    if (registry->GetInstalledExtension(extension->id())) {
++      continue;
++    }
++    auto previous = client->RegisterTrustedExtensionCandidate(extension->path(),
++                                                              extension->id());
++    if (!management_policy_->UserMayLoad(extension.get(), nullptr)) {
++      client->RestoreTrustedExtensionCandidate(extension->path(),
++                                               extension->id(), previous);
++      continue;
++    }
++    extension->permissions_data()->BindToCurrentThread();
++    PermissionsUpdater(browser_context_).InitializePermissions(extension.get());
++    registrar->AddExtension(extension);
++    if (registry->GetInstalledExtension(extension->id()) == extension.get()) {
++      TrackSignedImport(*extension);
++    } else {
++      client->RestoreTrustedExtensionCandidate(extension->path(),
++                                               extension->id(), previous);
++    }
++  }
++  restoring_signed_imports_ = false;
++}
++
+ void IOSExtensionSystem::OnBundledExtensionPathResolved(
+     const base::FilePath& canonical_path,
+     const ExtensionId& expected_id) {
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -86,6 +86,7 @@
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
++#include "ios/chrome/browser/extensions/model/ios_extension_system.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
+ #include "ios/chrome/browser/extensions/model/ios_signed_extension_package.h"
+ #include "ios/chrome/browser/extensions/model/ios_store_crx_download.h"
+@@ -236,7 +237,8 @@
+
+ TrustedDirectoryResolution ResolveTrustedExtensionOnFileThread(
+     const base::FilePath& trusted_root,
+-    const base::FilePath& candidate_path) {
++    const base::FilePath& candidate_path,
++    bool verified_import) {
+   TrustedDirectoryResolution result;
+   if (trusted_root.empty() || candidate_path.empty() ||
+       !base::DirectoryExists(trusted_root)) {
+@@ -260,6 +262,16 @@
+     result.error =
+         "Extension directory must resolve strictly inside "
+         "TrustedUnpackedExtensions.";
++    return result;
++  }
++  const auto signed_root = canonical_root.AppendASCII("SignedImports");
++  const bool inside_imports = signed_root == canonical_dir ||
++                              signed_root.IsParent(canonical_dir);
++  if ((inside_imports && !verified_import) ||
++      (verified_import && (canonical_dir.DirName() != signed_root ||
++                           base::IsLink(signed_root) ||
++                           base::IsLink(candidate_path)))) {
++    result.error = "The private signed import directory requires verification.";
+     return result;
+   }
+   if (!base::PathExists(canonical_dir.Append(extensions::kManifestFilename))) {
+@@ -372,8 +384,6 @@
+   size_t generation = 0;
+   base::FilePath profile;
+   bool busy = false;
+-  // Only this verified installer can claim ownership of an unpacked copy.
+-  base::flat_map<base::FilePath, extensions::ExtensionId> installed_paths;
+   std::optional<PreparedSignedImport> prepared;
+   std::unique_ptr<extensions::IOSStoreCrxDownload> download;
+ };
+@@ -411,28 +421,6 @@
+     DeleteImportDirectory(std::move(state.prepared->staging_path));
+     state.prepared.reset();
+   }
+-  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
+-  for (const auto& [path, id] : state.installed_paths) {
+-    client->RestoreTrustedExtensionCandidate(path, id, std::nullopt);
+-  }
+-  state.installed_paths.clear();
+-}
+-
+-void SweepSignedImportDirectories(base::FilePath profile) {
+-  // Restoring verified installations is a separate step. Do not accumulate
+-  // orphaned copies for the current session-only installer.
+-  if (profile.empty() || base::IsLink(profile)) {
+-    return;
+-  }
+-  const auto pending = profile.AppendASCII("PendingSignedExtension");
+-  const auto trusted = profile.AppendASCII("TrustedUnpackedExtensions");
+-  const auto signed_imports = trusted.AppendASCII("SignedImports");
+-  if (!base::IsLink(pending)) {
+-    base::DeletePathRecursively(pending);
+-  }
+-  if (!base::IsLink(trusted) && !base::IsLink(signed_imports)) {
+-    base::DeletePathRecursively(signed_imports);
+-  }
+ }
+
+ bool ResolveSignedImportProfile(base::FilePath* profile_path,
+@@ -443,6 +431,12 @@
+   extensions::ExtensionRegistrar* registrar = nullptr;
+   if (!ResolveExtensionServices(&context, &system, registry, &registrar,
+                                 error)) {
++    return false;
++  }
++  if (static_cast<extensions::IOSExtensionSystem*>(system)
++          ->restoring_signed_imports()) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"Chromium is restoring installed extensions.");
+     return false;
+   }
+   *profile_path = context->GetPath();
+@@ -812,11 +806,6 @@
+       browser_context);
+
+   auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
+-  if (!client->IsValidContext(browser_context)) {
+-    extensions::GetExtensionFileTaskRunner()->PostTask(
+-        FROM_HERE,
+-        base::BindOnce(&SweepSignedImportDirectories, browser_context->GetPath()));
+-  }
+   client->RegisterBrowserContext(browser_context, profile);
+   BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
+       browser_context);
+@@ -1459,7 +1448,8 @@
+     NSMutableDictionary<NSString*, id>* entry =
+         [MakeExtensionEntryDictionary(extension.get(), registrar) mutableCopy];
+     entry[@"removable"] =
+-        @(SignedImportOnUIThread().installed_paths.contains(extension->path()));
++        @(static_cast<extensions::IOSExtensionSystem*>(system)
++              ->IsSignedImport(extension->path()));
+     [items addObject:entry];
+   }
+   return [items copy];
+@@ -1486,8 +1476,9 @@
+   scoped_refptr<const extensions::Extension> extension =
+       registry->GetInstalledExtension(id);
+   auto& state = SignedImportOnUIThread();
++  auto* ios_system = static_cast<extensions::IOSExtensionSystem*>(system);
+   if (!extension || id == extensions::kIOSBundledExtensionId ||
+-      !state.installed_paths.contains(extension->path())) {
++      !ios_system->IsSignedImport(extension->path())) {
+     completion(NO, SignedImportError(@"This extension cannot be removed."));
+     return;
+   }
+@@ -1508,7 +1499,7 @@
+                            : base::SysUTF16ToNSString(policy_error)));
+     return;
+   }
+-  state.installed_paths.erase(extension->path());
++  ios_system->ForgetSignedImport(*extension);
+   extensions::IOSExtensionsBrowserClient::GetInstance()
+       ->RestoreTrustedExtensionCandidate(extension->path(), id, std::nullopt);
+   extensions::ServiceWorkerTaskQueue::Get(context)
+@@ -1699,7 +1690,7 @@
+   extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(&ResolveTrustedExtensionOnFileThread, trusted_root,
+-                     candidate_path),
++                     candidate_path, expectedID != nil),
+       base::BindOnce(
+           [](content::BrowserContext* original_context,
+              std::string verified_id,
+@@ -1737,6 +1728,12 @@
+               return;
+             }
+
++            if (static_cast<extensions::IOSExtensionSystem*>(live_system)
++                    ->restoring_signed_imports()) {
++              std::move(finish_cb).Run(
++                  nil, SignedImportError(@"Chromium is restoring installed extensions."));
++              return;
++            }
+             if (!verified_id.empty() &&
+                 (resolved.extension_id != verified_id ||
+                  live_registry->GetInstalledExtension(verified_id))) {
+@@ -1797,6 +1794,7 @@
+             }
+             installer->set_completion_callback(base::BindOnce(
+                 [](content::BrowserContext* expected_context,
++                   bool signed_import,
+                    base::FilePath canonical_dir,
+                    extensions::ExtensionId expected_id,
+                    std::optional<extensions::ExtensionId> prev_id,
+@@ -1868,6 +1866,10 @@
+                     }
+                     return;
+                   }
++                  if (signed_import) {
++                    static_cast<extensions::IOSExtensionSystem*>(final_system)
++                        ->TrackSignedImport(*installed);
++                  }
+                   if (cb && *cb) {
+                     std::move(*cb).Run(
+                         MakeExtensionEntryDictionary(installed,
+@@ -1875,7 +1877,8 @@
+                         nil);
+                   }
+                 },
+-                live_context, resolved.canonical_dir, resolved.extension_id,
++                live_context, !verified_id.empty(), resolved.canonical_dir,
++                resolved.extension_id,
+                 previous_id, shared_cb, std::move(shutdown_guard)));
+             installer->Load(resolved.canonical_dir);
+           },
+@@ -2070,8 +2073,6 @@
+                            live_import.busy = false;
+                            if (failure || !entry) {
+                              DeleteImportDirectory(target);
+-                           } else {
+-                             live_import.installed_paths.emplace(target, verified_id);
+                            }
+                            reply(entry, failure);
+                          }];
