@@ -1,0 +1,17 @@
+diff --git a/ios/chrome/browser/omnibox/ui/popup/omnibox_popup_presenter.mm b/ios/chrome/browser/omnibox/ui/popup/omnibox_popup_presenter.mm
+--- a/ios/chrome/browser/omnibox/ui/popup/omnibox_popup_presenter.mm
++++ b/ios/chrome/browser/omnibox/ui/popup/omnibox_popup_presenter.mm
+@@ -318,5 +318,5 @@
+     // Bottom constraints.
+     if (showPopoutLayout) {
+-      BOOL paddingAmmount =
++      CGFloat padding =
+           _presentationContext == OmniboxPresentationContext::kLensOverlay
+               ? 0
+@@ -330,5 +330,5 @@
+       self.bottomConstraintPhone = [superviewAnchor
+           constraintGreaterThanOrEqualToAnchor:popup.bottomAnchor
+-                                      constant:paddingAmmount];
++                                      constant:padding];
+     } else {
+       CGFloat offset = self.useBottomOmniboxInPopup ? _bottomOmniboxOffset : 0;

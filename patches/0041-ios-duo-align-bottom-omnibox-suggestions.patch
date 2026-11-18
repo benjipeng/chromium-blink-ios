@@ -1,0 +1,73 @@
+From: Chromium iOS contributors
+Subject: [PATCH] iOS Duo: keep short suggestions next to the bottom address bar
+
+Use the omnibox popup’s measured content height with the existing inset API.
+Leave normal start-of-scroll behavior in place for lists that do not fit.
+
+diff --git a/ios/chrome/browser/composebox/ui/composebox_view_controller.mm b/ios/chrome/browser/composebox/ui/composebox_view_controller.mm
+--- a/ios/chrome/browser/composebox/ui/composebox_view_controller.mm
++++ b/ios/chrome/browser/composebox/ui/composebox_view_controller.mm
+@@ -38,6 +38,8 @@
+ const CGFloat kIncognitoVerticalPadding = 24.0f;
+ /// The bottom margin between the composebox and the container.
+ const CGFloat kBlurBottomMargin = 20.0f;
++// Space between the last suggestion and a bottom input plate on a side rail.
++const CGFloat kBottomSuggestionGap = 8.0f;
+ /// Margin between the composebox and the container when reduced transparency is
+ /// enabled.
+ const CGFloat kReducedTransparencyInputPlateBottomMargin = 4.0f;
+@@ -242,9 +244,25 @@
+   } else if ([self currentInputPlatePosition] ==
+              ComposeboxInputPlatePosition::kBottom) {
+     // Add inset so the first suggestion is not covered by the close button.
++    CGFloat topInset = kCloseButtonSize;
++    if (@available(iOS 27.1, *)) {
++      const UIVerticalBarEdge barEdge = self.traitCollection.verticalBarEdge;
++      if ((barEdge == UIVerticalBarEdgeLeading ||
++           barEdge == UIVerticalBarEdgeTrailing) &&
++          !_omniboxPopupContainer.hidden &&
++          _omniboxPreferredContentHeight > 0) {
++        // Keep short suggestion lists close to the input. Use the live
++        // input frame so the keyboard and a fold can move both together.
++        const CGFloat inputTop = CGRectGetMinY(inputPlateFrame) -
++                                 CGRectGetMinY(_omniboxPopupContainer.frame);
++        topInset = std::max(topInset, inputTop -
++                                         _omniboxPreferredContentHeight -
++                                         kBottomSuggestionGap);
++      }
++    }
+     [_presenter
+         setAdditionalVerticalContentInset:UIEdgeInsetsMake(
+-                                              kCloseButtonSize, 0,
++                                              topInset, 0,
+                                               _inputViewController.inputHeight,
+                                               0)];
+
+@@ -688,6 +706,14 @@
+   [super preferredContentSizeDidChangeForChildContentContainer:container];
+   if (ShouldApplyOmniboxPopoutLayout(self)) {
+     [self updatePreferredContentSize:container];
++    return;
++  }
++  if (container != _inputViewController &&
++      _omniboxPreferredContentHeight != container.preferredContentSize.height) {
++    _omniboxPreferredContentHeight = container.preferredContentSize.height;
++    if ([self currentInputPlatePosition] == ComposeboxInputPlatePosition::kBottom) {
++      [self.view setNeedsLayout];
++    }
+   }
+ }
+
+@@ -757,11 +783,11 @@
+ - (void)popupDidCloseForPresenter:(OmniboxPopupPresenter*)presenter {
+   _incognitoView.hidden = NO;
+   _omniboxPopupContainer.hidden = YES;
++  _omniboxPreferredContentHeight = 0;
+   if ([self currentInputPlatePosition] == ComposeboxInputPlatePosition::kiPad) {
+     // When the omnibox popup is closed (e.g. because suggestion results went
+     // from some to none), the preferred content size must be updated to
+     // collapse the container and remove empty white space.
+-    _omniboxPreferredContentHeight = 0;
+     [self updatePreferredContentSize:_inputViewController];
+   }
+   [self.proxiedPresenterDelegate popupDidCloseForPresenter:presenter];
