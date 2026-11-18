@@ -1,0 +1,194 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 89b6511..ffeff17 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -42,6 +42,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "extensions/browser/api/core_extensions_browser_api_provider.h"
+@@ -64,6 +65,7 @@
+ #include "extensions/browser/management_policy.h"
+ #include "extensions/browser/permissions_manager.h"
+ #include "extensions/browser/pref_names.h"
++#include "extensions/browser/service_worker/service_worker_task_queue.h"
+ #include "extensions/browser/unpacked_installer.h"
+ #include "extensions/browser/url_request_util.h"
+ #include "extensions/common/constants.h"
+@@ -99,6 +101,8 @@ - (BOOL)setExtensionWithID:(NSString*)extensionId
+                    enabled:(BOOL)enabled
+                      error:(NSError* __autoreleasing*)error;
+ @optional
++- (void)uninstallExtensionWithID:(NSString*)extensionID
++                      completion:(void (^)(BOOL, NSError*))completion;
+ - (NSString*)trustedUnpackedExtensionsDirectoryWithError:
+     (NSError* __autoreleasing*)error;
+ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+@@ -362,6 +366,8 @@ bool ResolveExtensionServices(content::BrowserContext** out_context,
+ 
+ struct SignedImportState {
+   bool busy = false;
++  // Only this verified installer can claim ownership of an unpacked copy.
++  base::flat_set<base::FilePath> installed_paths;
+   std::optional<PreparedSignedImport> prepared;
+   std::unique_ptr<extensions::IOSStoreCrxDownload> download;
+ };
+@@ -492,13 +498,34 @@ PreparedSignedImport PrepareSignedImportOnFileThread(
+ base::FilePath PromoteSignedImportOnFileThread(base::FilePath profile_path,
+                                                base::FilePath staging_path,
+                                                std::string token) {
+-  const auto root = profile_path.AppendASCII("TrustedUnpackedExtensions");
+-  const auto target = root.AppendASCII(token);
+-  const bool moved = base::CreateDirectory(root) && !base::IsLink(root) &&
+-                     !base::PathExists(target) &&
+-                     base::Move(staging_path.AppendASCII("extension"), target);
++  const auto trusted = profile_path.AppendASCII("TrustedUnpackedExtensions");
++  const auto root = trusted.AppendASCII("SignedImports");
++  base::FilePath target;
++  if (!base::IsLink(trusted) && !base::IsLink(root) &&
++      base::CreateDirectory(root)) {
++    const auto canonical = base::MakeAbsoluteFilePath(root);
++    if (!canonical.empty()) {
++      const auto candidate = canonical.AppendASCII(token);
++      if (!base::IsLink(candidate) && !base::PathExists(candidate) &&
++          base::Move(staging_path.AppendASCII("extension"), candidate)) {
++        target = candidate;
++      }
++    }
++  }
+   base::DeletePathRecursively(staging_path);
+-  return moved ? target : base::FilePath();
++  return target;
++}
++
++bool DeleteInstalledSignedImport(const base::FilePath& profile_path,
++                                 const base::FilePath& directory) {
++  const auto trusted = profile_path.AppendASCII("TrustedUnpackedExtensions");
++  const auto root = trusted.AppendASCII("SignedImports");
++  if (base::IsLink(trusted) || base::IsLink(root) || base::IsLink(directory)) {
++    return false;
++  }
++  const auto canonical = base::MakeAbsoluteFilePath(root);
++  return !canonical.empty() && directory.DirName() == canonical &&
++         base::DeletePathRecursively(directory);
+ }
+ 
+ // A non-empty expected ID denotes an owned Store download. Clean up the
+@@ -1361,11 +1388,91 @@ + (instancetype)sharedManager {
+     if (!extension) {
+       continue;
+     }
+-    [items addObject:MakeExtensionEntryDictionary(extension.get(), registrar)];
++    auto* entry =
++        [MakeExtensionEntryDictionary(extension.get(), registrar) mutableCopy];
++    entry[@"removable"] =
++        @(SignedImportOnUIThread().installed_paths.contains(extension->path()));
++    [items addObject:entry];
+   }
+   return [items copy];
+ }
+ 
++- (void)uninstallExtensionWithID:(NSString*)extensionID
++                      completion:(void (^)(BOOL, NSError*))completion {
++  if (!completion) {
++    return;
++  }
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  NSError* error = nil;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                &error)) {
++    completion(NO, error);
++    return;
++  }
++  const std::string id = [extensionID isKindOfClass:NSString.class]
++                             ? base::SysNSStringToUTF8(extensionID)
++                             : std::string();
++  scoped_refptr<const extensions::Extension> extension =
++      registry->GetInstalledExtension(id);
++  auto& state = SignedImportOnUIThread();
++  if (!extension || id == extensions::kIOSBundledExtensionId ||
++      !state.installed_paths.contains(extension->path())) {
++    completion(NO, SignedImportError(@"This extension cannot be removed."));
++    return;
++  }
++  if (state.busy) {
++    completion(NO, SignedImportError(@"An extension change is already in progress."));
++    return;
++  }
++  state.busy = true;
++  std::u16string policy_error;
++  if (!registrar->UninstallExtension(
++          id, extensions::UNINSTALL_REASON_USER_INITIATED, &policy_error,
++          base::DoNothing())) {
++    state.busy = false;
++    completion(NO, MakeBridgeError(
++                       kCrIOSExtensionManagerErrorPolicyDenied,
++                       policy_error.empty()
++                           ? @"Extension removal is not allowed."
++                           : base::SysUTF16ToNSString(policy_error)));
++    return;
++  }
++  state.installed_paths.erase(extension->path());
++  extensions::IOSExtensionsBrowserClient::GetInstance()
++      ->RestoreTrustedExtensionCandidate(extension->path(), id, std::nullopt);
++  extensions::ServiceWorkerTaskQueue::Get(context)
++      ->RemoveRegisteredServiceWorkerInfo(id);
++
++  // Verified imports are ordinary MV3 extensions in the default partition.
++  // Clear their exact origin before allowing the same ID to be installed again.
++  using content::StoragePartition;
++  constexpr uint32_t kExtensionOriginData =
++      StoragePartition::REMOVE_DATA_MASK_SERVICE_WORKERS |
++      StoragePartition::REMOVE_DATA_MASK_CACHE_STORAGE |
++      StoragePartition::REMOVE_DATA_MASK_LOCAL_STORAGE |
++      StoragePartition::REMOVE_DATA_MASK_INDEXEDDB |
++      StoragePartition::REMOVE_DATA_MASK_FILE_SYSTEMS;
++  context->GetDefaultStoragePartition()->ClearDataForOrigin(
++      kExtensionOriginData, extension->url(),
++      base::BindOnce(
++          [](base::FilePath profile, base::FilePath installed,
++             void (^reply)(BOOL, NSError*)) {
++            extensions::GetExtensionFileTaskRunner()->PostTaskAndReplyWithResult(
++                FROM_HERE,
++                base::BindOnce(&DeleteInstalledSignedImport, std::move(profile),
++                               std::move(installed)),
++                base::BindOnce([](void (^reply)(BOOL, NSError*), bool deleted) {
++                  SignedImportOnUIThread().busy = false;
++                  reply(YES, deleted ? nil : SignedImportError(
++                      @"The extension was removed, but its files could not be deleted."));
++                }, std::move(reply)));
++          },
++          context->GetPath(), extension->path(), [completion copy]));
++}
++
+ - (BOOL)setExtensionWithID:(NSString*)extensionId
+                    enabled:(BOOL)enabled
+                      error:(NSError* __autoreleasing*)error {
+@@ -1831,6 +1938,12 @@ - (void)confirmPreparedExtensionWithToken:(NSString*)token
+         SignedImportError(@"The extension review has expired."));
+     return;
+   }
++  if (state.busy) {
++    PostInstallCompletionOnMainThread(
++        base::BindOnce(completion), nil,
++        SignedImportError(@"An extension change is already in progress."));
++    return;
++  }
+   auto prepared = std::move(*state.prepared);
+   state.prepared.reset();
+   state.busy = true;
+@@ -1865,6 +1978,8 @@ - (void)confirmPreparedExtensionWithToken:(NSString*)token
+                            SignedImportOnUIThread().busy = false;
+                            if (failure || !entry) {
+                              DeleteImportDirectory(target);
++                           } else {
++                             SignedImportOnUIThread().installed_paths.insert(target);
+                            }
+                            reply(entry, failure);
+                          }];

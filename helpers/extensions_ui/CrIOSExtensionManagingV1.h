@@ -7,6 +7,8 @@
                    enabled:(BOOL)enabled
                      error:(NSError *__autoreleasing *)error;
 @optional
+- (void)uninstallExtensionWithID:(NSString *)extensionID
+                      completion:(void (^)(BOOL removed, NSError *error))completion;
 - (void)prepareStoreExtensionWithID:(NSString *)storeID
                           completion:
                               (void (^)(NSDictionary<NSString *, id> *prepared,

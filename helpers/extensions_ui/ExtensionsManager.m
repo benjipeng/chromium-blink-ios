@@ -79,6 +79,7 @@ static id<CrIOSExtensionManagingV1> ResolveExtensionManager(NSString **outError)
 @property(nonatomic, copy) NSString *name;
 @property(nonatomic, copy) NSString *version;
 @property(nonatomic, assign) BOOL enabled;
+@property(nonatomic, assign) BOOL removable;
 @property(nonatomic, copy) NSString *optionsPageURL;
 @end
 
@@ -119,6 +120,7 @@ static NSArray<ExtensionEntryModel *> *LoadExtensionsSnapshot(NSString **outErro
     id rawName = dict[@"name"];
     id rawVersion = dict[@"version"];
     id rawEnabled = dict[@"enabled"];
+    id rawRemovable = dict[@"removable"];
     id rawOptionsURL = dict[@"optionsPageURL"];
 
     ExtensionEntryModel *entry = [[ExtensionEntryModel alloc] init];
@@ -133,6 +135,9 @@ static NSArray<ExtensionEntryModel *> *LoadExtensionsSnapshot(NSString **outErro
     entry.enabled = [rawEnabled isKindOfClass:NSNumber.class]
                         ? [(NSNumber *)rawEnabled boolValue]
                         : NO;
+    entry.removable = [rawRemovable isKindOfClass:NSNumber.class] &&
+        [rawRemovable boolValue] &&
+        [manager respondsToSelector:@selector(uninstallExtensionWithID:completion:)];
     if (entry.enabled && [rawOptionsURL isKindOfClass:NSString.class] &&
         [(NSString *)rawOptionsURL hasPrefix:@"chrome-extension://"]) {
       entry.optionsPageURL = (NSString *)rawOptionsURL;
@@ -431,6 +436,76 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   [self.tableView reloadData];
 }
 
+- (void)confirmRemovalOfExtension:(ExtensionEntryModel *)entry {
+  if (self.importInProgress || self.presentedViewController) return;
+  UIAlertController *alert = [UIAlertController
+      alertControllerWithTitle:[NSString stringWithFormat:@"Remove %@?", entry.name]
+      message:@"The extension will stop running in this profile."
+      preferredStyle:UIAlertControllerStyleAlert];
+  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  [alert addAction:[UIAlertAction actionWithTitle:@"Remove"
+      style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+    ExtensionsManagerViewController *view = weakSelf;
+    id<CrIOSExtensionManagingV1> manager = ResolveExtensionManager(NULL);
+    if (!view || view.importInProgress) return;
+    if (![manager respondsToSelector:@selector(uninstallExtensionWithID:completion:)]) {
+      [view reloadSnapshot];
+      return;
+    }
+    view.importInProgress = YES;
+    [manager uninstallExtensionWithID:entry.extensionId
+                           completion:^(BOOL removed, NSError *error) {
+      ExtensionsManagerViewController *liveView = weakSelf;
+      liveView.importInProgress = NO;
+      [liveView reloadSnapshot];
+      if (!removed || error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (liveView.viewIfLoaded.window) {
+            PresentOptionsAlert(liveView, removed ? @"Cleanup Incomplete" : @"Could Not Remove Extension",
+                error.localizedDescription ?: @"Try again.");
+          }
+        });
+      }
+    }];
+  }]];
+  [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (UIButton *)buildManageButtonForEntry:(ExtensionEntryModel *)entry {
+  UIButtonConfiguration *config = [UIButtonConfiguration borderedButtonConfiguration];
+  config.title = @"Manage";
+  UIButton *button = [UIButton buttonWithConfiguration:config primaryAction:nil];
+  button.accessibilityIdentifier =
+      [NSString stringWithFormat:@"kExtensionManageButton_%@", entry.extensionId];
+  button.accessibilityLabel = [NSString stringWithFormat:@"Manage %@", entry.name];
+  __weak ExtensionsManagerViewController *weakSelf = self;
+  NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
+  if (entry.optionsPageURL.length > 0) {
+    [actions addObject:[UIAction actionWithTitle:@"Options" image:[UIImage systemImageNamed:@"gear"]
+        identifier:nil handler:^(__unused UIAction *action) {
+      ExtensionsManagerViewController *view = weakSelf;
+      if (!view) return;
+      NSString *error = nil;
+      if (!OpenOptionsPageInBrowser(view, entry, &error)) {
+        PresentOptionsAlert(view, @"Options Unavailable", error);
+      }
+    }]];
+  }
+  UIAction *remove = [UIAction actionWithTitle:@"Remove…"
+      image:[UIImage systemImageNamed:@"trash"] identifier:nil
+      handler:^(__unused UIAction *action) {
+    [weakSelf confirmRemovalOfExtension:entry];
+  }];
+  remove.attributes = UIMenuElementAttributesDestructive;
+  [actions addObject:remove];
+  button.menu = [UIMenu menuWithChildren:actions];
+  button.showsMenuAsPrimaryAction = YES;
+  return button;
+}
+
 - (void)pickExtensionFile {
   if (self.importInProgress || self.presentedViewController) return;
   UTType *type = [UTType typeWithFilenameExtension:@"crx"];
@@ -646,6 +721,8 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   }
 
   ExtensionEntryModel *entry = self.entries[(NSUInteger)indexPath.row];
+  cell.selectionStyle = entry.removable ? UITableViewCellSelectionStyleNone
+                                        : UITableViewCellSelectionStyleDefault;
   cell.textLabel.text = entry.name;
   cell.detailTextLabel.text = entry.version.length > 0
       ? [NSString stringWithFormat:@"Version %@", entry.version]
@@ -705,10 +782,11 @@ static NSString *StoreIDFromListingURL(NSString *input) {
                 action:@selector(handleExtensionSwitch:)
       forControlEvents:UIControlEventValueChanged];
 
-  if (entry.enabled && entry.optionsPageURL.length > 0) {
-    UIButton *optionsBtn = [self buildOptionsButtonForRow:row withEntry:entry];
+  if (entry.removable || (entry.enabled && entry.optionsPageURL.length > 0)) {
+    UIButton *manage = entry.removable ? [self buildManageButtonForEntry:entry]
+                                       : [self buildOptionsButtonForRow:row withEntry:entry];
     UIStackView *stack =
-        [[UIStackView alloc] initWithArrangedSubviews:@[ optionsBtn, toggle ]];
+        [[UIStackView alloc] initWithArrangedSubviews:@[ manage, toggle ]];
     stack.axis = UILayoutConstraintAxisHorizontal;
     stack.alignment = UIStackViewAlignmentCenter;
     stack.spacing = 10.0;
@@ -781,6 +859,7 @@ static NSString *StoreIDFromListingURL(NSString *input) {
   NSInteger row = indexPath.row;
   if (row < 0 || row >= (NSInteger)self.entries.count) return;
   ExtensionEntryModel *entry = self.entries[(NSUInteger)row];
+  if (entry.removable) return;
   UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
   UISwitch *toggle = [self switchInAccessoryView:cell.accessoryView];
   [self applyToggleForRow:row
