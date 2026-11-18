@@ -1,12 +1,15 @@
 chrome/browser/extensions/installed_loader.cc
 chrome/common/extensions/api/tabs.json
 extensions/browser/api/declarative_net_request/action_tracker.cc
+extensions/browser/api/declarative_net_request/action_tracker.h
 extensions/browser/api/declarative_net_request/request_action.h
 extensions/browser/api/messaging/messaging_delegate.h
-extensions/browser/api/web_request/web_request_api.cc
+extensions/browser/api/web_request/extension_web_request_event_router.cc
 extensions/browser/api/web_request/web_request_info.cc
 extensions/browser/api/web_request/web_request_info.h
+extensions/browser/extension_api_frame_id_map.cc
 extensions/browser/extension_function.h
+extensions/browser/extension_navigation_ui_data.cc
 extensions/browser/extensions_browser_client.h
 extensions/browser/permissions/active_tab_permission_granter.h
 extensions/browser/permissions/permissions_updater.cc
