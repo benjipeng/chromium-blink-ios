@@ -33,6 +33,10 @@ In Chromium on the simulator, open `http://127.0.0.1:8765/` and tap **Run filter
 
 Run the same check after removal and again after reinstalling. Both paths should reach the server while the extension is absent. The EasyList path should stop reaching it after reinstalling, while the control remains reachable. Check on a newly loaded page each time.
 
+## Verify tab binding once action popups are implemented
+
+`tools/simulator/extension-action-check/` is a developer fixture, not a signed package for Files import. It declares `activeTab` and no broad host permissions. Launch its popup from two ordinary tabs and confirm the real tab IDs and hostnames differ. Reload must act on the associated web tab, and Close must dismiss the popup without closing that tab. Repeat while folding the simulator and after switching tabs to verify that stale popup actions cannot target the wrong tab.
+
 ## Where changes live
 
 - Put native browser behavior and layout fixes in `patches/`. They ship through the ordinary build.
