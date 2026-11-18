@@ -59,3 +59,4 @@
 0067-ios-extensions-trusted-unpacked-installer.patch
 0068-ios-extensions-commands-api.patch
 0069-ios-extensions-options-and-navigation.patch
+0070-ios-disable-unsupported-management-api.patch

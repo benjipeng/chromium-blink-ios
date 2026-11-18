@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS: hide management API until a delegate is provided
+
+Listing installed extensions from the Web Store aborts when the iOS
+embedder returns a null ManagementAPIDelegate. Privileged extension
+calls such as management.getSelf inherit the same API and can reach
+the same check. Gate all management contexts on supported platforms
+without changing the native iOS Settings bridge or other APIs.
+
+---
+diff --git a/extensions/common/api/_api_features.json b/extensions/common/api/_api_features.json
+index 1966a1e..4735410 100644
+--- a/extensions/common/api/_api_features.json
++++ b/extensions/common/api/_api_features.json
+@@ -341,28 +341,33 @@
+   "idle.getAutoLockDelay": {
+     "platforms": ["chromeos"]
+   },
++  // iOS does not yet supply a ManagementAPIDelegate.
+   "management": [{
+     "dependencies": ["permission:management"],
+     "contexts": ["privileged_extension"],
+-    "default_parent": true
++    "default_parent": true,
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }, {
+     "channel": "stable",
+     "contexts": ["webui"],
+     "matches": [
+       "chrome://extensions/*",
+       "chrome://settings/*"
+-    ]
++    ],
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }, {
+     "channel": "stable",
+     "contexts": ["web_page"],
+-    "matches": ["https://chromewebstore.google.com/*"]
++    "matches": ["https://chromewebstore.google.com/*"],
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }, {
+     // Used for webstore testing. See comment in
+     // chrome/common/extensions/webstore_override.cc
+     "channel": "stable",
+     "contexts": ["web_page"],
+     "requires_delegated_availability_check": true,
+-    "matches": ["<all_urls>"]
++    "matches": ["<all_urls>"],
++    "platforms": ["chromeos", "desktop_android", "linux", "mac", "win"]
+   }],
+   "management.getPermissionWarningsByManifest": {
+     "dependencies": [],
