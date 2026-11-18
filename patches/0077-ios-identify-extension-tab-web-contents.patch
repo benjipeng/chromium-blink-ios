@@ -1,0 +1,114 @@
+diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
+--- a/ios/web/content/web_state/content_web_state.h
++++ b/ios/web/content/web_state/content_web_state.h
+@@ -78,6 +78,10 @@
+ 
+   // Returns the WebContents owned by this ContentWebState.
+   content::WebContents* GetWebContents();
++
++  // Returns an invalid ID for WebContents that do not belong to an iOS tab.
++  static WebStateID GetUniqueIdentifierForWebContents(
++      const content::WebContents& web_contents);
+ 
+   // WebState implementation.
+   void SerializeToProto(proto::WebStateStorage& storage) const override;
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -11,6 +11,7 @@
+ #import "base/functional/bind.h"
+ #import "base/functional/callback_helpers.h"
+ #import "base/notimplemented.h"
++#import "base/supports_user_data.h"
+ #import "base/strings/sys_string_conversions.h"
+ #import "base/strings/utf_string_conversions.h"
+ #import "components/embedder_support/ios/delegate/color_chooser/color_chooser_ios.h"
+@@ -71,6 +72,15 @@
+ 
+ namespace {
+ 
++const char kContentTabIdentityKey = 0;
++
++class ContentTabIdentity final : public base::SupportsUserData::Data {
++ public:
++  explicit ContentTabIdentity(WebStateID id) : identifier(id) {}
++
++  const WebStateID identifier;
++};
++
+ // The content navigation machinery should not use this so we will use a dummy.
+ // TODO(crbug.com/40257932): enable returning nullptr for the cache.
+ class DummySessionCertificatePolicyCache
+@@ -193,6 +203,9 @@
+   } else {
+     web_contents_ = content::WebContents::Create(createParams);
+   }
++  web_contents_->SetUserData(
++      &kContentTabIdentityKey,
++      std::make_unique<ContentTabIdentity>(unique_identifier_));
+   web_contents_->SetDelegate(this);
+   WebContentsObserver::Observe(web_contents_.get());
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+@@ -268,6 +281,14 @@
+ 
+ content::WebContents* ContentWebState::GetWebContents() {
+   return web_contents_.get();
++}
++
++// static
++WebStateID ContentWebState::GetUniqueIdentifierForWebContents(
++    const content::WebContents& web_contents) {
++  const auto* identity = static_cast<const ContentTabIdentity*>(
++      web_contents.GetUserData(&kContentTabIdentityKey));
++  return identity ? identity->identifier : WebStateID();
+ }
+ 
+ void ContentWebState::SerializeToProto(proto::WebStateStorage& storage) const {
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -189,6 +189,9 @@
+   ExtensionCache* GetExtensionCache() override;
+   bool IsBackgroundUpdateAllowed() override;
+   bool IsMinBrowserVersionSupported(const std::string& min_version) override;
++  void GetTabAndWindowIdForWebContents(content::WebContents* web_contents,
++                                       int* tab_id,
++                                       int* window_id) override;
+   void CreateExtensionWebContentsObserver(
+       content::WebContents* web_contents) override;
+   ExtensionWebContentsObserver* GetExtensionWebContentsObserver(
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -94,6 +94,7 @@
+ #include "ios/chrome/browser/shared/model/profile/profile_ios.h"
+ #include "ios/chrome/common/channel_info.h"
+ #include "ios/web/content/content_browser_context.h"
++#include "ios/web/content/web_state/content_web_state.h"
+ #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+ #include "url/gurl.h"
+ 
+@@ -1230,6 +1231,23 @@
+   const base::Version min_parsed(min_version);
+   return !browser_version.IsValid() || !min_parsed.IsValid() ||
+          min_parsed.CompareTo(browser_version) <= 0;
++}
++
++void IOSExtensionsBrowserClient::GetTabAndWindowIdForWebContents(
++    content::WebContents* web_contents,
++    int* tab_id,
++    int* window_id) {
++  *tab_id = -1;
++  *window_id = -1;
++  if (!web_contents || IsShuttingDown() ||
++      !IsValidContext(web_contents->GetBrowserContext())) {
++    return;
++  }
++  const auto id =
++      web::ContentWebState::GetUniqueIdentifierForWebContents(*web_contents);
++  if (id.valid()) {
++    *tab_id = id.identifier();
++  }
+ }
+ 
+ void IOSExtensionsBrowserClient::CreateExtensionWebContentsObserver(

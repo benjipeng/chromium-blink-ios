@@ -29,6 +29,7 @@ obj/extensions/browser/browser_sources/renderer_startup_helper.o
 obj/ios/web/content/init/init/ios_content_client.o
 obj/ios/web/content/init/init/ios_content_renderer_client.o
 obj/ios/web/content/init/init/ios_content_browser_client.o
+obj/ios/web/content/content/content_web_state.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_renderer_client.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
