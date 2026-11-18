@@ -37,6 +37,7 @@
 0038-ios-sideload-one-resize-per-turn.patch
 0039-ios-duo-keep-omnibox-padding-in-points.patch
 0040-ios-duo-avoid-vertical-fold-in-tab-grid.patch
+0041-ios-duo-align-bottom-omnibox-suggestions.patch
 0046-ios-sideload-google-services-off-by-default.patch
 0047-ios-extensions-guard-renderer-chrome-resources.patch
 0048-ios-extensions-guard-test-support-chrome-buildflags.patch
@@ -67,3 +68,7 @@
 0073-ios-extension-uninstall.patch
 0074-ios-signed-extension-consent-and-session.patch
 0075-ios-attach-extension-host-observer.patch
+0076-ios-restore-confirmed-extension-installs.patch
+0077-ios-identify-extension-tab-web-contents.patch
+0078-ios-extensions-valid-tab-id.patch
+0079-ios-expose-per-page-dnr-block-count.patch

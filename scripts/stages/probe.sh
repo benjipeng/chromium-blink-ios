@@ -36,6 +36,7 @@ obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system_factory.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_web_contents_observer.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_client.o
+obj/ios/chrome/browser/composebox/ui/ui/composebox_view_controller.o
 obj/components/policy/core/common/internal/policy_merger.o
 obj/extensions/common/common/command.o
 obj/extensions/common/common/content_script_utils.o

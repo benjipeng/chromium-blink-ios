@@ -33,6 +33,18 @@ src_dir="$(cd "$src_dir" && pwd)"
 series_file="$REPO_ROOT/patches/series"
 [ -f "$series_file" ] || { echo "error: missing $series_file" >&2; exit 1; }
 
+# Top-level patches must be active. Keep intentionally inactive patches in
+# patches/optional/ so a missing series entry cannot produce a false green.
+unlisted_patches="$(comm -23 \
+  <(cd "$REPO_ROOT/patches" && find . -maxdepth 1 -type f -name '*.patch' -print |
+    sed 's|^./||' | LC_ALL=C sort) \
+  <(sed -e 's/#.*//' -e 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+    -e '/^$/d' "$series_file" | LC_ALL=C sort -u))"
+if [ -n "$unlisted_patches" ]; then
+  printf 'error: patches missing from series:\n%s\n' "$unlisted_patches" >&2
+  exit 1
+fi
+
 target_dir="$src_dir"
 overlay_dir=""
 if [ "$check_only" -eq 1 ]; then
