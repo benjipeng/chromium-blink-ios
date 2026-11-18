@@ -72,3 +72,5 @@
 0077-ios-identify-extension-tab-web-contents.patch
 0078-ios-extensions-valid-tab-id.patch
 0079-ios-expose-per-page-dnr-block-count.patch
+0080-ios-report-extension-runtime-platform.patch
+0081-ios-bridge-extension-tab-queries-and-close-events.patch

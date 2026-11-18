@@ -1,0 +1,38 @@
+diff --git a/extensions/common/api/runtime.json b/extensions/common/api/runtime.json
+--- a/extensions/common/api/runtime.json
++++ b/extensions/common/api/runtime.json
+@@ -102,6 +102,7 @@
+             {"name": "mac", "description": "Specifies the MacOS operating system."},
+             {"name": "win", "description": "Specifies the Windows operating system."},
+             {"name": "android", "description": "Specifies the Android operating system."},
++            {"name": "ios", "description": "Specifies the iOS operating system."},
+             {"name": "cros", "description": "Specifies the Chrome operating system."},
+             {"name": "linux", "description": "Specifies the Linux operating system."},
+             {"name": "openbsd", "description": "Specifies the OpenBSD operating system."}
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -31,6 +31,7 @@
+ #include "base/uuid.h"
+ #include "base/values.h"
+ #include "base/version.h"
++#include "build/build_config.h"
+ #include "components/application_locale_storage/application_locale_storage.h"
+ #include "components/crx_file/id_util.h"
+ #include "components/keyed_service/content/browser_context_dependency_manager.h"
+@@ -720,8 +721,13 @@
+   void OpenURL(const GURL& uninstall_url) override {}
+
+   bool GetPlatformInfo(extensions::api::runtime::PlatformInfo* info) override {
+-    // runtime.PlatformOs currently has no `ios` enumerator upstream.
+-    return false;
++#if defined(ARCH_CPU_ARM64)
++    info->os = extensions::api::runtime::PlatformOs::kIos;
++    info->arch = extensions::api::runtime::PlatformArch::kArm64;
++    return true;
++#else
++    return false;
++#endif
+   }
+
+   bool RestartDevice(std::string* error_message) override {

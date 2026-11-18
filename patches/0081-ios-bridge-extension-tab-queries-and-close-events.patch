@@ -1,0 +1,575 @@
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 58f7546d2021925fe6276bad70e117a6e86e8874..95b92b48686ce797ba54270aaeb20de23eed50d6 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -24,6 +24,8 @@ source_set("model") {
+     "ios_signed_extension_package.h",
+     "ios_store_crx_download.h",
+     "ios_store_crx_download.mm",
++    "ios_tabs_api.h",
++    "ios_tabs_api.mm",
+   ]
+
+   public_deps = [
+@@ -50,10 +52,14 @@ source_set("model") {
+     "//extensions/common",
+     "//extensions/common/api",
+     "//ios/chrome/browser/shared/model/application_context",
++    "//ios/chrome/browser/shared/model/browser",
++    "//ios/chrome/browser/shared/model/browser:utils",
+     "//ios/chrome/browser/shared/model/paths",
+     "//ios/chrome/browser/shared/model/profile",
++    "//ios/chrome/browser/shared/model/web_state_list",
+     "//ios/chrome/common",
+     "//ios/web/content",
++    "//ios/web/public",
+     "//net",
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.h b/ios/chrome/browser/extensions/model/ios_extension_system.h
+index 6665039bdf50e23db5fd4ece3e7b23b2ba0efee0..e28c68f2e17046eabe93d27a2a84ca45de5886ca 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.h
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.h
+@@ -28,6 +28,7 @@ class ValueStoreFactoryImpl;
+ namespace extensions {
+
+ class Extension;
++class IOSTabEvents;
+ class NullAppSorting;
+
+ class IOSExtensionSystem final : public ExtensionSystem {
+@@ -96,6 +97,7 @@ class IOSExtensionSystem final : public ExtensionSystem {
+   std::unique_ptr<ManagementPolicy> management_policy_;
+   std::unique_ptr<ServiceWorkerManager> service_worker_manager_;
+   std::unique_ptr<UserScriptManager> user_script_manager_;
++  std::unique_ptr<IOSTabEvents> tab_events_;
+   std::unique_ptr<RegistrarDelegate> registrar_delegate_;
+   base::OneShotEvent ready_;
+
+diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+index 40a46e9a6d106f10d0e0e2190b1cdc468220b1ea..c374b8abf25a435f06e9100eef89794a0fb65c9a 100644
+--- a/ios/chrome/browser/extensions/model/ios_extension_system.mm
++++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
+@@ -44,6 +44,7 @@
+ #include "extensions/common/manifest_constants.h"
+ #include "extensions/common/permissions/permissions_data.h"
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#include "ios/chrome/browser/extensions/model/ios_tabs_api.h"
+
+ namespace extensions {
+
+@@ -300,6 +301,7 @@ void OnExtensionInstalled(const Extension* extension,
+ IOSExtensionSystem::~IOSExtensionSystem() = default;
+
+ void IOSExtensionSystem::Shutdown() {
++  tab_events_.reset();
+   weak_factory_.InvalidateWeakPtrs();
+   auto* client = IOSExtensionsBrowserClient::GetInstance();
+   for (const auto& [path, id] : signed_imports_) {
+@@ -355,6 +357,10 @@ void OnExtensionInstalled(const Extension* extension,
+     return;
+   }
+
++  if (auto* profile = IOSExtensionsBrowserClient::GetInstance()->GetTabProfile(
++          browser_context_)) {
++    tab_events_ = std::make_unique<IOSTabEvents>(browser_context_, profile);
++  }
+   RestoreSignedImports();
+   const base::FilePath bundled_dir = GetIOSBundledExtensionDirectory();
+   const base::FilePath profile_path = browser_context_->GetPath();
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+index 6b7a2a475f1dd047d879f514672d94793196f3e4..f0ece009db4f56d4a6421ba29c0dd5003ad37db6 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+@@ -6,6 +6,7 @@
+
+ #include "extensions/browser/extension_function_registry.h"
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
++#include "ios/chrome/browser/extensions/model/ios_tabs_api.h"
+
+ namespace extensions {
+
+@@ -15,6 +16,8 @@ IOSExtensionsBrowserAPIProvider::~IOSExtensionsBrowserAPIProvider() = default;
+ void IOSExtensionsBrowserAPIProvider::RegisterExtensionFunctions(
+     ExtensionFunctionRegistry* registry) {
+   registry->RegisterFunction<CommandsGetAllFunction>();
++  registry->RegisterFunction<IOSTabsQueryFunction>();
++  registry->RegisterFunction<IOSTabsGetFunction>();
+ }
+
+ }  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 3b40c7ff2f15b1c689b2b294e1ed58922f260171..fede851d6624d0a11d3f70d458a12fa74013e4f1 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -83,6 +83,9 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+   void UnregisterBrowserContext(content::BrowserContext* context);
+   std::vector<content::BrowserContext*> GetRegisteredContextsSnapshot() const;
+
++  // The registered regular profile. Call only on the browser UI thread.
++  ProfileIOS* GetTabProfile(content::BrowserContext* context) const;
++
+   // Tracks live ContentWebState-backed tabs for extension request attribution.
+   void RegisterTabWebContents(int tab_id, content::WebContents* web_contents);
+   void UnregisterTabWebContents(int tab_id,
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 105ec3ac42bce3397f70f59979d08109cc54b0c9..9b87acfafa105e08c7a03a079216acbf96b489d3 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -1402,6 +1402,14 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   return contexts;
+ }
+
++ProfileIOS* IOSExtensionsBrowserClient::GetTabProfile(
++    content::BrowserContext* context) const {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  base::AutoLock lock(context_lock_);
++  auto it = registered_contexts_.find(context);
++  return it == registered_contexts_.end() ? nullptr : it->second.get();
++}
++
+ bool IOSExtensionsBrowserClient::IOSKioskDelegate::IsAutoLaunchedKioskApp(
+     const ExtensionId& id) const {
+   return false;
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.h b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a38bba27c5cdd28ecb8200cfdd75b27afe9a273a
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_TABS_API_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_TABS_API_H_
++
++#include <memory>
++
++#include "extensions/browser/extension_function.h"
++
++class ProfileIOS;
++
++namespace content {
++class BrowserContext;
++}
++
++namespace extensions {
++
++class IOSTabsQueryFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("tabs.query", TABS_QUERY)
++
++ private:
++  ~IOSTabsQueryFunction() override = default;
++  ResponseAction Run() override;
++};
++
++class IOSTabsGetFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("tabs.get", TABS_GET)
++
++ private:
++  ~IOSTabsGetFunction() override = default;
++  ResponseAction Run() override;
++};
++
++// Publishes tab lifecycle events for this regular profile.
++class IOSTabEvents {
++ public:
++  IOSTabEvents(content::BrowserContext* context, ProfileIOS* profile);
++  ~IOSTabEvents();
++  IOSTabEvents(const IOSTabEvents&) = delete;
++  IOSTabEvents& operator=(const IOSTabEvents&) = delete;
++
++ private:
++  class Observer;
++  std::unique_ptr<Observer> observer_;
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_TABS_API_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.mm b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..d99dbeb0f38c13b589b95349ec941afa2cafaf83
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+@@ -0,0 +1,263 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/extensions/model/ios_tabs_api.h"
++
++#include <memory>
++#include <optional>
++#include <set>
++#include <utility>
++
++#include "base/containers/flat_map.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/scoped_multi_source_observation.h"
++#include "base/scoped_observation.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
++#include "content/public/browser/web_contents.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_event_histogram_value.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/event_args.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/permissions/permissions_data.h"
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#import "ios/chrome/browser/shared/model/browser/browser.h"
++#include "ios/chrome/browser/shared/model/browser/browser_list.h"
++#import "ios/chrome/browser/shared/model/browser/browser_list_factory.h"
++#include "ios/chrome/browser/shared/model/browser/browser_list_utils.h"
++#include "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
++#include "ios/chrome/browser/shared/model/web_state_list/web_state_list_observer.h"
++#include "ios/web/content/web_state/content_web_state.h"
++#include "ios/web/public/web_state.h"
++#include "url/gurl.h"
++
++namespace extensions {
++namespace {
++
++const char kWindowIDKey = 0;
++
++class WindowID final : public base::SupportsUserData::Data {
++ public:
++  explicit WindowID(int id) : id(id) {}
++  const int id;
++};
++
++int GetWindowID(Browser& browser) {
++  // Browser and WebStateList are both owned by the UI sequence.
++  auto* data = static_cast<WindowID*>(browser.GetUserData(&kWindowIDKey));
++  if (data) {
++    return data->id;
++  }
++  static int next_id = 1;
++  const int id = next_id++;
++  browser.SetUserData(&kWindowIDKey, std::make_unique<WindowID>(id));
++  return id;
++}
++
++BrowserList* GetBrowserList(content::BrowserContext* context) {
++  auto* profile =
++      IOSExtensionsBrowserClient::GetInstance()->GetTabProfile(context);
++  return profile ? BrowserListFactory::GetForProfileIfExists(profile) : nullptr;
++}
++
++Browser* FindSenderBrowser(const std::set<Browser*>& browsers,
++                           content::WebContents* sender) {
++  if (!sender) {
++    return nullptr;
++  }
++  const auto id = web::ContentWebState::GetUniqueIdentifierForWebContents(*sender);
++  if (!id.valid()) {
++    return nullptr;
++  }
++  for (auto* browser : browsers) {
++    auto* tabs = browser->GetWebStateList();
++    for (int i = 0; i < tabs->count(); ++i) {
++      if (tabs->GetWebStateAt(i)->GetUniqueIdentifier() == id) {
++        return browser;
++      }
++    }
++  }
++  return nullptr;
++}
++
++base::DictValue MakeTab(Browser& browser,
++                        int index,
++                        const Extension& extension) {
++  auto* tabs = browser.GetWebStateList();
++  const auto& tab = *tabs->GetWebStateAt(index);
++  const int id = tab.GetUniqueIdentifier().identifier();
++  const bool active = &tab == tabs->GetActiveWebState();
++  base::DictValue result;
++  result.Set("id", id);
++  result.Set("index", index);
++  result.Set("windowId", GetWindowID(browser));
++  result.Set("active", active);
++  result.Set("highlighted", active);
++  result.Set("pinned", index < tabs->pinned_tabs_count());
++  result.Set("incognito", false);
++  result.Set("status", tab.IsLoading() ? "loading" : "complete");
++  const GURL& url = tab.GetLastCommittedURL();
++  const auto* permissions = extension.permissions_data();
++  if (url.is_valid() &&
++      ((url.SchemeIs(kExtensionScheme) && url.host() == extension.id()) ||
++       permissions->CanAccessPage(url, id, /*error=*/nullptr))) {
++    result.Set("url", url.spec());
++    result.Set("title", base::UTF16ToUTF8(tab.GetTitle()));
++  }
++  return result;
++}
++
++}  // namespace
++
++ExtensionFunction::ResponseAction IOSTabsQueryFunction::Run() {
++  EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_dict());
++  const auto& query = args()[0].GetDict();
++  if (!extension()) {
++    return RespondNow(Error("No extension found."));
++  }
++  const std::optional<bool> active = query.FindBool("active");
++  const std::optional<bool> current = query.FindBool("currentWindow");
++  const std::optional<bool> focused = query.FindBool("lastFocusedWindow");
++  base::ListValue matches;
++  const auto* type = query.FindString("windowType");
++  if (type && *type != "normal") {
++    return RespondNow(WithArguments(std::move(matches)));
++  }
++  auto* list = GetBrowserList(browser_context());
++  if (!list) {
++    return RespondNow(WithArguments(std::move(matches)));
++  }
++  const auto browsers = list->BrowsersOfType(BrowserList::BrowserType::kRegular);
++  Browser* foreground = browser_list_utils::GetMostActiveSceneBrowser(list);
++  Browser* sender_browser =
++      current.has_value() ? FindSenderBrowser(browsers, GetSenderWebContents())
++                          : nullptr;
++  Browser* current_browser = sender_browser ? sender_browser : foreground;
++  for (auto* browser : browsers) {
++    if ((current && *current != (browser == current_browser)) ||
++        (focused && *focused != (browser == foreground))) {
++      continue;
++    }
++    auto* tabs = browser->GetWebStateList();
++    for (int i = 0; i < tabs->count(); ++i) {
++      if (!active ||
++          *active == (tabs->GetWebStateAt(i) == tabs->GetActiveWebState())) {
++        matches.Append(MakeTab(*browser, i, *extension()));
++      }
++    }
++  }
++  return RespondNow(WithArguments(std::move(matches)));
++}
++
++ExtensionFunction::ResponseAction IOSTabsGetFunction::Run() {
++  EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_int());
++  if (!extension()) {
++    return RespondNow(Error("No extension found."));
++  }
++  const int id = args()[0].GetInt();
++  auto* list = GetBrowserList(browser_context());
++  if (!list) {
++    return RespondNow(Error("No tab with that ID."));
++  }
++  for (auto* browser :
++       list->BrowsersOfType(BrowserList::BrowserType::kRegular)) {
++    auto* tabs = browser->GetWebStateList();
++    for (int i = 0; i < tabs->count(); ++i) {
++      if (tabs->GetWebStateAt(i)->GetUniqueIdentifier().identifier() == id) {
++        return RespondNow(WithArguments(MakeTab(*browser, i, *extension())));
++      }
++    }
++  }
++  return RespondNow(Error("No tab with that ID."));
++}
++
++class IOSTabEvents::Observer final : public BrowserListObserver,
++                                     public WebStateListObserver {
++ public:
++  Observer(content::BrowserContext* context, ProfileIOS* profile)
++      : context_(context) {
++    auto* browsers = BrowserListFactory::GetForProfile(profile);
++    if (!browsers) {
++      return;
++    }
++    browser_observation_.Observe(browsers);
++    for (auto* browser :
++         browsers->BrowsersOfType(BrowserList::BrowserType::kRegular)) {
++      OnBrowserAdded(browsers, browser);
++    }
++  }
++
++  void OnBrowserAdded(const BrowserList*, Browser* browser) override {
++    auto* tabs = browser->GetWebStateList();
++    if (browser->type() == Browser::Type::kRegular &&
++        !tab_observation_.IsObservingSource(tabs)) {
++      windows_.emplace(tabs, GetWindowID(*browser));
++      tab_observation_.AddObservation(tabs);
++    }
++  }
++
++  void OnBrowserRemoved(const BrowserList*, Browser* browser) override {
++    StopObserving(browser->GetWebStateList());
++  }
++
++  void OnBrowserListShutdown(BrowserList*) override {
++    tab_observation_.RemoveAllObservations();
++    windows_.clear();
++    browser_observation_.Reset();
++  }
++
++  void WebStateListDestroyed(WebStateList* list) override {
++    StopObserving(list);
++  }
++
++  void WebStateListDidChange(WebStateList* list,
++                             const WebStateListChange& change,
++                             const WebStateListStatus&) override {
++    if (change.type() != WebStateListChange::Type::kDetach) {
++      return;
++    }
++    const auto& detach = change.As<WebStateListChangeDetach>();
++    if (!detach.is_closing()) {
++      return;
++    }
++    const auto window = windows_.find(list);
++    auto* router = EventRouter::Get(context_);
++    if (!router || window == windows_.end()) {
++      return;
++    }
++    base::DictValue info;
++    info.Set("windowId", window->second);
++    info.Set("isWindowClosing", false);
++    base::ListValue args;
++    args.Append(detach.detached_web_state()->GetUniqueIdentifier().identifier());
++    args.Append(std::move(info));
++    router->BroadcastEvent(std::make_unique<Event>(
++        events::TABS_ON_REMOVED, "tabs.onRemoved",
++        base::MakeRefCounted<EventArgs>(std::move(args)), context_));
++  }
++
++ private:
++  void StopObserving(WebStateList* list) {
++    if (tab_observation_.IsObservingSource(list)) {
++      tab_observation_.RemoveObservation(list);
++      windows_.erase(list);
++    }
++  }
++
++  const raw_ptr<content::BrowserContext> context_;
++  base::flat_map<WebStateList*, int> windows_;
++  base::ScopedObservation<BrowserList, BrowserListObserver>
++      browser_observation_{this};
++  base::ScopedMultiSourceObservation<WebStateList, WebStateListObserver>
++      tab_observation_{this};
++};
++
++IOSTabEvents::IOSTabEvents(content::BrowserContext* context, ProfileIOS* profile)
++    : observer_(std::make_unique<Observer>(context, profile)) {}
++
++IOSTabEvents::~IOSTabEvents() = default;
++
++}  // namespace extensions
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index e3dfd36274382701af9af58104c698937a176265..c698a64b11926df082316183d6c3da55631282b2 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -17,8 +17,11 @@ json_features("ios_api_features") {
+ }
+
+ generated_json_strings("ios_api_json_strings") {
+-  sources = [ "//chrome/common/extensions/api/commands.json" ]
+-  root = "//chrome/common/extensions/api"
++  sources = [
++    "//chrome/common/extensions/api/commands.json",
++    "tabs.json",
++  ]
++  root = "//"
+   target_prefix = "ios/web/content/init/extensions"
+   bundle_name = "IOS"
+   root_namespace = extensions_api_root_namespace
+diff --git a/ios/web/content/init/extensions/ios_api_features.json b/ios/web/content/init/extensions/ios_api_features.json
+index be4b2ec24576ac8b91bef4b35becfa232df525a5..ae384af6f23b06ce12057d2260989d6724ee6535 100644
+--- a/ios/web/content/init/extensions/ios_api_features.json
++++ b/ios/web/content/init/extensions/ios_api_features.json
+@@ -6,5 +6,8 @@
+   "commands": {
+     "dependencies": ["manifest:commands"],
+     "contexts": ["privileged_extension"]
++  },
++  "tabs": {
++    "contexts": ["privileged_extension"]
+   }
+ }
+diff --git a/ios/web/content/init/extensions/tabs.json b/ios/web/content/init/extensions/tabs.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c01fccf0f8945884b35daa36d993c09ea3c0bff
+--- /dev/null
++++ b/ios/web/content/init/extensions/tabs.json
+@@ -0,0 +1,77 @@
++[
++  {
++    "namespace": "tabs",
++    "description": "Read and observe tabs in the extension's iOS profile.",
++    "types": [
++      {
++        "id": "Tab",
++        "type": "object",
++        "properties": {
++          "id": {"type": "integer"},
++          "index": {"type": "integer"},
++          "windowId": {"type": "integer"},
++          "active": {"type": "boolean"},
++          "highlighted": {"type": "boolean"},
++          "pinned": {"type": "boolean"},
++          "incognito": {"type": "boolean"},
++          "status": {"type": "string", "enum": ["loading", "complete"]},
++          "url": {"type": "string", "optional": true},
++          "title": {"type": "string", "optional": true}
++        }
++      }
++    ],
++    "functions": [
++      {
++        "name": "query",
++        "type": "function",
++        "description": "Returns the regular-profile tabs that match the query.",
++        "parameters": [
++          {
++            "name": "queryInfo",
++            "type": "object",
++            "properties": {
++              "active": {"type": "boolean", "optional": true},
++              "currentWindow": {"type": "boolean", "optional": true},
++              "lastFocusedWindow": {"type": "boolean", "optional": true},
++              "windowType": {"type": "string", "optional": true}
++            }
++          }
++        ],
++        "returns_async": {
++          "name": "callback",
++          "parameters": [
++            {"name": "result", "type": "array", "items": {"$ref": "Tab"}}
++          ]
++        }
++      },
++      {
++        "name": "get",
++        "type": "function",
++        "description": "Returns the tab with the given ID in this profile.",
++        "parameters": [{"name": "tabId", "type": "integer"}],
++        "returns_async": {
++          "name": "callback",
++          "parameters": [{"name": "tab", "$ref": "Tab"}]
++        }
++      }
++    ],
++    "events": [
++      {
++        "name": "onRemoved",
++        "type": "function",
++        "description": "Fired when a tab is closed.",
++        "parameters": [
++          {"name": "tabId", "type": "integer"},
++          {
++            "name": "removeInfo",
++            "type": "object",
++            "properties": {
++              "windowId": {"type": "integer"},
++              "isWindowClosing": {"type": "boolean"}
++            }
++          }
++        ]
++      }
++    ]
++  }
++]
