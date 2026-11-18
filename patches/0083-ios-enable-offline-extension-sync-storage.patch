@@ -133,7 +133,15 @@ index 9b87acfafa105e08c7a03a079216acbf96b489d3..ef54d737ef2633cc5f33f76eabe2861a
  #include <memory>
  #include <optional>
  #include <string>
-@@ -51,6 +52,7 @@
+@@ -37,6 +38,7 @@
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/user_prefs/user_prefs.h"
++#include "components/value_store/value_store_factory.h"
+ #include "components/version_info/version_info.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_task_traits.h"
+@@ -51,6 +53,7 @@
  #include "extensions/browser/api/messaging/messaging_delegate.h"
  #include "extensions/browser/api/runtime/runtime_api.h"
  #include "extensions/browser/api/runtime/runtime_api_delegate.h"
@@ -141,7 +149,7 @@ index 9b87acfafa105e08c7a03a079216acbf96b489d3..ef54d737ef2633cc5f33f76eabe2861a
  #include "extensions/browser/browser_context_keyed_service_factories.h"
  #include "extensions/browser/event_router.h"
  #include "extensions/browser/disable_reason.h"
-@@ -752,6 +754,19 @@ bool RestartDevice(std::string* error_message) override {
+@@ -752,6 +755,19 @@ bool RestartDevice(std::string* error_message) override {
      return messaging_delegate_.get();
    }
 

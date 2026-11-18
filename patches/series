@@ -76,3 +76,5 @@
 0081-ios-bridge-extension-tab-queries-and-close-events.patch
 0082-ios-expose-extension-file-access-setting.patch
 0083-ios-enable-offline-extension-sync-storage.patch
+0084-ios-store-extension-action-icons.patch
+0085-ios-route-extension-tab-messages.patch

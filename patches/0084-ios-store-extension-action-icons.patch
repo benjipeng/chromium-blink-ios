@@ -1,0 +1,270 @@
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 14dd8448554d19f9ddccbb18668c68f27cc8b575..7b384b8499726ccdd5fc2de6e16429ad788f386b 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -8,6 +8,8 @@ assert(enable_extensions_core)
+
+ source_set("model") {
+   sources = [
++    "ios_action_api.cc",
++    "ios_action_api.h",
+     "ios_commands_api.cc",
+     "ios_commands_api.h",
+     "ios_extension_system.h",
+@@ -68,6 +70,8 @@ source_set("model") {
+     "//third_party/zlib/google:zip",
+     "//ui/base",
+     "//ui/base/mojom",
++    "//ui/gfx",
++    "//ui/gfx/geometry",
+     "//url",
+   ]
+ }
+diff --git a/ios/chrome/browser/extensions/model/ios_action_api.cc b/ios/chrome/browser/extensions/model/ios_action_api.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ea23b92b68518e02b1ac72d12a1cd43bcdf61c4
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_action_api.cc
+@@ -0,0 +1,126 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ios/chrome/browser/extensions/model/ios_action_api.h"
++
++#include <limits>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "extensions/browser/extension_action.h"
++#include "extensions/browser/extension_action_manager.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/browser/image_loader.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/file_util.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/image/image.h"
++#include "url/gurl.h"
++
++namespace extensions {
++namespace {
++
++constexpr int kIconPixels = 64;
++
++std::string ChooseIcon(const base::Value& path) {
++  if (path.is_string()) {
++    return path.GetString();
++  }
++  if (!path.is_dict()) {
++    return {};
++  }
++  // Prefer the smallest image at or above the display size.
++  std::string best;
++  int best_rank = std::numeric_limits<int>::max();
++  for (const auto [dimension, value] : path.GetDict()) {
++    int pixels = 0;
++    if (!value.is_string() || !base::StringToInt(dimension, &pixels) ||
++        pixels <= 0 || pixels > 1024) {
++      continue;
++    }
++    const int rank = pixels >= kIconPixels ? pixels - kIconPixels
++                                          : 1024 + kIconPixels - pixels;
++    if (rank < best_rank) {
++      best_rank = rank;
++      best = value.GetString();
++    }
++  }
++  return best;
++}
++
++bool IsLiveTab(content::BrowserContext* context, int tab_id) {
++  return tab_id == ExtensionAction::kDefaultTabId ||
++         ExtensionsBrowserClient::Get()->IsValidTabId(
++             context, tab_id, /*include_incognito=*/false, nullptr);
++}
++
++}  // namespace
++
++ExtensionFunction::ResponseAction IOSActionSetIconFunction::Run() {
++  EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_dict());
++  const auto& details = args()[0].GetDict();
++  const auto* path = details.Find("path");
++  const std::string selected = path ? ChooseIcon(*path) : std::string();
++  if (!extension() || selected.empty()) {
++    return RespondNow(Error("A packaged icon path is required."));
++  }
++  // Resolve relative to the worker or extension page, just as Chrome does.
++  const GURL& sender = source_url();
++  const GURL& base_url =
++      sender.SchemeIs(kExtensionScheme) && sender.host() == extension()->id()
++          ? sender
++          : extension()->url();
++  const GURL icon_url = base_url.Resolve(selected);
++  if (!icon_url.SchemeIs(kExtensionScheme) ||
++      icon_url.host() != extension()->id()) {
++    return RespondNow(Error("The icon must be inside the extension package."));
++  }
++  const auto file = file_util::ExtensionURLToRelativeFilePath(icon_url);
++  if (file.empty() || file.IsAbsolute() || file.ReferencesParent()) {
++    return RespondNow(Error("The icon must be inside the extension package."));
++  }
++  const int tab_id =
++      details.FindInt("tabId").value_or(ExtensionAction::kDefaultTabId);
++  if (!IsLiveTab(browser_context(), tab_id)) {
++    return RespondNow(Error("No tab with that ID."));
++  }
++  auto* loader = ImageLoader::Get(browser_context());
++  if (!loader) {
++    return RespondNow(Error("The extension image loader is unavailable."));
++  }
++  loader->LoadImageAsync(
++      extension(), extension()->GetResource(file),
++      gfx::Size(kIconPixels, kIconPixels),
++      base::BindOnce(&IOSActionSetIconFunction::SetLoadedIcon, this, tab_id));
++  return did_respond() ? AlreadyResponded() : RespondLater();
++}
++
++void IOSActionSetIconFunction::SetLoadedIcon(int tab_id, const gfx::Image& image) {
++  if (image.IsEmpty() || !browser_context() || !extension()) {
++    Respond(Error("The extension icon could not be loaded."));
++    return;
++  }
++  auto* registry = ExtensionRegistry::Get(browser_context());
++  if (!registry ||
++      registry->enabled_extensions().GetByID(extension()->id()) != extension() ||
++      !IsLiveTab(browser_context(), tab_id)) {
++    Respond(Error("The extension or tab is no longer available."));
++    return;
++  }
++  auto* manager = ExtensionActionManager::Get(browser_context());
++  auto* action = manager ? manager->GetExtensionAction(*extension()) : nullptr;
++  if (!action) {
++    Respond(Error("The extension has no action."));
++    return;
++  }
++  action->SetIcon(tab_id, image);
++  Respond(NoArguments());
++}
++
++}  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_action_api.h b/ios/chrome/browser/extensions/model/ios_action_api.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ada12200b4e2e16874d9dfce3c132c877c0c1665
+--- /dev/null
++++ b/ios/chrome/browser/extensions/model/ios_action_api.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_ACTION_API_H_
++#define IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_ACTION_API_H_
++
++#include "extensions/browser/extension_function.h"
++
++namespace gfx {
++class Image;
++}
++
++namespace extensions {
++
++class IOSActionSetIconFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("action.setIcon", ACTION_SETICON)
++
++ private:
++  ~IOSActionSetIconFunction() override = default;
++  ResponseAction Run() override;
++  void SetLoadedIcon(int tab_id, const gfx::Image& image);
++};
++
++}  // namespace extensions
++
++#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_ACTION_API_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+index 02256153d7c1a8eacc376b07cef7d4d1c2ccd8dc..864397233627dceb2be2f8d39e45f9b5e954e438 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+@@ -5,6 +5,7 @@
+ #include "ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.h"
+
+ #include "extensions/browser/extension_function_registry.h"
++#include "ios/chrome/browser/extensions/model/ios_action_api.h"
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
+ #include "ios/chrome/browser/extensions/model/ios_tabs_api.h"
+
+@@ -15,6 +16,7 @@ IOSExtensionsBrowserAPIProvider::~IOSExtensionsBrowserAPIProvider() = default;
+
+ void IOSExtensionsBrowserAPIProvider::RegisterExtensionFunctions(
+     ExtensionFunctionRegistry* registry) {
++  registry->RegisterFunction<IOSActionSetIconFunction>();
+   registry->RegisterFunction<CommandsGetAllFunction>();
+   registry->RegisterFunction<IOSTabsQueryFunction>();
+   registry->RegisterFunction<IOSTabsGetFunction>();
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index f70353fd58666eec839ee17ba9937b3880805a8d..7100aff6425e853dc7baea07422c77ecc17e413f 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -19,6 +19,7 @@ json_features("ios_api_features") {
+ generated_json_strings("ios_api_json_strings") {
+   sources = [
+     "//chrome/common/extensions/api/commands.json",
++    "action.json",
+     "extension.json",
+     "tabs.json",
+   ]
+diff --git a/ios/web/content/init/extensions/action.json b/ios/web/content/init/extensions/action.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1408490db0bd00946520c7dd90d811fd8eb88def
+--- /dev/null
++++ b/ios/web/content/init/extensions/action.json
+@@ -0,0 +1,29 @@
++[
++  {
++    "namespace": "action",
++    "description": "Controls the extension's browser action.",
++    "functions": [
++      {
++        "name": "setIcon",
++        "type": "function",
++        "description": "Sets the action icon from an image in the extension package.",
++        "parameters": [
++          {
++            "name": "details",
++            "type": "object",
++            "properties": {
++              "path": {
++                "choices": [
++                  {"type": "string"},
++                  {"type": "object", "additionalProperties": {"type": "string"}}
++                ]
++              },
++              "tabId": {"type": "integer", "optional": true, "minimum": 0}
++            }
++          }
++        ],
++        "returns_async": {"name": "callback", "parameters": []}
++      }
++    ]
++  }
++]
+diff --git a/ios/web/content/init/extensions/ios_api_features.json b/ios/web/content/init/extensions/ios_api_features.json
+index aeeac0bcf24cfc84eed9bd5d2c8900775dc9e15e..2482cbf1bd949e1788e83f1579ca99bd1f049c1f 100644
+--- a/ios/web/content/init/extensions/ios_api_features.json
++++ b/ios/web/content/init/extensions/ios_api_features.json
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+
+ {
++  "action": {
++    "dependencies": ["manifest:action"],
++    "contexts": ["privileged_extension"]
++  },
+   "commands": {
+     "dependencies": ["manifest:commands"],
+     "contexts": ["privileged_extension"]

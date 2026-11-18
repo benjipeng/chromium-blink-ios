@@ -1,0 +1,242 @@
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index ef54d737ef2633cc5f33f76eabe2861acee2a6a0..3fc205a52b7cbc90ee7a4773b1871c4c6b7b9fff 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -93,6 +93,7 @@
+ #include "ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h"
+ #include "ios/chrome/browser/extensions/model/ios_signed_extension_package.h"
+ #include "ios/chrome/browser/extensions/model/ios_store_crx_download.h"
++#include "ios/chrome/browser/extensions/model/ios_tabs_api.h"
+ #include "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #include "ios/chrome/browser/shared/model/paths/paths.h"
+ #include "ios/chrome/browser/shared/model/profile/profile_ios.h"
+@@ -746,8 +747,7 @@ bool RestartDevice(std::string* error_message) override {
+ class IOSExtensionsAPIClient final : public extensions::ExtensionsAPIClient {
+  public:
+   IOSExtensionsAPIClient()
+-      : messaging_delegate_(
+-            std::make_unique<extensions::MessagingDelegate>()) {}
++      : messaging_delegate_(extensions::CreateIOSTabMessagingDelegate()) {}
+   ~IOSExtensionsAPIClient() override = default;
+
+   extensions::MessagingDelegate* GetMessagingDelegate() override {
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.h b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+index cdd8739bb8211645d532f1980f884aeaab8af8ee..a3e14d417e67de0bde3a0153ae067f7d871a61cb 100644
+--- a/ios/chrome/browser/extensions/model/ios_tabs_api.h
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.h
+@@ -17,6 +17,9 @@ class BrowserContext;
+
+ namespace extensions {
+
++class MessagingDelegate;
++std::unique_ptr<MessagingDelegate> CreateIOSTabMessagingDelegate();
++
+ class IOSTabsQueryFunction final : public ExtensionFunction {
+  public:
+   DECLARE_EXTENSION_FUNCTION("tabs.query", TABS_QUERY)
+diff --git a/ios/chrome/browser/extensions/model/ios_tabs_api.mm b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+index 98c3e01a070daeefdc0b12b2222b2476c7b6bf30..d177b48438c488abf1906ea896855ef19790d184 100644
+--- a/ios/chrome/browser/extensions/model/ios_tabs_api.mm
++++ b/ios/chrome/browser/extensions/model/ios_tabs_api.mm
+@@ -17,6 +17,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "content/public/browser/web_contents.h"
++#include "extensions/browser/api/messaging/messaging_delegate.h"
+ #include "extensions/browser/event_router.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_event_histogram_value.h"
+@@ -86,7 +87,7 @@ int GetWindowID(Browser& browser) {
+
+ base::DictValue MakeTab(Browser& browser,
+                         int index,
+-                        const Extension& extension) {
++                        const Extension* extension) {
+   auto* tabs = browser.GetWebStateList();
+   const auto& tab = *tabs->GetWebStateAt(index);
+   const int id = tab.GetUniqueIdentifier().identifier();
+@@ -101,18 +102,61 @@ int GetWindowID(Browser& browser) {
+   result.Set("incognito", false);
+   result.Set("status", tab.IsLoading() ? "loading" : "complete");
+   const GURL& url = tab.GetLastCommittedURL();
+-  const auto* permissions = extension.permissions_data();
+-  if (url.is_valid() &&
+-      ((url.SchemeIs(kExtensionScheme) && url.host() == extension.id()) ||
+-       permissions->CanAccessPage(url, id, /*error=*/nullptr))) {
++  if (extension && url.is_valid() &&
++      ((url.SchemeIs(kExtensionScheme) && url.host() == extension->id()) ||
++       extension->permissions_data()->CanAccessPage(url, id, /*error=*/nullptr))) {
+     result.Set("url", url.spec());
+     result.Set("title", base::UTF16ToUTF8(tab.GetTitle()));
+   }
+   return result;
+ }
+
++class IOSTabMessagingDelegate final : public MessagingDelegate {
++ public:
++  std::optional<base::DictValue> MaybeGetTabInfo(
++      content::WebContents* contents) override {
++    if (!contents || contents->IsBeingDestroyed()) {
++      return std::nullopt;
++    }
++    auto* list = GetBrowserList(contents->GetBrowserContext());
++    if (!list) {
++      return std::nullopt;
++    }
++    const auto browsers =
++        list->BrowsersOfType(BrowserList::BrowserType::kRegular);
++    auto* browser = FindSenderBrowser(browsers, contents);
++    if (!browser) {
++      return std::nullopt;
++    }
++    auto* tabs = browser->GetWebStateList();
++    const auto id =
++        web::ContentWebState::GetUniqueIdentifierForWebContents(*contents);
++    for (int i = 0; i < tabs->count(); ++i) {
++      if (tabs->GetWebStateAt(i)->GetUniqueIdentifier() == id) {
++        // The message already supplies the source URL and origin separately.
++        return MakeTab(*browser, i, /*extension=*/nullptr);
++      }
++    }
++    return std::nullopt;
++  }
++
++  content::WebContents* GetWebContentsByTabId(
++      content::BrowserContext* context,
++      int tab_id) override {
++    content::WebContents* contents = nullptr;
++    return IOSExtensionsBrowserClient::GetInstance()->IsValidTabId(
++               context, tab_id, /*include_incognito=*/false, &contents)
++               ? contents
++               : nullptr;
++  }
++};
++
+ }  // namespace
+
++std::unique_ptr<MessagingDelegate> CreateIOSTabMessagingDelegate() {
++  return std::make_unique<IOSTabMessagingDelegate>();
++}
++
+ ExtensionFunction::ResponseAction IOSTabsQueryFunction::Run() {
+   EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_dict());
+   const auto& query = args()[0].GetDict();
+@@ -146,7 +190,7 @@ int GetWindowID(Browser& browser) {
+     for (int i = 0; i < tabs->count(); ++i) {
+       if (!active ||
+           *active == (tabs->GetWebStateAt(i) == tabs->GetActiveWebState())) {
+-        matches.Append(MakeTab(*browser, i, *extension()));
++        matches.Append(MakeTab(*browser, i, extension()));
+       }
+     }
+   }
+@@ -168,7 +212,7 @@ int GetWindowID(Browser& browser) {
+     auto* tabs = browser->GetWebStateList();
+     for (int i = 0; i < tabs->count(); ++i) {
+       if (tabs->GetWebStateAt(i)->GetUniqueIdentifier().identifier() == id) {
+-        return RespondNow(WithArguments(MakeTab(*browser, i, *extension())));
++        return RespondNow(WithArguments(MakeTab(*browser, i, extension())));
+       }
+     }
+   }
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index 7100aff6425e853dc7baea07422c77ecc17e413f..aabb2770bbd7e1a4fdcb51ad68956c2de2a7caae 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -33,6 +33,8 @@ generated_json_strings("ios_api_json_strings") {
+
+ source_set("clients") {
+   sources = [
++    "//chrome/renderer/extensions/api/tabs_hooks_delegate.cc",
++    "//chrome/renderer/extensions/api/tabs_hooks_delegate.h",
+     "ios_extensions_api_provider.cc",
+     "ios_extensions_api_provider.h",
+     "ios_extensions_client.cc",
+@@ -48,6 +50,8 @@ source_set("clients") {
+     ":ios_api_json_strings",
+     "//base",
+     "//extensions/common:core_api_provider",
++    "//gin",
++    "//v8:v8_headers",
+     "//services/service_manager/public/cpp",
+     "//url",
+   ]
+diff --git a/ios/web/content/init/extensions/ios_extensions_renderer_client.cc b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
+index 1e92409d32070b5ba4d6ff2923ae55da13db3745..f699d2d84c212a0bbbb2336b4709f731cec740ad 100644
+--- a/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
++++ b/ios/web/content/init/extensions/ios_extensions_renderer_client.cc
+@@ -9,22 +9,39 @@
+
+ #include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
++#include "chrome/renderer/extensions/api/tabs_hooks_delegate.h"
+ #include "content/public/common/isolated_world_ids.h"
+ #include "content/public/renderer/render_frame_observer.h"
+ #include "content/public/renderer/render_frame_observer_tracker.h"
+ #include "extensions/renderer/api/core_extensions_renderer_api_provider.h"
++#include "extensions/renderer/bindings/api_bindings_system.h"
+ #include "extensions/renderer/extensions_renderer_client.h"
++#include "extensions/renderer/native_extension_bindings_system.h"
+ #include "services/service_manager/public/cpp/binder_registry.h"
+
+ namespace web {
+ namespace {
+
++class IOSExtensionsRendererAPIProvider final
++    : public extensions::CoreExtensionsRendererAPIProvider {
++ public:
++  void AddBindingsSystemHooks(
++      extensions::Dispatcher* dispatcher,
++      extensions::NativeExtensionBindingsSystem* bindings) const override {
++    CoreExtensionsRendererAPIProvider::AddBindingsSystemHooks(dispatcher,
++                                                              bindings);
++    bindings->api_system()->RegisterHooksDelegate(
++        "tabs", std::make_unique<extensions::TabsHooksDelegate>(
++                    bindings->messaging_service()));
++  }
++};
++
+ class IOSExtensionsRendererClient final
+     : public extensions::ExtensionsRendererClient {
+  public:
+   IOSExtensionsRendererClient() {
+     AddAPIProvider(
+-        std::make_unique<extensions::CoreExtensionsRendererAPIProvider>());
++        std::make_unique<IOSExtensionsRendererAPIProvider>());
+   }
+
+   bool IsIncognitoProcess() const override { return false; }
+diff --git a/ios/web/content/init/extensions/tabs.json b/ios/web/content/init/extensions/tabs.json
+index 3ea321d509fb899283cf1769d43f4401578bf12c..e8a3b796e6041767b241c62ee8ea7e3ee71bc822 100644
+--- a/ios/web/content/init/extensions/tabs.json
++++ b/ios/web/content/init/extensions/tabs.json
+@@ -49,6 +49,29 @@
+           ]
+         }
+       },
++      {
++        "name": "sendMessage",
++        "type": "function",
++        "description": "Sends a message to this extension's script in the specified tab.",
++        "parameters": [
++          {"name": "tabId", "type": "integer", "minimum": 0},
++          {"name": "message", "type": "any"},
++          {
++            "name": "options",
++            "type": "object",
++            "optional": true,
++            "properties": {
++              "frameId": {"type": "integer", "minimum": 0, "optional": true},
++              "documentId": {"type": "string", "optional": true}
++            }
++          }
++        ],
++        "returns_async": {
++          "name": "responseCallback",
++          "optional": true,
++          "parameters": [{"name": "response", "type": "any", "optional": true}]
++        }
++      },
+       {
+         "name": "get",
+         "type": "function",

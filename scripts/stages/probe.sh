@@ -34,6 +34,8 @@ obj/ios/web/content/init/init/ios_content_browser_client.o
 obj/ios/web/content/content/content_web_state.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_renderer_client.o
+obj/ios/web/content/init/extensions/clients/tabs_hooks_delegate.o
+obj/ios/chrome/browser/extensions/model/model/ios_action_api.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_system_factory.o
 obj/ios/chrome/browser/extensions/model/model/ios_extension_web_contents_observer.o
