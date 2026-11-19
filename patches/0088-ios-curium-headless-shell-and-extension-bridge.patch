@@ -3,9 +3,10 @@ Subject: [PATCH] ios: headless Curium Blink shell, extension V2 bridge, and down
 
 Routes SceneController into a pure headless Browser + CuriumBrowserHost when
 CrIOSEngineBootstrap has a registered Swift shell delegate, skips Chrome's
-First Run UI and BrowserKit multi-process appex targets, isolates downloads
-per-WebState via CuriumDownloadRouter, hardens popup/file-chooser/cookie-clear
-paths, and exports CrIOSExtensionManagerV1 V2 toolbar/popup/DNR/command APIs.
+First Run / Search Engine Choice UI and BrowserKit multi-process appex targets,
+isolates downloads per-WebState via CuriumDownloadRouter, hardens
+popup/file-chooser/cookie-clear paths, and exports CrIOSExtensionManagerV1 V2
+toolbar/popup/DNR/command APIs.
 
 ---
 diff --git a/ios/chrome/app/BUILD.gn b/ios/chrome/app/BUILD.gn
@@ -217,7 +218,7 @@ index 558f360..b00dd8e 100644
  
    if (appState.initStage < AppInitStage::kFinal) {
 diff --git a/ios/chrome/app/profile/BUILD.gn b/ios/chrome/app/profile/BUILD.gn
-index 28e3f17..6da4ac7 100644
+index 28e3f17..2d297a0 100644
 --- a/ios/chrome/app/profile/BUILD.gn
 +++ b/ios/chrome/app/profile/BUILD.gn
 @@ -211,6 +211,7 @@ source_set("first_run_profile_agent") {
@@ -228,6 +229,14 @@ index 28e3f17..6da4ac7 100644
      "//ios/chrome/browser/authentication/ui_bundled/signin:signin_headers",
      "//ios/chrome/browser/device_orientation/ui_bundled",
      "//ios/chrome/browser/feature_engagement/model",
+@@ -244,6 +245,7 @@ source_set("search_engine_choice_profile_agent") {
+     "//components/strings",
+     "//ios/chrome/app/application_delegate:app_state",
+     "//ios/chrome/app/profile",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/app/strings",
+     "//ios/chrome/browser/device_orientation/ui_bundled",
+     "//ios/chrome/browser/regional_capabilities/model",
 diff --git a/ios/chrome/app/profile/first_run_profile_agent.mm b/ios/chrome/app/profile/first_run_profile_agent.mm
 index 2cb43ce..43bf0ae 100644
 --- a/ios/chrome/app/profile/first_run_profile_agent.mm
@@ -271,6 +280,30 @@ index 2cb43ce..43bf0ae 100644
      _postActionsCompleted = YES;
      [self releaseUILocks];
      [self.profileState queueTransitionToNextInitStage];
+diff --git a/ios/chrome/app/profile/search_engine_choice_profile_agent.mm b/ios/chrome/app/profile/search_engine_choice_profile_agent.mm
+index 5b172af..1fc8a74 100644
+--- a/ios/chrome/app/profile/search_engine_choice_profile_agent.mm
++++ b/ios/chrome/app/profile/search_engine_choice_profile_agent.mm
+@@ -16,6 +16,7 @@
+ #import "ios/chrome/app/application_delegate/app_state.h"
+ #import "ios/chrome/app/profile/profile_init_stage.h"
+ #import "ios/chrome/app/profile/profile_state.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/device_orientation/ui_bundled/scoped_force_portrait_orientation.h"
+ #import "ios/chrome/browser/regional_capabilities/model/regional_capabilities_service_factory.h"
+ #import "ios/chrome/browser/scoped_ui_blocker/ui_bundled/scoped_ui_blocker.h"
+@@ -145,6 +146,11 @@ - (BOOL)startupHadExternalIntent {
+ // Returns whether the choice screen should be presented or not. The return
+ // value is cached to ensure stability.
+ - (BOOL)shouldShowChoiceScreen {
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    _skipScreenDecision = SkipScreenDecision::kSkip;
++    return NO;
++  }
++
+   DCHECK(self.profileState.profile);
+   ProfileIOS* profile = self.profileState.profile;
+ 
 diff --git a/ios/chrome/browser/curium/BUILD.gn b/ios/chrome/browser/curium/BUILD.gn
 new file mode 100644
 index 0000000..79a8ba8
@@ -2269,10 +2302,10 @@ index 0000000..13f2bcc
 +#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_WEB_STATE_DELEGATE_H_
 diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.mm b/ios/chrome/browser/curium/curium_web_state_delegate.mm
 new file mode 100644
-index 0000000..d6cae8b
+index 0000000..58aeeb1
 --- /dev/null
 +++ b/ios/chrome/browser/curium/curium_web_state_delegate.mm
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,277 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -2379,8 +2412,7 @@ index 0000000..d6cae8b
 +        return nullptr;
 +      }
 +      web::WebState::CreateParams create_params(browser_->GetProfile());
-+      create_params.created_with_opener =
-+          params.disposition == ui::mojom::WindowOpenDisposition::kNewPopup;
++      create_params.created_with_opener = false;
 +      std::unique_ptr<web::WebState> child =
 +          web::WebState::Create(create_params);
 +      web::WebState* raw_child = child.get();
@@ -2583,8 +2615,20 @@ index 8e6a275..68dbe5f 100644
    frameworks = [
      "UIKit.framework",
      "PassKit.framework",
+diff --git a/ios/chrome/browser/download/model/DEPS b/ios/chrome/browser/download/model/DEPS
+index d860cc4..30b1aae 100644
+--- a/ios/chrome/browser/download/model/DEPS
++++ b/ios/chrome/browser/download/model/DEPS
+@@ -1,6 +1,7 @@
+ include_rules = [
+   # keep-sorted start
+   "+crypto",
++  "+ios/chrome/browser/curium",
+   "+ios/chrome/browser/drive/model",
+   "+ios/chrome/browser/enterprise/cloud_content_scanning/model",
+   "+ios/chrome/browser/enterprise/connectors/analysis/content_analysis_info.h",
 diff --git a/ios/chrome/browser/download/model/browser_download_service.mm b/ios/chrome/browser/download/model/browser_download_service.mm
-index b65e2c4..aef1402 100644
+index b65e2c4..fc0e042 100644
 --- a/ios/chrome/browser/download/model/browser_download_service.mm
 +++ b/ios/chrome/browser/download/model/browser_download_service.mm
 @@ -6,8 +6,12 @@
@@ -2600,18 +2644,20 @@ index b65e2c4..aef1402 100644
  #import "ios/chrome/browser/download/model/ar_quick_look_tab_helper.h"
  #import "ios/chrome/browser/download/model/download_manager_metric_names.h"
  #import "ios/chrome/browser/download/model/download_manager_tab_helper.h"
-@@ -134,6 +138,11 @@ DownloadRoutingCategory GetDownloadRoutingCategory(
-     web::DownloadController* download_controller,
-     web::WebState* web_state,
-     std::unique_ptr<web::DownloadTask> task) {
+@@ -139,6 +143,13 @@ DownloadRoutingCategory GetDownloadRoutingCategory(
+     return;
+   }
+ 
 +#if BUILDFLAG(USE_BLINK)
-+  if (CuriumDownloadRouter::GetInstance()->RouteDownload(web_state, task)) {
++  if (!ShouldRestrictLocalDownloads(web_state) &&
++      CuriumDownloadRouter::GetInstance()->RouteDownload(web_state, task)) {
 +    return;
 +  }
 +#endif
-   // When a prerendered page tries to download a file, cancel the download.
-   if (PrerenderTabHelper::FromWebState(web_state)) {
-     return;
++
+   base::UmaHistogramEnumeration(
+       "Download.IOSDownloadMimeType",
+       GetDownloadMimeTypeResultFromMimeType(task->GetMimeType()));
 diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
 index 6333da5..b2db6af 100644
 --- a/ios/chrome/browser/extensions/model/BUILD.gn
@@ -3244,8 +3290,20 @@ index 9fa5535..1725644 100644
    frameworks = [ "UIKit.framework" ]
  }
  
+diff --git a/ios/chrome/browser/shared/coordinator/scene/DEPS b/ios/chrome/browser/shared/coordinator/scene/DEPS
+index b15feb0..a587795 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/DEPS
++++ b/ios/chrome/browser/shared/coordinator/scene/DEPS
+@@ -8,6 +8,7 @@ include_rules = [
+   "+ios/chrome/browser/authentication/signin/fullscreen_promo/model",
+   "+ios/chrome/browser/authentication/ui_bundled",
+   "+ios/chrome/browser/browser_view/ui_bundled/browser_view_controller.h",
++  "+ios/chrome/browser/curium",
+   "+ios/chrome/browser/browsing_data/model",
+   "+ios/chrome/browser/crash_report/model",
+   "+ios/chrome/browser/credential_provider_promo/ui_bundled/credential_provider_promo_scene_agent.h",
 diff --git a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
-index 8472351..3b95309 100644
+index 8472351..fb64c65 100644
 --- a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
 +++ b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
 @@ -126,6 +126,15 @@
@@ -3264,7 +3322,20 @@ index 8472351..3b95309 100644
  #import "ios/chrome/browser/shared/model/browser/browser_list_factory.h"
  #import "ios/chrome/browser/shared/model/browser/browser_provider_interface.h"
  #import "ios/chrome/browser/shared/model/prefs/pref_names.h"
-@@ -358,8 +367,19 @@ @interface SceneController () <ProfileStateObserver,
+@@ -326,6 +335,12 @@ UrlLoadParams UpdateParamsForDinoGame(UrlLoadParams params) {
+ 
+ // TODO(crbug.com/429354805): Add method comments(!)
+ 
++#if BUILDFLAG(USE_BLINK) && BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++@protocol CuriumExtensionManagerLookup <NSObject>
+++ (id<CrIOSExtensionManagingV1>)sharedManager;
++@end
++#endif
++
+ @interface SceneController () <ProfileStateObserver,
+                                SceneUIBlockerStateObserver,
+                                SceneUIHandler,
+@@ -358,6 +373,11 @@ @interface SceneController () <ProfileStateObserver,
    // across tab switcher dismissal.
    std::optional<RemoteActorRequest> _remoteActorRequest;
    BOOL _handleExternalIntentsInProgress;
@@ -3275,15 +3346,7 @@ index 8472351..3b95309 100644
 +#endif
  }
  
-+#if BUILDFLAG(USE_BLINK) && BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+@protocol CuriumExtensionManagerLookup <NSObject>
-++ (id<CrIOSExtensionManagingV1>)sharedManager;
-+@end
-+#endif
-+
  // Coordinates the creation of PDF screenshots with the window's content.
- @property(nonatomic, strong) ScreenshotDelegate* screenshotDelegate;
- 
 @@ -423,6 +443,11 @@ - (instancetype)initWithSceneState:(SceneState*)sceneState {
  
  // TODO(crbug.com/429347474): Get rid of BrowserProviderInterface
