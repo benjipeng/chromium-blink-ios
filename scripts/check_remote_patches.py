@@ -153,21 +153,31 @@ def main() -> int:
                 if "=" in line and not line.lstrip().startswith("#"))
     files = collect_upstream_files(root / "patches", root / "patches/series")
     rev = lock["CHROMIUM_REV"]
+    v8_rev = lock["V8_REV"]
     gitiles_base = f"https://chromium.googlesource.com/chromium/src/+/{rev}/"
     github_base = f"https://raw.githubusercontent.com/chromium/chromium/{rev}/"
+    v8_gitiles_base = f"https://chromium.googlesource.com/v8/v8/+/{v8_rev}/"
+    v8_github_base = f"https://raw.githubusercontent.com/v8/v8/{v8_rev}/"
     with tempfile.TemporaryDirectory(prefix="patch-preflight-") as directory:
         source = pathlib.Path(directory).resolve()
 
         def fetch(relative: str) -> int:
-            quoted = urllib.parse.quote(relative)
+            if relative.startswith("v8/"):
+                sub = relative[3:]
+                gh_url = f"{v8_github_base}{urllib.parse.quote(sub)}"
+                gt_url = f"{v8_gitiles_base}{urllib.parse.quote(sub)}?format=TEXT"
+            else:
+                quoted = urllib.parse.quote(relative)
+                gh_url = f"{github_base}{quoted}"
+                gt_url = f"{gitiles_base}{quoted}?format=TEXT"
             data = None
             try:
-                with urllib.request.urlopen(f"{github_base}{quoted}", timeout=25) as response:
+                with urllib.request.urlopen(gh_url, timeout=25) as response:
                     data = response.read()
             except OSError:
                 for attempt in range(3):
                     try:
-                        with urllib.request.urlopen(f"{gitiles_base}{quoted}?format=TEXT", timeout=30) as response:
+                        with urllib.request.urlopen(gt_url, timeout=30) as response:
                             data = base64.b64decode(response.read(), validate=True)
                             break
                     except OSError as error:

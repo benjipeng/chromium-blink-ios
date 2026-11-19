@@ -103,6 +103,8 @@ obj/content/browser/browser/video_picture_in_picture_window_controller_impl.o
 obj/ios/web/content/content/ios_video_overlay_window.o
 obj/third_party/blink/renderer/platform/media/media/video_frame_compositor.o
 obj/third_party/blink/renderer/platform/media/media/web_media_player_impl.o
+obj/content/app/app/content_main.o
+obj/v8/v8_libbase/ios-jit-memory.o
 EOF
   python3 - <<'PY'
 import os
@@ -112,7 +114,27 @@ sys.path.insert(0, "scripts")
 from ninja_graph import Graph, deps, is_target_object, is_target_work
 
 graph = Graph(Path("/tmp/cb_work/src/out/Release"))
-targets = (Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis/compile_targets.txt").read_text().splitlines()
+targets_path = Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis/compile_targets.txt"
+targets = targets_path.read_text().splitlines()
+# Also resolve our patched V8 target objects (handles v8_cluster_source_set names).
+v8_basenames = {
+    "code-range.o",
+    "code-memory-access.o",
+    "memory-allocator.o",
+    "sweeper.o",
+    "deoptimizer-arm64.o",
+    "instructions-arm64.o",
+}
+found_v8 = set()
+for out in sorted(graph.producer.keys()):
+    if out.startswith("obj/v8/") and out.rsplit("/", 1)[-1] in v8_basenames:
+        if out not in targets:
+            targets.append(out)
+        found_v8.add(out.rsplit("/", 1)[-1])
+missing_v8 = v8_basenames - found_v8
+if missing_v8:
+    sys.exit(f"Missing patched V8 device object targets: {sorted(missing_v8)}")
+targets_path.write_text("\n".join(targets) + "\n")
 missing = set(targets) - graph.producer.keys()
 if missing:
     sys.exit(f"Missing extension object targets (enable extensions core): {sorted(missing)}")

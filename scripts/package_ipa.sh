@@ -370,11 +370,12 @@ python3 - "$chrome_fw_bin" <<'PY'
 import subprocess, sys
 bin_path = sys.argv[1]
 exports = subprocess.check_output(["nm", "-gU", bin_path], text=True)
-assert "_ChromeMain" in exports, "chrome_framework missing exported _ChromeMain symbol"
+for sym in ("_ChromeMain", "_V8IOSJitGetActiveMode"):
+    assert sym in exports, f"chrome_framework missing exported {sym} symbol"
 objc_meta = subprocess.check_output(["otool", "-oV", bin_path], text=True)
 for cls in ("CrIOSEngineBootstrap", "CrIOSExtensionManagerV1"):
     assert cls in objc_meta, f"chrome_framework missing required ObjC class metadata: {cls}"
-print(f"  verified Curium ABI in {bin_path} (_ChromeMain, CrIOSEngineBootstrap, CrIOSExtensionManagerV1)")
+print(f"  verified Curium ABI in {bin_path} (_ChromeMain, _V8IOSJitGetActiveMode, CrIOSEngineBootstrap, CrIOSExtensionManagerV1)")
 PY
 
 echo "==> Signing nested frameworks (without entitlements) then top-level app bundle"

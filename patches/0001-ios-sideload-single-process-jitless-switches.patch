@@ -1,26 +1,34 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: chromium-blink-ios <noreply@github.com>
-Subject: [PATCH] iOS Blink: single-process, RAM-scaled jitless V8, and background bloat suppression
+Subject: [PATCH] iOS Blink: single-process, dual-mode JIT/jitless V8, and RAM-scaled budgets
 
 diff --git a/content/app/content_main.cc b/content/app/content_main.cc
-index 53ad968..8621bc7 100644
+index 53ad968..9a2f7af 100644
 --- a/content/app/content_main.cc
 +++ b/content/app/content_main.cc
-@@ -27,6 +27,9 @@
+@@ -27,6 +27,10 @@
  #include "base/run_loop.h"
  #include "base/strings/string_number_conversions.h"
  #include "base/synchronization/condition_variable.h"
++#include <stdlib.h>
 +#include <string>
 +
 +#include "base/system/sys_info.h"
  #include "base/task/single_thread_task_executor.h"
  #include "base/task/thread_pool/thread_pool_instance.h"
  #include "base/threading/platform_thread.h"
-@@ -113,6 +116,97 @@ void SetupSignalHandlers() {
+@@ -113,6 +117,152 @@ void SetupSignalHandlers() {
  
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
  
 +#if BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
++// Exported by v8_libbase (v8/src/base/platform/ios-jit-memory.cc). Weak so
++// non-V8 targets linking content/app remain self-contained and default cleanly
++// to jitless mode.
++extern "C" __attribute__((weak)) int V8IOSJitPrepareForProcess(
++    size_t pool_size_bytes,
++    int allow_txm_brk);
++
 +// [ios-blink-sideload] Adds |features| to a comma-separated feature switch
 +// without discarding values that are already present.
 +void AppendToFeatureSwitch(base::CommandLine* command_line,
@@ -34,11 +42,11 @@ index 53ad968..8621bc7 100644
 +  command_line->AppendSwitchASCII(switch_name, value);
 +}
 +
-+// [ios-blink-sideload] A sideloaded app cannot hold the BrowserEngineKit
-+// entitlements, so the web content, GPU and network extension processes can
-+// never be launched and V8 cannot allocate executable memory. Run the way the
-+// tvOS port does: everything in one process, V8 jitless, and memory budgets
-+// sized for a single shared process.
++// [ios-blink-sideload] Dual-mode single-process defaults for sideloaded iOS.
++// Runs V8 in full JIT mode when JIT memory is available (BrowserEngineCore,
++// native MAP_JIT on Simulator / pre-TXM, or iOS 26/27 TXM dual-mapped pool via
++// StikDebug universal.js under LiveContainer / explicit --curium-enable-jit),
++// and fails closed to jitless + DrumBrake Wasm otherwise.
 +void AppendSideloadSwitches(base::CommandLine* command_line) {
 +  // blink::switches::kJavaScriptFlags; spelled out to keep content/app free of
 +  // a direct Blink dependency.
@@ -64,18 +72,66 @@ index 53ad968..8621bc7 100644
 +    semi_space_mb = 12;
 +  }
 +
-+  // Enforce jitless mode authoritatively so no caller-supplied prefix or
-+  // unknown flag can prevent V8 from seeing --jitless / --wasm-jitless.
++  // Resolve JIT vs jitless mode:
++  //  - --curium-disable-jit forces jitless unconditionally.
++  //  - --curium-enable-jit explicitly requests JIT (including TXM brk #0xf00d).
++  //  - Inside LiveContainer (LC_HOME_PATH set), auto-probe JIT including TXM
++  //    when a debugger is attached ("Launch with JIT").
++  //  - Outside LiveContainer, probe only non-trapping paths (BrowserEngineCore
++  //    or native MAP_JIT) so Xcode/LLDB sessions never hit spurious brk traps.
++  bool jit_enabled = false;
++  const bool force_disable_jit = command_line->HasSwitch("curium-disable-jit");
++  if (!force_disable_jit && V8IOSJitPrepareForProcess != nullptr) {
++    const bool explicit_enable_jit =
++        command_line->HasSwitch("curium-enable-jit");
++    const bool in_livecontainer = getenv("LC_HOME_PATH") != nullptr;
++    const int allow_txm_brk = (explicit_enable_jit || in_livecontainer) ? 1 : 0;
++
++    // Default TXM code-range pool: 64 MiB (V8's arm64 kMinimumCodeRangeSize),
++    // overridable via --curium-jit-pool-mb=N (clamped to [64, 256] MiB).
++    size_t pool_mb = 64;
++    if (command_line->HasSwitch("curium-jit-pool-mb")) {
++      int parsed = 0;
++      if (base::StringToInt(
++              command_line->GetSwitchValueASCII("curium-jit-pool-mb"),
++              &parsed)) {
++        if (parsed < 64) parsed = 64;
++        if (parsed > 256) parsed = 256;
++        pool_mb = static_cast<size_t>(parsed);
++      }
++    }
++    const int jit_mode =
++        V8IOSJitPrepareForProcess(pool_mb * 1024ULL * 1024ULL, allow_txm_brk);
++    jit_enabled = (jit_mode != 0);
++  }
++
++  // Preserve caller-supplied --js-flags while ensuring RAM-scaled heap caps
++  // and (when in jitless mode) authoritative --jitless / --wasm-jitless flags.
 +  // Keep --wasm-jitless last because V8 ignores flags after any unrecognized
-+  // flag, and DrumBrake requires --wasm-jitless to expose WebAssembly under
-+  // --jitless.
++  // flag, and DrumBrake requires --wasm-jitless under --jitless.
++  const std::string existing_js_flags =
++      command_line->GetSwitchValueASCII(kJsFlagsSwitch);
++  std::string js_flags;
++  if (!jit_enabled) {
++    js_flags = "--jitless";
++  }
++  if (!existing_js_flags.empty()) {
++    if (!js_flags.empty()) js_flags += " ";
++    js_flags += existing_js_flags;
++  }
++  if (existing_js_flags.find("--max-old-space-size=") == std::string::npos) {
++    if (!js_flags.empty()) js_flags += " ";
++    js_flags += "--max-old-space-size=" + base::NumberToString(old_space_mb);
++  }
++  if (existing_js_flags.find("--max-semi-space-size=") == std::string::npos) {
++    if (!js_flags.empty()) js_flags += " ";
++    js_flags += "--max-semi-space-size=" + base::NumberToString(semi_space_mb);
++  }
++  if (!jit_enabled) {
++    js_flags += " --wasm-jitless";
++  }
 +  command_line->RemoveSwitch(kJsFlagsSwitch);
-+  command_line->AppendSwitchASCII(
-+      kJsFlagsSwitch,
-+      "--jitless --max-old-space-size=" +
-+          base::NumberToString(old_space_mb) +
-+          " --max-semi-space-size=" + base::NumberToString(semi_space_mb) +
-+          " --wasm-jitless");
++  command_line->AppendSwitchASCII(kJsFlagsSwitch, js_flags);
 +
 +  // In-process, the GPU watchdog killing a slow GPU thread takes the whole app
 +  // down; a slow first GL/ANGLE init is expected here.
@@ -114,12 +170,12 @@ index 53ad968..8621bc7 100644
  bool IsSubprocess() {
    auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kProcessType);
-@@ -288,6 +382,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+@@ -288,6 +438,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
      // Enable spatial navigation; we interpret remote control swipes as arrow
      // keys.
      command_line->AppendSwitch(switches::kEnableSpatialNavigation);
 +#else
-+    // [ios-blink-sideload] Single-process, jitless defaults for sideloading.
++    // [ios-blink-sideload] Single-process, dual-mode JIT/jitless defaults.
 +    AppendSideloadSwitches(command_line);
  #endif
  #endif

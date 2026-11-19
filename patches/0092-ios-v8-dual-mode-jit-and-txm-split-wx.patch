@@ -1,0 +1,1013 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS V8: modular dual-mode JIT and TXM split-W^X memory substrate
+
+Adds v8::base::IOSJitMemory (v8/src/base/platform/ios-jit-memory.{h,cc}) to
+support runtime selection between jitless, BrowserEngineCore, native MAP_JIT
+(Simulator / pre-TXM), and iOS 26/27 TXM split-W^X dual-mapped code ranges
+(StikDebug universal.js brk #0xf00d + vm_remap RW alias) in one binary.
+
+diff --git a/v8/BUILD.gn b/v8/BUILD.gn
+index 6c37a6d..6942101 100644
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -7798,6 +7798,7 @@ v8_component("v8_libbase") {
+     "src/base/platform/condition-variable.h",
+     "src/base/platform/elapsed-timer.h",
+     "src/base/platform/memory-protection-key.cc",
++    "src/base/platform/ios-jit-memory.h",
+     "src/base/platform/memory-protection-key.h",
+     "src/base/platform/memory.h",
+     "src/base/platform/mutex.cc",
+@@ -7976,6 +7977,7 @@ v8_component("v8_libbase") {
+   } else if (is_ios) {
+     sources += [
+       "src/base/debug/stack_trace_posix.cc",
++      "src/base/platform/ios-jit-memory.cc",
+       "src/base/platform/platform-darwin.cc",
+     ]
+   } else if (is_win) {
+diff --git a/v8/src/base/platform/ios-jit-memory.cc b/v8/src/base/platform/ios-jit-memory.cc
+new file mode 100644
+index 0000000..fbac921
+--- /dev/null
++++ b/v8/src/base/platform/ios-jit-memory.cc
+@@ -0,0 +1,373 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "src/base/platform/ios-jit-memory.h"
++
++#if defined(V8_OS_IOS)
++
++#include <TargetConditionals.h>
++#include <dlfcn.h>
++#include <libkern/OSCacheControl.h>
++#include <mach/mach.h>
++#include <mach/vm_map.h>
++#include <setjmp.h>
++#include <signal.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/sysctl.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <mutex>
++
++extern "C" int csops(pid_t pid,
++                     unsigned int ops,
++                     void* useraddr,
++                     size_t usersize);
++
++namespace v8 {
++namespace base {
++
++std::atomic<int> IOSJitMemory::mode_{static_cast<int>(IOSJitMode::kDisabled)};
++std::atomic<uintptr_t> IOSJitMemory::txm_rx_base_{0};
++std::atomic<size_t> IOSJitMemory::txm_rx_size_{0};
++std::atomic<intptr_t> IOSJitMemory::txm_rw_delta_{0};
++
++namespace {
++
++constexpr unsigned int kCsOpsStatus = 0;
++constexpr uint32_t kCsDebugged = 0x10000000u;
++constexpr size_t kTxmPageAlign = 256 * 1024;  // Matches V8 NormalPage::kPageSize
++constexpr size_t kMinTxmPoolSize = 64 * 1024 * 1024;
++constexpr size_t kMaxTxmPoolSize = 256 * 1024 * 1024;
++constexpr uintptr_t kStikDebugStubReturn = 0xE0000069ULL;
++
++std::mutex g_init_mutex;
++bool g_initialized = false;
++bool g_txm_pool_leased = false;
++
++using PthreadJitWriteProtectFn = void (*)(int);
++using BeMemoryWitnessSupportedFn = int (*)();
++
++std::atomic<PthreadJitWriteProtectFn> g_pthread_jit_write_protect{nullptr};
++
++thread_local volatile sig_atomic_t g_jit_probe_active = 0;
++thread_local sigjmp_buf g_jit_probe_jmp;
++
++void JitProbeSignalHandler(int sig) {
++  if (g_jit_probe_active) {
++    g_jit_probe_active = 0;
++    siglongjmp(g_jit_probe_jmp, sig ? sig : 1);
++  }
++  signal(sig, SIG_DFL);
++  raise(sig);
++}
++
++struct ScopedSignalGuard {
++  static constexpr int kSignals[4] = {SIGTRAP, SIGBUS, SIGSEGV, SIGILL};
++  struct sigaction prev[4];
++  bool installed = false;
++
++  ScopedSignalGuard() {
++    struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = JitProbeSignalHandler;
++    sigemptyset(&sa.sa_mask);
++    sa.sa_flags = 0;
++    for (size_t i = 0; i < 4; ++i) {
++      sigaction(kSignals[i], &sa, &prev[i]);
++    }
++    installed = true;
++  }
++
++  ~ScopedSignalGuard() {
++    g_jit_probe_active = 0;
++    if (!installed) return;
++    for (size_t i = 0; i < 4; ++i) {
++      sigaction(kSignals[i], &prev[i], nullptr);
++    }
++  }
++};
++
++constexpr int ScopedSignalGuard::kSignals[4];
++
++bool IsProcessDebugged() {
++  uint32_t flags = 0;
++  if (csops(getpid(), kCsOpsStatus, &flags, sizeof(flags)) != 0) {
++    return false;
++  }
++  return (flags & kCsDebugged) != 0;
++}
++
++bool IsProcessTraced() {
++  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
++  struct kinfo_proc info;
++  memset(&info, 0, sizeof(info));
++  size_t size = sizeof(info);
++  if (sysctl(mib, 4, &info, &size, nullptr, 0) != 0 || size < sizeof(info)) {
++    return false;
++  }
++  return (info.kp_proc.p_flag & P_TRACED) != 0;
++}
++
++bool IsTracedAndDebugged() { return IsProcessDebugged() && IsProcessTraced(); }
++
++#if defined(__arm64__) || defined(__aarch64__)
++__attribute__((noinline, optnone, naked)) void JIT26Detach() {
++  __asm__ volatile(
++      "mov x16, #0\n"
++      "brk #0xf00d\n"
++      "ret\n");
++}
++
++__attribute__((noinline, optnone, naked)) void* JIT26PrepareRegion(
++    void* /*address*/,
++    size_t /*length*/) {
++  __asm__ volatile(
++      "mov x16, #1\n"
++      "brk #0xf00d\n"
++      "ret\n");
++}
++
++// Writes `mov w0, #42; ret` via |rw_addr|, invalidates icache on |rx_addr|,
++// executes |rx_addr| under ScopedSignalGuard, and zeroes the scratch bytes.
++bool RunArm64ExecutionSelfTest(void* rx_addr, void* rw_addr) {
++  constexpr uint32_t kTestCode[2] = {0x52800540u, 0xd65f03c0u};
++  ScopedSignalGuard guard;
++  if (sigsetjmp(g_jit_probe_jmp, 1) != 0) {
++    return false;
++  }
++  g_jit_probe_active = 1;
++  memcpy(rw_addr, kTestCode, sizeof(kTestCode));
++  sys_icache_invalidate(rx_addr, sizeof(kTestCode));
++  using TestFn = int (*)();
++  int result = reinterpret_cast<TestFn>(rx_addr)();
++  memset(rw_addr, 0, sizeof(kTestCode));
++  sys_icache_invalidate(rx_addr, sizeof(kTestCode));
++  g_jit_probe_active = 0;
++  return result == 42;
++}
++#endif  // defined(__arm64__) || defined(__aarch64__)
++
++void ResolveNativeWriteProtect() {
++  void* sym = dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
++  g_pthread_jit_write_protect.store(
++      reinterpret_cast<PthreadJitWriteProtectFn>(sym),
++      std::memory_order_release);
++}
++
++IOSJitMode ProbeNativeMapJit() {
++  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
++  void* mem = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
++                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, VM_MAKE_TAG(255), 0);
++  if (mem == MAP_FAILED) {
++    return IOSJitMode::kDisabled;
++  }
++
++#if !TARGET_OS_SIMULATOR
++  auto be_supported = reinterpret_cast<BeMemoryWitnessSupportedFn>(
++      dlsym(RTLD_DEFAULT,
++            "be_memory_inline_jit_restrict_with_witness_supported"));
++  if (be_supported && be_supported() != 0) {
++    munmap(mem, page_size);
++    return IOSJitMode::kBrowserEngineCore;
++  }
++#endif
++
++  ResolveNativeWriteProtect();
++  volatile bool ok = false;
++#if defined(__arm64__) || defined(__aarch64__)
++  {
++    ScopedSignalGuard guard;
++    if (sigsetjmp(g_jit_probe_jmp, 1) == 0) {
++      g_jit_probe_active = 1;
++      IOSJitMemory::SetNativeJitWriteProtected(0);
++      constexpr uint32_t kTestCode[2] = {0x52800540u, 0xd65f03c0u};
++      memcpy(mem, kTestCode, sizeof(kTestCode));
++      IOSJitMemory::SetNativeJitWriteProtected(1);
++      sys_icache_invalidate(mem, sizeof(kTestCode));
++      using TestFn = int (*)();
++      ok = (reinterpret_cast<TestFn>(mem)() == 42);
++      g_jit_probe_active = 0;
++    }
++  }
++#endif
++  munmap(mem, page_size);
++  return ok ? IOSJitMode::kNativeMapJit : IOSJitMode::kDisabled;
++}
++
++bool ProbeTxmDualMap(size_t requested_pool_size,
++                     uintptr_t* out_rx_base,
++                     size_t* out_rx_size,
++                     intptr_t* out_rw_delta) {
++#if !TARGET_OS_SIMULATOR && (defined(__arm64__) || defined(__aarch64__))
++  if (!IsTracedAndDebugged()) {
++    return false;
++  }
++
++  size_t pool_size = requested_pool_size;
++  if (pool_size < kMinTxmPoolSize) pool_size = kMinTxmPoolSize;
++  if (pool_size > kMaxTxmPoolSize) pool_size = kMaxTxmPoolSize;
++  pool_size = (pool_size + kTxmPageAlign - 1) & ~(kTxmPageAlign - 1);
++
++  const size_t alloc_size = pool_size + kTxmPageAlign;
++  void* rx_raw = nullptr;
++  {
++    ScopedSignalGuard guard;
++    if (sigsetjmp(g_jit_probe_jmp, 1) != 0) {
++      return false;
++    }
++    g_jit_probe_active = 1;
++    rx_raw = JIT26PrepareRegion(nullptr, alloc_size);
++    g_jit_probe_active = 0;
++  }
++
++  const uintptr_t rx_raw_addr = reinterpret_cast<uintptr_t>(rx_raw);
++  if (rx_raw == nullptr || rx_raw_addr == kStikDebugStubReturn ||
++      (rx_raw_addr & 0x3FFFULL) != 0) {
++    return false;
++  }
++
++  vm_address_t rw_raw_addr = 0;
++  vm_prot_t cur_prot = 0;
++  vm_prot_t max_prot = 0;
++  kern_return_t kr = vm_remap(
++      mach_task_self(), &rw_raw_addr, alloc_size, 0, VM_FLAGS_ANYWHERE,
++      mach_task_self(), static_cast<vm_address_t>(rx_raw_addr), FALSE,
++      &cur_prot, &max_prot, VM_INHERIT_NONE);
++  if (kr != KERN_SUCCESS || rw_raw_addr == 0) {
++    return false;
++  }
++
++  kr = vm_protect(mach_task_self(), rw_raw_addr, alloc_size, FALSE,
++                  VM_PROT_READ | VM_PROT_WRITE);
++  if (kr != KERN_SUCCESS) {
++    vm_deallocate(mach_task_self(), rw_raw_addr, alloc_size);
++    return false;
++  }
++
++  if (IsTracedAndDebugged()) {
++    ScopedSignalGuard guard;
++    if (sigsetjmp(g_jit_probe_jmp, 1) == 0) {
++      g_jit_probe_active = 1;
++      JIT26Detach();
++      g_jit_probe_active = 0;
++    }
++  }
++
++  const uintptr_t rx_aligned =
++      (rx_raw_addr + kTxmPageAlign - 1) & ~(kTxmPageAlign - 1);
++  const intptr_t rw_delta =
++      static_cast<intptr_t>(rw_raw_addr) - static_cast<intptr_t>(rx_raw_addr);
++  void* rw_aligned =
++      reinterpret_cast<void*>(static_cast<intptr_t>(rx_aligned) + rw_delta);
++
++  if (!RunArm64ExecutionSelfTest(reinterpret_cast<void*>(rx_aligned),
++                                 rw_aligned)) {
++    vm_deallocate(mach_task_self(), rw_raw_addr, alloc_size);
++    return false;
++  }
++
++  *out_rx_base = rx_aligned;
++  *out_rx_size = pool_size;
++  *out_rw_delta = rw_delta;
++  return true;
++#else
++  (void)requested_pool_size;
++  (void)out_rx_base;
++  (void)out_rx_size;
++  (void)out_rw_delta;
++  return false;
++#endif
++}
++
++}  // namespace
++
++// static
++IOSJitMode IOSJitMemory::Initialize(size_t pool_size_bytes,
++                                    bool allow_txm_brk) {
++  std::lock_guard<std::mutex> lock(g_init_mutex);
++  if (g_initialized) {
++    return GetMode();
++  }
++  g_initialized = true;
++
++  IOSJitMode native_mode = ProbeNativeMapJit();
++  if (native_mode != IOSJitMode::kDisabled) {
++    mode_.store(static_cast<int>(native_mode), std::memory_order_release);
++    return native_mode;
++  }
++
++  if (allow_txm_brk) {
++    uintptr_t rx_base = 0;
++    size_t rx_size = 0;
++    intptr_t rw_delta = 0;
++    if (ProbeTxmDualMap(pool_size_bytes, &rx_base, &rx_size, &rw_delta)) {
++      txm_rw_delta_.store(rw_delta, std::memory_order_relaxed);
++      txm_rx_size_.store(rx_size, std::memory_order_relaxed);
++      txm_rx_base_.store(rx_base, std::memory_order_release);
++      mode_.store(static_cast<int>(IOSJitMode::kTxmDualMap),
++                  std::memory_order_release);
++      return IOSJitMode::kTxmDualMap;
++    }
++  }
++
++  mode_.store(static_cast<int>(IOSJitMode::kDisabled),
++              std::memory_order_release);
++  return IOSJitMode::kDisabled;
++}
++
++// static
++void* IOSJitMemory::TryAcquireTxmPool(size_t length, size_t alignment) {
++  std::lock_guard<std::mutex> lock(g_init_mutex);
++  if (!IsTxmDualMap() || g_txm_pool_leased) {
++    return nullptr;
++  }
++  const uintptr_t base = txm_rx_base_.load(std::memory_order_relaxed);
++  const size_t size = txm_rx_size_.load(std::memory_order_relaxed);
++  if (base == 0 || length == 0 || length > size) {
++    return nullptr;
++  }
++  if (alignment > 1 && (base % alignment) != 0) {
++    return nullptr;
++  }
++  g_txm_pool_leased = true;
++  return reinterpret_cast<void*>(base);
++}
++
++// static
++bool IOSJitMemory::ReleaseTxmPool(void* address) {
++  std::lock_guard<std::mutex> lock(g_init_mutex);
++  if (reinterpret_cast<uintptr_t>(address) !=
++      txm_rx_base_.load(std::memory_order_relaxed)) {
++    return false;
++  }
++  g_txm_pool_leased = false;
++  return true;
++}
++
++// static
++void IOSJitMemory::SetNativeJitWriteProtected(int enable) {
++  auto fn = g_pthread_jit_write_protect.load(std::memory_order_acquire);
++  if (fn != nullptr) {
++    fn(enable);
++  }
++}
++
++}  // namespace base
++}  // namespace v8
++
++extern "C" __attribute__((visibility("default"), used)) int
++V8IOSJitPrepareForProcess(size_t pool_size_bytes, int allow_txm_brk) {
++  return static_cast<int>(v8::base::IOSJitMemory::Initialize(
++      pool_size_bytes, allow_txm_brk != 0));
++}
++
++extern "C" __attribute__((visibility("default"), used)) int
++V8IOSJitGetActiveMode(void) {
++  return static_cast<int>(v8::base::IOSJitMemory::GetMode());
++}
++
++#endif  // defined(V8_OS_IOS)
+diff --git a/v8/src/base/platform/ios-jit-memory.h b/v8/src/base/platform/ios-jit-memory.h
+new file mode 100644
+index 0000000..e9b86a8
+--- /dev/null
++++ b/v8/src/base/platform/ios-jit-memory.h
+@@ -0,0 +1,122 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef V8_BASE_PLATFORM_IOS_JIT_MEMORY_H_
++#define V8_BASE_PLATFORM_IOS_JIT_MEMORY_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <atomic>
++
++#include "src/base/base-export.h"
++#include "src/base/build_config.h"
++#include "src/base/macros.h"
++
++#if defined(V8_OS_IOS)
++extern "C" {
++__attribute__((visibility("default"))) int V8IOSJitPrepareForProcess(
++    size_t pool_size_bytes,
++    int allow_txm_brk);
++__attribute__((visibility("default"))) int V8IOSJitGetActiveMode(void);
++}
++#endif  // defined(V8_OS_IOS)
++
++namespace v8 {
++namespace base {
++
++// Runtime JIT execution mode on iOS. Values match V8IOSJitGetActiveMode().
++enum class IOSJitMode : int {
++  kDisabled = 0,
++  kBrowserEngineCore = 1,
++  kNativeMapJit = 2,
++  kTxmDualMap = 3,
++};
++
++#if defined(V8_OS_IOS)
++
++class V8_BASE_EXPORT IOSJitMemory final {
++ public:
++  // Probe and initialize the best available JIT substrate for this process.
++  // Safe to call once before V8 starts; subsequent calls return the active
++  // mode. Fails closed to IOSJitMode::kDisabled on any error.
++  static IOSJitMode Initialize(size_t pool_size_bytes, bool allow_txm_brk);
++
++  static V8_INLINE IOSJitMode GetMode() {
++    return static_cast<IOSJitMode>(mode_.load(std::memory_order_acquire));
++  }
++
++  static V8_INLINE bool IsTxmDualMap() {
++    return GetMode() == IOSJitMode::kTxmDualMap;
++  }
++
++  static V8_INLINE uintptr_t TxmPoolBase() {
++    return txm_rx_base_.load(std::memory_order_relaxed);
++  }
++
++  static V8_INLINE size_t TxmPoolSize() {
++    return txm_rx_size_.load(std::memory_order_relaxed);
++  }
++
++  static V8_INLINE intptr_t TxmRwDelta() {
++    return txm_rw_delta_.load(std::memory_order_relaxed);
++  }
++
++  // O(1) lock-free translation from an executable address inside the TXM RX
++  // pool to its vm_remap'd RW alias. Returns |addr| unchanged when TXM dual-
++  // mapping is inactive or |addr| lies outside the RX pool.
++  static V8_INLINE uintptr_t ToWritable(uintptr_t addr) {
++    const uintptr_t base = txm_rx_base_.load(std::memory_order_relaxed);
++    const size_t size = txm_rx_size_.load(std::memory_order_relaxed);
++    if (V8_UNLIKELY(base != 0 && (addr - base) < size)) {
++      return static_cast<uintptr_t>(
++          static_cast<intptr_t>(addr) +
++          txm_rw_delta_.load(std::memory_order_relaxed));
++    }
++    return addr;
++  }
++
++  template <typename T>
++  static V8_INLINE T* ToWritablePtr(T* ptr) {
++    return reinterpret_cast<T*>(ToWritable(reinterpret_cast<uintptr_t>(ptr)));
++  }
++
++  // Leases the single pre-blessed TXM RX pool for V8's process-wide CodeRange.
++  static void* TryAcquireTxmPool(size_t length, size_t alignment);
++  static bool ReleaseTxmPool(void* address);
++
++  // Weakly-resolved pthread_jit_write_protect_np for kNativeMapJit mode
++  // (Simulator / pre-TXM devices).
++  static void SetNativeJitWriteProtected(int enable);
++
++ private:
++  static std::atomic<int> mode_;
++  static std::atomic<uintptr_t> txm_rx_base_;
++  static std::atomic<size_t> txm_rx_size_;
++  static std::atomic<intptr_t> txm_rw_delta_;
++};
++
++#else  // !defined(V8_OS_IOS)
++
++class IOSJitMemory final {
++ public:
++  static V8_INLINE IOSJitMode GetMode() { return IOSJitMode::kDisabled; }
++  static V8_INLINE bool IsTxmDualMap() { return false; }
++  static V8_INLINE uintptr_t TxmPoolBase() { return 0; }
++  static V8_INLINE size_t TxmPoolSize() { return 0; }
++  static V8_INLINE intptr_t TxmRwDelta() { return 0; }
++  static V8_INLINE uintptr_t ToWritable(uintptr_t addr) { return addr; }
++  template <typename T>
++  static V8_INLINE T* ToWritablePtr(T* ptr) {
++    return ptr;
++  }
++  static V8_INLINE void SetNativeJitWriteProtected(int) {}
++};
++
++#endif  // defined(V8_OS_IOS)
++
++}  // namespace base
++}  // namespace v8
++
++#endif  // V8_BASE_PLATFORM_IOS_JIT_MEMORY_H_
+diff --git a/v8/src/codegen/arm64/assembler-arm64-inl.h b/v8/src/codegen/arm64/assembler-arm64-inl.h
+index 09ed823..3d404e8 100644
+--- a/v8/src/codegen/arm64/assembler-arm64-inl.h
++++ b/v8/src/codegen/arm64/assembler-arm64-inl.h
+@@ -11,6 +11,7 @@
+ #include <type_traits>
+ 
+ #include "src/base/memory.h"
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/codegen/assembler.h"
+ #include "src/codegen/flush-instruction-cache.h"
+ #include "src/debug/debug.h"
+@@ -599,7 +600,9 @@ void Assembler::set_target_address_at(Address pc, Address constant_pool,
+       jit_allocation->WriteUnalignedValue<Address>(
+           target_pointer_address_at(pc), target);
+     } else {
+-      WriteUnalignedValue(target_pointer_address_at(pc), target);
++      WriteUnalignedValue(
++          base::IOSJitMemory::ToWritable(target_pointer_address_at(pc)),
++          target);
+     }
+     // Intuitively, we would think it is necessary to always flush the
+     // instruction cache after patching a target address in the code. However,
+@@ -629,7 +632,8 @@ void Assembler::set_target_compressed_address_at(
+   if (jit_allocation) {
+     jit_allocation->WriteValue(target_pointer_address_at(pc), target);
+   } else {
+-    Memory<Tagged_t>(target_pointer_address_at(pc)) = target;
++    Memory<Tagged_t>(
++        base::IOSJitMemory::ToWritable(target_pointer_address_at(pc))) = target;
+   }
+ }
+ 
+diff --git a/v8/src/codegen/arm64/instructions-arm64.cc b/v8/src/codegen/arm64/instructions-arm64.cc
+index baa6d64..40146e4 100644
+--- a/v8/src/codegen/arm64/instructions-arm64.cc
++++ b/v8/src/codegen/arm64/instructions-arm64.cc
+@@ -5,6 +5,7 @@
+ #if V8_TARGET_ARCH_ARM64
+ 
+ #include "src/codegen/arm64/instructions-arm64.h"
++#include "src/base/platform/ios-jit-memory.h"
+ 
+ #include "src/codegen/arm64/assembler-arm64-inl.h"
+ #include "src/common/code-memory-access-inl.h"
+@@ -19,7 +20,9 @@ void Instruction::SetInstructionBits(Instr new_instr,
+     jit_allocation->WriteUnalignedValue(reinterpret_cast<Address>(this),
+                                         new_instr);
+   } else {
+-    base::WriteUnalignedValue(reinterpret_cast<Address>(this), new_instr);
++    base::WriteUnalignedValue(
++        base::IOSJitMemory::ToWritable(reinterpret_cast<Address>(this)),
++        new_instr);
+   }
+ }
+ 
+diff --git a/v8/src/common/code-memory-access-inl.h b/v8/src/common/code-memory-access-inl.h
+index 72c6046..865afd6 100644
+--- a/v8/src/common/code-memory-access-inl.h
++++ b/v8/src/common/code-memory-access-inl.h
+@@ -8,6 +8,7 @@
+ #include "src/common/code-memory-access.h"
+ // Include the non-inl header before the rest of the headers.
+ 
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/flags/flags.h"
+ #include "src/objects/instruction-stream.h"
+ #include "src/objects/tagged.h"
+@@ -152,11 +153,12 @@ void WritableJitAllocation::WriteHeaderSlot(T value) {
+   // non-implemented functionality.
+   static_assert(!is_taggable_v<T>);
+ 
++  const Address writable_address = base::IOSJitMemory::ToWritable(address_);
+   if constexpr (offset == offsetof(HeapObject, map_)) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(
+-        HeapObject::FromAddress(address_), value);
++        HeapObject::FromAddress(writable_address), value);
+   } else {
+-    WriteMaybeUnalignedValue<T>(address_ + offset, value);
++    WriteMaybeUnalignedValue<T>(writable_address + offset, value);
+   }
+ }
+ 
+@@ -168,20 +170,22 @@ void WritableJitAllocation::WriteHeaderSlot(Tagged<T> value, ReleaseStoreTag) {
+   // non-implemented functionality.
+   static_assert(offset != offsetof(HeapObject, map_));
+ 
+-  TaggedField<T, offset>::Release_Store(HeapObject::FromAddress(address_),
+-                                        value);
++  const Address writable_address = base::IOSJitMemory::ToWritable(address_);
++  TaggedField<T, offset>::Release_Store(
++      HeapObject::FromAddress(writable_address), value);
+ }
+ 
+ template <typename T, size_t offset>
+ void WritableJitAllocation::WriteHeaderSlot(Tagged<T> value, RelaxedStoreTag) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
++  const Address writable_address = base::IOSJitMemory::ToWritable(address_);
+   if constexpr (offset == offsetof(HeapObject, map_)) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(
+-        HeapObject::FromAddress(address_), value);
++        HeapObject::FromAddress(writable_address), value);
+   } else {
+-    TaggedField<T, offset>::Relaxed_Store(HeapObject::FromAddress(address_),
+-                                          value);
++    TaggedField<T, offset>::Relaxed_Store(
++        HeapObject::FromAddress(writable_address), value);
+   }
+ }
+ 
+@@ -191,8 +195,9 @@ void WritableJitAllocation::WriteProtectedPointerHeaderSlot(Tagged<T> value,
+   static_assert(offset != offsetof(HeapObject, map_));
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
++  const Address writable_address = base::IOSJitMemory::ToWritable(address_);
+   TaggedField<T, offset, TrustedSpaceCompressionScheme>::Relaxed_Store(
+-      HeapObject::FromAddress(address_), value);
++      HeapObject::FromAddress(writable_address), value);
+ }
+ 
+ template <typename T, size_t offset>
+@@ -201,8 +206,9 @@ void WritableJitAllocation::WriteProtectedPointerHeaderSlot(Tagged<T> value,
+   static_assert(offset != offsetof(HeapObject, map_));
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
++  const Address writable_address = base::IOSJitMemory::ToWritable(address_);
+   TaggedField<T, offset, TrustedSpaceCompressionScheme>::Release_Store(
+-      HeapObject::FromAddress(address_), value);
++      HeapObject::FromAddress(writable_address), value);
+ }
+ 
+ template <typename T>
+@@ -234,7 +240,7 @@ V8_INLINE void WritableJitAllocation::WriteUnalignedValue(Address address,
+       WriteScopeForApiEnforcement();
+   DCHECK_GE(address, address_);
+   DCHECK_LT(address - address_, size());
+-  base::WriteUnalignedValue<T>(address, value);
++  base::WriteUnalignedValue<T>(base::IOSJitMemory::ToWritable(address), value);
+ }
+ 
+ template <typename T>
+@@ -243,7 +249,7 @@ V8_INLINE void WritableJitAllocation::WriteValue(Address address, T value) {
+       WriteScopeForApiEnforcement();
+   DCHECK_GE(address, address_);
+   DCHECK_LT(address - address_, size());
+-  base::Memory<T>(address) = value;
++  base::Memory<T>(base::IOSJitMemory::ToWritable(address)) = value;
+ }
+ 
+ template <typename T>
+@@ -253,28 +259,34 @@ V8_INLINE void WritableJitAllocation::WriteValue(Address address, T value,
+       WriteScopeForApiEnforcement();
+   DCHECK_GE(address, address_);
+   DCHECK_LT(address - address_, size());
+-  reinterpret_cast<std::atomic<T>*>(address)->store(value,
+-                                                    std::memory_order_relaxed);
++  reinterpret_cast<std::atomic<T>*>(base::IOSJitMemory::ToWritable(address))
++      ->store(value, std::memory_order_relaxed);
+ }
+ 
+ void WritableJitAllocation::CopyCode(size_t dst_offset, const uint8_t* src,
+                                      size_t num_bytes) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  CopyBytes(reinterpret_cast<uint8_t*>(address_ + dst_offset), src, num_bytes);
++  CopyBytes(reinterpret_cast<uint8_t*>(
++                base::IOSJitMemory::ToWritable(address_ + dst_offset)),
++            src, num_bytes);
+ }
+ 
+ void WritableJitAllocation::CopyData(size_t dst_offset, const uint8_t* src,
+                                      size_t num_bytes) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  CopyBytes(reinterpret_cast<uint8_t*>(address_ + dst_offset), src, num_bytes);
++  CopyBytes(reinterpret_cast<uint8_t*>(
++                base::IOSJitMemory::ToWritable(address_ + dst_offset)),
++            src, num_bytes);
+ }
+ 
+ void WritableJitAllocation::ClearBytes(size_t offset, size_t len) {
+   std::optional<RwxMemoryWriteScope> write_scope =
+       WriteScopeForApiEnforcement();
+-  memset(reinterpret_cast<void*>(address_ + offset), 0, len);
++  memset(reinterpret_cast<void*>(
++             base::IOSJitMemory::ToWritable(address_ + offset)),
++         0, len);
+ }
+ 
+ WritableJitPage::~WritableJitPage() = default;
+@@ -311,7 +323,8 @@ V8_INLINE WritableFreeSpace::WritableFreeSpace(base::Address addr, size_t size,
+ template <typename T, size_t offset>
+ void WritableFreeSpace::WriteHeaderSlot(Tagged<T> value,
+                                         RelaxedStoreTag) const {
+-  Tagged<HeapObject> object = HeapObject::FromAddress(address_);
++  Tagged<HeapObject> object =
++      HeapObject::FromAddress(base::IOSJitMemory::ToWritable(address_));
+   // TODO(v8:13355): add validation before the write.
+   if constexpr (offset == offsetof(HeapObject, map_)) {
+     TaggedField<T, offset>::Relaxed_Store_Map_Word(object, value);
+@@ -335,17 +348,39 @@ void RwxMemoryWriteScope::SetExecutable() { base::SetJitWriteProtected(1); }
+ 
+ // static
+ bool RwxMemoryWriteScope::IsSupported() {
+-  return be_memory_inline_jit_restrict_with_witness_supported() != 0;
++  return base::IOSJitMemory::GetMode() ==
++             base::IOSJitMode::kBrowserEngineCore &&
++         be_memory_inline_jit_restrict_with_witness_supported() != 0;
+ }
+ 
+ // static
+ void RwxMemoryWriteScope::SetWritable() {
+-  be_memory_inline_jit_restrict_rwx_to_rw_with_witness();
++  switch (base::IOSJitMemory::GetMode()) {
++    case base::IOSJitMode::kBrowserEngineCore:
++      be_memory_inline_jit_restrict_rwx_to_rw_with_witness();
++      break;
++    case base::IOSJitMode::kNativeMapJit:
++      base::IOSJitMemory::SetNativeJitWriteProtected(0);
++      break;
++    case base::IOSJitMode::kTxmDualMap:
++    case base::IOSJitMode::kDisabled:
++      break;
++  }
+ }
+ 
+ // static
+ void RwxMemoryWriteScope::SetExecutable() {
+-  be_memory_inline_jit_restrict_rwx_to_rx_with_witness();
++  switch (base::IOSJitMemory::GetMode()) {
++    case base::IOSJitMode::kBrowserEngineCore:
++      be_memory_inline_jit_restrict_rwx_to_rx_with_witness();
++      break;
++    case base::IOSJitMode::kNativeMapJit:
++      base::IOSJitMemory::SetNativeJitWriteProtected(1);
++      break;
++    case base::IOSJitMode::kTxmDualMap:
++    case base::IOSJitMode::kDisabled:
++      break;
++  }
+ }
+ 
+ #elif V8_HAS_PKU_JIT_WRITE_PROTECT
+diff --git a/v8/src/common/code-memory-access.cc b/v8/src/common/code-memory-access.cc
+index 710f437..bbecfc6 100644
+--- a/v8/src/common/code-memory-access.cc
++++ b/v8/src/common/code-memory-access.cc
+@@ -783,7 +783,7 @@ WritableJumpTablePair WritableJumpTablePair::ForTesting(
+ 
+ template <size_t offset>
+ void WritableFreeSpace::ClearTagged(size_t count) const {
+-  base::Address start = address_ + offset;
++  base::Address start = base::IOSJitMemory::ToWritable(address_ + offset);
+   // TODO(v8:13355): add validation before the write.
+   MemsetTagged(ObjectSlot(start), Tagged<Object>(kClearedFreeMemoryValue),
+                count);
+diff --git a/v8/src/deoptimizer/arm64/deoptimizer-arm64.cc b/v8/src/deoptimizer/arm64/deoptimizer-arm64.cc
+index 18da04f..c403acd 100644
+--- a/v8/src/deoptimizer/arm64/deoptimizer-arm64.cc
++++ b/v8/src/deoptimizer/arm64/deoptimizer-arm64.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "src/api/api.h"
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/codegen/flush-instruction-cache.h"
+ #include "src/codegen/macro-assembler.h"
+ #include "src/common/code-memory-access-inl.h"
+@@ -36,7 +37,9 @@ void Deoptimizer::PatchToJump(Address pc, Address new_pc) {
+   AccountingAllocator allocator;
+   Assembler masm(
+       &allocator, AssemblerOptions{},
+-      ExternalAssemblerBuffer(reinterpret_cast<uint8_t*>(pc), kSize));
++      ExternalAssemblerBuffer(
++          reinterpret_cast<uint8_t*>(base::IOSJitMemory::ToWritable(pc)),
++          kSize));
+   masm.b(static_cast<int>(offset));
+   FlushInstructionCache(pc, kSize);
+ }
+diff --git a/v8/src/heap/code-range.cc b/v8/src/heap/code-range.cc
+index 2035801..6bd5205 100644
+--- a/v8/src/heap/code-range.cc
++++ b/v8/src/heap/code-range.cc
+@@ -12,7 +12,9 @@
+ #include "src/base/bits.h"
+ #include "src/base/lazy-instance.h"
+ #include "src/base/once.h"
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/codegen/constants-arch.h"
++#include "src/codegen/flush-instruction-cache.h"
+ #include "src/common/globals.h"
+ #include "src/flags/flags.h"
+ #include "src/heap/heap-inl.h"
+@@ -30,6 +32,47 @@ DEFINE_LAZY_LEAKY_OBJECT_GETTER(CodeRangeAddressHint, GetCodeRangeAddressHint)
+ 
+ void FunctionInStaticBinaryForAddressHint() {}
+ 
++#if defined(V8_OS_IOS)
++// PageAllocator backed by the single pre-blessed TXM RX pool. Never calls
++// mprotect, munmap, or madvise(MADV_FREE) on TXM pages so page blessings
++// remain valid for the lifetime of the process.
++class TxmCodeRangePageAllocator final : public v8::PageAllocator {
++ public:
++  size_t AllocatePageSize() override { return 16 * 1024; }
++  size_t CommitPageSize() override { return 16 * 1024; }
++  void SetRandomMmapSeed(int64_t seed) override {}
++  void* GetRandomMmapAddr() override {
++    return reinterpret_cast<void*>(base::IOSJitMemory::TxmPoolBase());
++  }
++  void* AllocatePages(void* address, size_t length, size_t alignment,
++                      Permission permissions) override {
++    return base::IOSJitMemory::TryAcquireTxmPool(length, alignment);
++  }
++  bool FreePages(void* address, size_t length) override {
++    return base::IOSJitMemory::ReleaseTxmPool(address);
++  }
++  bool ReleasePages(void* address, size_t length, size_t new_length) override {
++    return true;
++  }
++  bool SetPermissions(void* address, size_t length,
++                      Permission permissions) override {
++    return true;
++  }
++  bool RecommitPages(void* address, size_t length,
++                     Permission permissions) override {
++    return true;
++  }
++  bool DiscardSystemPages(void* address, size_t size) override { return true; }
++  bool DecommitPages(void* address, size_t size) override { return true; }
++};
++
++v8::PageAllocator* GetTxmCodeRangePageAllocator() {
++  static TxmCodeRangePageAllocator* allocator =
++      new TxmCodeRangePageAllocator();
++  return allocator;
++}
++#endif  // defined(V8_OS_IOS)
++
+ }  // anonymous namespace
+ 
+ void RedZones::Initialize(base::BoundedPageAllocator* allocator) {
+@@ -159,6 +202,16 @@ bool CodeRange::InitReservation(v8::PageAllocator* page_allocator,
+     requested = kMinimumCodeRangeSize;
+   }
+ 
++#if defined(V8_OS_IOS)
++  if (!v8_flags.jitless && base::IOSJitMemory::IsTxmDualMap()) {
++    page_allocator = GetTxmCodeRangePageAllocator();
++    const size_t txm_pool_size = base::IOSJitMemory::TxmPoolSize();
++    if (txm_pool_size >= kMinimumCodeRangeSize && requested > txm_pool_size) {
++      requested = txm_pool_size;
++    }
++  }
++#endif  // defined(V8_OS_IOS)
++
+   const size_t kPageSize = NormalPage::kPageSize;
+   const size_t allocate_page_size = page_allocator->AllocatePageSize();
+   CHECK(IsAligned(kPageSize, allocate_page_size));
+@@ -588,8 +641,10 @@ uint8_t* CodeRange::RemapEmbeddedBuiltins(Isolate* isolate,
+     // Builtins should start at a page boundary, see
+     // platform-embedded-file-writer-mac.cc. If it's not the case (e.g. if the
+     // embedded builtins are not coming from the binary), fall back to copying.
+-    bool source_is_remappable = IsAligned(
+-        reinterpret_cast<uintptr_t>(embedded_blob_code), commit_page_size);
++    bool source_is_remappable =
++        !base::IOSJitMemory::IsTxmDualMap() &&
++        IsAligned(reinterpret_cast<uintptr_t>(embedded_blob_code),
++                  commit_page_size);
+ #if defined(V8_OS_LINUX)
+     // On Linux, RemapPages is destructive unless the source is a
+     // file-backed mapping, so only remap when the embedded blob is the one
+@@ -621,8 +676,11 @@ uint8_t* CodeRange::RemapEmbeddedBuiltins(Isolate* isolate,
+ #endif  // defined(V8_TARGET_OS_IOS)
+     RwxMemoryWriteScope rwx_write_scope(
+         "Enable write access to copy the blob code into the code range");
+-    memcpy(embedded_blob_code_copy, embedded_blob_code,
+-           embedded_blob_code_size);
++    memcpy(base::IOSJitMemory::ToWritablePtr(embedded_blob_code_copy),
++           embedded_blob_code, embedded_blob_code_size);
++    if (base::IOSJitMemory::IsTxmDualMap()) {
++      FlushInstructionCache(embedded_blob_code_copy, embedded_blob_code_size);
++    }
+   } else {
+     if (!page_allocator()->SetPermissions(embedded_blob_code_copy, code_size,
+                                           PageAllocator::kReadWrite)) {
+diff --git a/v8/src/heap/memory-allocator.cc b/v8/src/heap/memory-allocator.cc
+index e6afb23..b285e16 100644
+--- a/v8/src/heap/memory-allocator.cc
++++ b/v8/src/heap/memory-allocator.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "src/base/address-region.h"
+ #include "src/base/macros.h"
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/common/globals.h"
+ #include "src/execution/isolate.h"
+ #include "src/flags/flags.h"
+@@ -457,7 +458,8 @@ NormalPage* MemoryAllocator::AllocatePage(
+       &trusted_flags);
+   if (executable) {
+     RwxMemoryWriteScope scope("Initialize a new MemoryChunk.");
+-    new (chunk_info->chunk) MemoryChunk(trusted_flags, metadata);
++    new (base::IOSJitMemory::ToWritablePtr(chunk_info->chunk))
++        MemoryChunk(trusted_flags, metadata);
+ #ifdef DEBUG
+     RegisterExecutableMemoryChunk(metadata);
+ #endif  // DEBUG
+@@ -539,7 +541,8 @@ LargePage* MemoryAllocator::AllocateLargePage(LargeObjectSpace* space,
+                 std::move(chunk_info->reservation), executable, &trusted_flags);
+   if (executable) {
+     RwxMemoryWriteScope scope("Initialize a new MemoryChunk.");
+-    new (chunk_info->chunk) MemoryChunk(trusted_flags, metadata);
++    new (base::IOSJitMemory::ToWritablePtr(chunk_info->chunk))
++        MemoryChunk(trusted_flags, metadata);
+ #ifdef DEBUG
+     RegisterExecutableMemoryChunk(metadata);
+ #endif  // DEBUG
+diff --git a/v8/src/heap/mutable-page-inl.h b/v8/src/heap/mutable-page-inl.h
+index d5e9963..c313a3a 100644
+--- a/v8/src/heap/mutable-page-inl.h
++++ b/v8/src/heap/mutable-page-inl.h
+@@ -8,6 +8,7 @@
+ #include "src/heap/mutable-page.h"
+ // Include the non-inl header before the rest of the headers.
+ 
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/heap/base-page-inl.h"
+ 
+ namespace v8::internal {
+@@ -80,7 +81,8 @@ V8_INLINE void MutablePage::RawSetTrustedAndUntrustedFlags(
+   SBXCHECK_EQ(untrusted_main_thread_flags, trusted_main_thread_flags_);
+ #endif  // V8_ENABLE_SANDBOX
+   trusted_main_thread_flags_ = new_flags;
+-  Chunk()->untrusted_main_thread_flags_ = trusted_main_thread_flags_;
++  base::IOSJitMemory::ToWritablePtr(Chunk())->untrusted_main_thread_flags_ =
++      trusted_main_thread_flags_;
+ }
+ 
+ void MutablePage::SetFlagsUnlocked(MemoryChunk::MainThreadFlags flags,
+diff --git a/v8/src/heap/sweeper.cc b/v8/src/heap/sweeper.cc
+index fb453c7..3d9c4de 100644
+--- a/v8/src/heap/sweeper.cc
++++ b/v8/src/heap/sweeper.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "src/base/atomic-utils.h"
+ #include "src/base/logging.h"
++#include "src/base/platform/ios-jit-memory.h"
+ #include "src/base/synchronization-point-support.h"
+ #include "src/common/globals.h"
+ #include "src/execution/isolate-inl.h"
+@@ -1119,15 +1120,19 @@ void Sweeper::ZeroOrDiscardUnusedMemory(NormalPage* page, Address addr,
+     if (v8_flags.zero_unused_memory) {
+       // Now zero unused memory right before and after the discarded OS pages to
+       // help with OS page compression.
+-      memset(reinterpret_cast<void*>(unused_start), 0,
+-             discard_area->begin() - unused_start);
+-      memset(reinterpret_cast<void*>(discard_area->end()), 0,
+-             unused_end - discard_area->end());
++      memset(reinterpret_cast<void*>(
++                 base::IOSJitMemory::ToWritable(unused_start)),
++             0, discard_area->begin() - unused_start);
++      memset(reinterpret_cast<void*>(
++                 base::IOSJitMemory::ToWritable(discard_area->end())),
++             0, unused_end - discard_area->end());
+     }
+   } else if (v8_flags.zero_unused_memory) {
+     // Unused memory does not span a full OS page. Simply clear all of the
+     // unused memory. This helps with OS page compression.
+-    memset(reinterpret_cast<void*>(unused_start), 0, unused_end - unused_start);
++    memset(reinterpret_cast<void*>(
++               base::IOSJitMemory::ToWritable(unused_start)),
++           0, unused_end - unused_start);
+   }
+ }
+ 

@@ -84,3 +84,4 @@
 0089-ios-zero-copy-video-picture-in-picture.patch
 0090-ios-curium-perf-guards-and-pip-contract.patch
 0091-ios-vp9-hardware-decode.patch
+0092-ios-v8-dual-mode-jit-and-txm-split-wx.patch
