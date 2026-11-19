@@ -723,10 +723,10 @@ index 0000000..5df249f
 +#endif  // IOS_WEB_CONTENT_PICTURE_IN_PICTURE_IOS_VIDEO_OVERLAY_WINDOW_H_
 diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
 new file mode 100644
-index 0000000..6c9f7f9
+index 0000000..a27d332
 --- /dev/null
 +++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
-@@ -0,0 +1,1303 @@
+@@ -0,0 +1,1304 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -757,6 +757,7 @@ index 0000000..6c9f7f9
 +#include "content/public/browser/video_picture_in_picture_window_controller.h"
 +#include "content/public/browser/web_contents.h"
 +#include "media/base/mac/ios_pip_frame_hub.h"
++#include "media/base/timestamp_constants.h"
 +#include "media/base/video_frame.h"
 +#include "third_party/libyuv/include/libyuv/convert_from.h"
 +#include "third_party/libyuv/include/libyuv/planar_functions.h"
