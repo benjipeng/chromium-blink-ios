@@ -363,6 +363,20 @@ assert loaded[-1] == install_name, f"helper not last in otool -L: {loaded}"
 PY
 fi
 
+echo "==> Verifying stripped chrome_framework exports Curium engine ABI"
+chrome_fw_bin="$bundle/Frameworks/chrome_framework.framework/chrome_framework"
+[ -f "$chrome_fw_bin" ] || { echo "error: missing chrome_framework binary at $chrome_fw_bin" >&2; exit 1; }
+python3 - "$chrome_fw_bin" <<'PY'
+import subprocess, sys
+bin_path = sys.argv[1]
+exports = subprocess.check_output(["nm", "-gU", bin_path], text=True)
+assert "_ChromeMain" in exports, "chrome_framework missing exported _ChromeMain symbol"
+objc_meta = subprocess.check_output(["otool", "-oV", bin_path], text=True)
+for cls in ("CrIOSEngineBootstrap", "CrIOSExtensionManagerV1"):
+    assert cls in objc_meta, f"chrome_framework missing required ObjC class metadata: {cls}"
+print(f"  verified Curium ABI in {bin_path} (_ChromeMain, CrIOSEngineBootstrap, CrIOSExtensionManagerV1)")
+PY
+
 echo "==> Signing nested frameworks (without entitlements) then top-level app bundle"
 if [ -d "$bundle/Frameworks" ]; then
   for fw in "$bundle/Frameworks"/*; do

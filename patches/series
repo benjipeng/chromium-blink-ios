@@ -81,3 +81,6 @@
 0086-ios-bind-extension-script-execution-to-real-tabs.patch
 0087-ios-support-extension-action-badges.patch
 0088-ios-curium-headless-shell-and-extension-bridge.patch
+0089-ios-zero-copy-video-picture-in-picture.patch
+0090-ios-curium-perf-guards-and-pip-contract.patch
+0091-ios-vp9-hardware-decode.patch

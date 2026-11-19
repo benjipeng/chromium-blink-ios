@@ -36,6 +36,7 @@ COMMON = [
     "args",
     "ci/gn_args.linux",
     "ci/gn_args.mac",
+    "ci/pgo_profile.env",
     "scripts/stage.sh",
     "scripts/apply_patches.sh",
     "scripts/overlay_linux_host_deps.py",

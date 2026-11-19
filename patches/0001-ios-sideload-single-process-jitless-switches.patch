@@ -3,7 +3,7 @@ From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS Blink: single-process, RAM-scaled jitless V8, and background bloat suppression
 
 diff --git a/content/app/content_main.cc b/content/app/content_main.cc
-index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5502aac06 100644
+index 53ad968..8621bc7 100644
 --- a/content/app/content_main.cc
 +++ b/content/app/content_main.cc
 @@ -27,6 +27,9 @@
@@ -16,7 +16,7 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
  #include "base/task/single_thread_task_executor.h"
  #include "base/task/thread_pool/thread_pool_instance.h"
  #include "base/threading/platform_thread.h"
-@@ -113,6 +116,96 @@ void SetupSignalHandlers() {
+@@ -113,6 +116,97 @@ void SetupSignalHandlers() {
  
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
  
@@ -49,32 +49,33 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
 +  const uint64_t ram_mb =
 +      base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
 +
-+  if (!command_line->HasSwitch(kJsFlagsSwitch)) {
-+    // Scale V8 heap ceilings by physical RAM (accounting for iOS kernel
-+    // carveouts on 4 GB, 6 GB, and 8 GB+ devices).
-+    int old_space_mb = 256;
-+    int semi_space_mb = 8;
-+    if (ram_mb >= 7000) {
-+      old_space_mb = 1024;
-+      semi_space_mb = 32;
-+    } else if (ram_mb >= 5120) {
-+      old_space_mb = 512;
-+      semi_space_mb = 16;
-+    } else if (ram_mb >= 3500) {
-+      old_space_mb = 384;
-+      semi_space_mb = 16;
-+    }
-+    // --wasm-jitless runs WebAssembly in DrumBrake, V8's interpreter: under
-+    // --jitless, V8 exposes WebAssembly only with it. It goes last because it
-+    // can only be set in builds with DrumBrake (args/*.gn), and V8 ignores
-+    // every flag after one it rejects.
-+    command_line->AppendSwitchASCII(
-+        kJsFlagsSwitch,
-+        "--jitless --max-old-space-size=" +
-+            base::NumberToString(old_space_mb) +
-+            " --max-semi-space-size=" + base::NumberToString(semi_space_mb) +
-+            " --wasm-jitless");
++  // Scale per-isolate V8 heap ceilings for single-process jetsam headroom
++  // (accounting for iOS kernel carveouts on 4 GB, 6 GB, and 8 GB+ devices).
++  int old_space_mb = 192;
++  int semi_space_mb = 8;
++  if (ram_mb >= 7000) {
++    old_space_mb = 512;
++    semi_space_mb = 16;
++  } else if (ram_mb >= 5120) {
++    old_space_mb = 384;
++    semi_space_mb = 16;
++  } else if (ram_mb >= 3500) {
++    old_space_mb = 256;
++    semi_space_mb = 12;
 +  }
++
++  // Enforce jitless mode authoritatively so no caller-supplied prefix or
++  // unknown flag can prevent V8 from seeing --jitless / --wasm-jitless.
++  // Keep --wasm-jitless last because V8 ignores flags after any unrecognized
++  // flag, and DrumBrake requires --wasm-jitless to expose WebAssembly under
++  // --jitless.
++  command_line->RemoveSwitch(kJsFlagsSwitch);
++  command_line->AppendSwitchASCII(
++      kJsFlagsSwitch,
++      "--jitless --max-old-space-size=" +
++          base::NumberToString(old_space_mb) +
++          " --max-semi-space-size=" + base::NumberToString(semi_space_mb) +
++          " --wasm-jitless");
 +
 +  // In-process, the GPU watchdog killing a slow GPU thread takes the whole app
 +  // down; a slow first GL/ANGLE init is expected here.
@@ -85,7 +86,7 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
 +  if (!command_line->HasSwitch("force-gpu-mem-available-mb")) {
 +    command_line->AppendSwitchASCII(
 +        "force-gpu-mem-available-mb",
-+        ram_mb >= 7000 ? "768" : (ram_mb >= 5120 ? "512" : (ram_mb >= 3500 ? "384" : "192")));
++        ram_mb >= 7000 ? "256" : (ram_mb >= 5120 ? "192" : (ram_mb >= 3500 ? "160" : "128")));
 +  }
 +
 +  // The Optimization Guide is disabled below, and Gemini dereferences it
@@ -113,7 +114,7 @@ index 53ad96889594b4ac5ed189bd11e7b01e5b6129e4..29f1d8cb87dea8b92aad2ead54fb56f5
  bool IsSubprocess() {
    auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kProcessType);
-@@ -288,6 +381,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+@@ -288,6 +382,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
      // Enable spatial navigation; we interpret remote control swipes as arrow
      // keys.
      command_line->AppendSwitch(switches::kEnableSpatialNavigation);

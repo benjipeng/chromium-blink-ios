@@ -16,10 +16,21 @@ enable_platform_apps = false
 enable_hosted_apps = false
 enable_guest_view = false
 
-# Release optimization with full symbol stripping to minimize object/cache bloat.
+# Official release optimization with Apple Silicon mac-arm PGO and local symbol
+# stripping (-x -S). ThinLTO and CFI stay disabled so 4-vCPU/16 GB Linux Link
+# runners remain fast and within RAM headroom.
 is_debug = false
+is_official_build = true
+is_chrome_branded = false
 is_component_build = false
 dcheck_always_on = false
+is_cfi = false
+use_thin_lto = false
+chrome_pgo_phase = 2
+enable_separate_pgo = false
+pgo_data_path = "//chrome/build/pgo_profiles/chrome-mac-arm-main-1795039197-078b10615f6e4e5969a93fc03e8f2016b5ab4123-3f3aa7d0f90fcd61d8362f871b078f729a418b01.profdata"
+enable_stripping = true
+enable_dsyms = false
 symbol_level = 0
 blink_symbol_level = 0
 v8_symbol_level = 0

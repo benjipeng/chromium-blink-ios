@@ -61,6 +61,12 @@ NS_SWIFT_UI_ACTOR
 - (void)takeSnapshotWithCompletion:
     (void (^NS_SWIFT_UI_ACTOR)(UIImage *_Nullable image))completion;
 
+@optional
+@property (nonatomic, readonly) BOOL hasPlayingVideo;
+@property (nonatomic, readonly) BOOL isPictureInPictureActive;
+- (void)enterPictureInPicture;
+- (void)exitPictureInPicture;
+
 @end
 
 NS_SWIFT_UI_ACTOR

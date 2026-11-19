@@ -31,6 +31,7 @@ apple_prepare() {
   fi
   log "Skipped $(grep -c 'Hard-link target' "$err" || true) hard links into excluded host trees"
   rm -rf "$STATE/codegen"
+  provision_pgo_profile "$MWORK/src"
   export PATH="$MWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
   generate_graph "$MWORK/src" "$MWORK/src/buildtools/mac/gn"
   # Plan on the full graph, then reduce it to the Apple edges (which also

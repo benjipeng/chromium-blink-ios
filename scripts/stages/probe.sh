@@ -95,6 +95,14 @@ obj/ios/chrome/browser/curium/download_router/curium_download_router.o
 obj/ios/chrome/browser/curium/curium/curium_download_task.o
 obj/ios/chrome/browser/curium/curium/curium_tab_host.o
 obj/ios/chrome/browser/curium/curium/curium_web_state_delegate.o
+obj/media/base/mac/mac/ios_pip_buffer_registry.o
+obj/media/base/mac/mac/ios_pip_frame_hub.o
+obj/content/browser/browser/picture_in_picture_service_impl.o
+obj/content/browser/browser/picture_in_picture_session.o
+obj/content/browser/browser/video_picture_in_picture_window_controller_impl.o
+obj/ios/web/content/content/ios_video_overlay_window.o
+obj/third_party/blink/renderer/platform/media/media/video_frame_compositor.o
+obj/third_party/blink/renderer/platform/media/media/web_media_player_impl.o
 EOF
   python3 - <<'PY'
 import os

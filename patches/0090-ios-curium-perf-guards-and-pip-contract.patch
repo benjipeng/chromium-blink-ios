@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: native metrics nil-guard, ResourceLoadComplete gate, popup block, and PiP contract
+
+diff --git a/ios/chrome/app/application_delegate/metrics_mediator.mm b/ios/chrome/app/application_delegate/metrics_mediator.mm
+index 21d3611..185f501 100644
+--- a/ios/chrome/app/application_delegate/metrics_mediator.mm
++++ b/ios/chrome/app/application_delegate/metrics_mediator.mm
+@@ -589,10 +589,12 @@ + (void)logLaunchMetricsWithStartupInformation:
+ 
+     Browser* const mainbrowser = scene.browserProviderInterface.mainBrowser;
+     const WebStateList* webStateList = mainbrowser->GetWebStateList();
++    Browser* const inactiveBrowser = mainbrowser->GetInactiveBrowser();
+     const WebStateList* inactiveWebStateList =
+-        mainbrowser->GetInactiveBrowser()->GetWebStateList();
++        inactiveBrowser ? inactiveBrowser->GetWebStateList() : nullptr;
+     const int webStateListCount = webStateList->count();
+-    const int inactiveWebStateListCount = inactiveWebStateList->count();
++    const int inactiveWebStateListCount =
++        inactiveWebStateList ? inactiveWebStateList->count() : 0;
+ 
+     for (const TabGroup* group : webStateList->GetGroups()) {
+       tabGroupCount++;
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+index ff70dbd..a1d94ce 100644
+--- a/ios/chrome/browser/curium/curium_browser_host.mm
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -130,10 +130,22 @@ @implementation CuriumBrowserHost {
+   NSMutableArray<CuriumDownloadTask*>* _downloads;
+   BOOL _pendingTabsNotification;
+   BOOL _isShutdown;
++  BOOL _observesResourceLoads;
+ }
+ 
+ @synthesize delegate = _delegate;
+ 
++- (void)setDelegate:(nullable id<CrIOSBrowserHostDelegateV1>)delegate {
++  _delegate = delegate;
++  _observesResourceLoads =
++      [delegate respondsToSelector:@selector
++                (browserHost:tab:didLoadResourceURL:mimeType:httpStatusCode:contentLength:)];
++}
++
++- (BOOL)observesResourceLoads {
++  return _observesResourceLoads && !_isShutdown;
++}
++
+ - (instancetype)initWithBrowser:(Browser*)browser
+                      sceneState:(SceneState*)sceneState {
+   self = [super init];
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 273106a..95c06ed 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -66,6 +66,8 @@ __attribute__((visibility("default")))
+ @property(nonatomic, readonly) BOOL usesDesktopUserAgent;
+ @property(nonatomic, strong, readonly, nullable) UIColor* pageCanvasColor;
+ @property(nonatomic, readonly) BOOL isWebFullscreen;
++@property(nonatomic, readonly) BOOL hasPlayingVideo;
++@property(nonatomic, readonly) BOOL isPictureInPictureActive;
+ 
+ - (void)loadURL:(NSURL*)url;
+ - (void)goBack;
+@@ -75,6 +77,8 @@ __attribute__((visibility("default")))
+ - (void)setUsesDesktopUserAgent:(BOOL)desktop;
+ - (void)presentFindInPage;
+ - (void)setPageZoomScale:(CGFloat)scale;
++- (void)enterPictureInPicture;
++- (void)exitPictureInPicture;
+ - (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable image))completion;
+ @end
+ 
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+index c806967..18337b4 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.mm
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -15,6 +15,7 @@
+ #import "base/scoped_observation.h"
+ #import "base/strings/sys_string_conversions.h"
+ #import "content/public/browser/host_zoom_map.h"
++#import "content/public/browser/media_session.h"
+ #import "content/public/browser/navigation_controller.h"
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/web_contents.h"
+@@ -37,6 +38,7 @@
+ #import "ui/base/page_transition_types.h"
+ 
+ @interface CuriumBrowserHost (TabNotifications)
++- (BOOL)observesResourceLoads;
+ - (void)tabHostDidUpdate:(CuriumTabHost*)tabHost;
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     didLoadResourceURL:(NSURL*)url
+@@ -70,6 +72,16 @@ void DidToggleFullscreenModeForTab(bool, bool) override {
+   }
+   void DidChangeThemeColor() override { [owner_ notifyUpdated]; }
+   void OnBackgroundColorChanged() override { [owner_ notifyUpdated]; }
++  void MediaStartedPlaying(const MediaPlayerInfo&,
++                           const content::MediaPlayerId&) override {
++    [owner_ notifyUpdated];
++  }
++  void MediaStoppedPlaying(const MediaPlayerInfo&,
++                           const content::MediaPlayerId&,
++                           MediaStoppedReason) override {
++    [owner_ notifyUpdated];
++  }
++  void MediaPictureInPictureChanged(bool) override { [owner_ notifyUpdated]; }
+   void ResourceLoadComplete(
+       content::RenderFrameHost* render_frame_host,
+       const content::GlobalRequestID& request_id,
+@@ -261,6 +273,24 @@ - (BOOL)isWebFullscreen {
+   return _webState ? _webState->IsWebPageInFullscreenMode() : NO;
+ }
+ 
++- (BOOL)hasPlayingVideo {
++  if (!_webState) {
++    return NO;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  return wc && wc->GetCurrentlyPlayingVideoCount() > 0;
++}
++
++- (BOOL)isPictureInPictureActive {
++  if (!_webState) {
++    return NO;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  return wc && wc->HasPictureInPictureVideo();
++}
++
+ - (void)loadURL:(NSURL*)url {
+   if (!_webState || !url) {
+     return;
+@@ -346,6 +376,34 @@ - (void)setPageZoomScale:(CGFloat)scale {
+   [self applyZoomIfNeeded];
+ }
+ 
++- (void)enterPictureInPicture {
++  if (!_webState) {
++    return;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  if (!wc) {
++    return;
++  }
++  if (content::MediaSession* session = content::MediaSession::Get(wc)) {
++    session->EnterPictureInPicture();
++  }
++}
++
++- (void)exitPictureInPicture {
++  if (!_webState) {
++    return;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  if (!wc) {
++    return;
++  }
++  if (content::MediaSession* session = content::MediaSession::Get(wc)) {
++    session->ExitPictureInPicture();
++  }
++}
++
+ - (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable))completion {
+   CHECK([NSThread isMainThread]);
+   if (!_webState) {
+@@ -469,6 +527,10 @@ - (void)handleWebStateDestroyed {
+ }
+ 
+ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
++  CuriumBrowserHost* browserHost = _browserHost;
++  if (!browserHost || ![browserHost observesResourceLoads]) {
++    return;
++  }
+   NSURL* ns_url = net::NSURLWithGURL(info.final_url.is_valid()
+                                          ? info.final_url
+                                          : info.original_url);
+diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.mm b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+index 58aeeb1..ec15a58 100644
+--- a/ios/chrome/browser/curium/curium_web_state_delegate.mm
++++ b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+@@ -52,6 +52,9 @@ - (nullable CuriumTabHost*)tabHostForWebState:(web::WebState*)webState;
+     const GURL& url,
+     const GURL& opener_url,
+     bool initiated_by_user) {
++  if (!initiated_by_user) {
++    return nullptr;
++  }
+   WebStateList* list = browser_->GetWebStateList();
+   if (list->IsMutating() ||
+       list->GetIndexOfWebState(source) == WebStateList::kInvalidIndex) {

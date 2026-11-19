@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: enable VideoToolbox VP9 hardware decode on iOS 26.2+
+
+diff --git a/media/gpu/mac/video_toolbox_video_decoder.cc b/media/gpu/mac/video_toolbox_video_decoder.cc
+index e09a968..db4c76e 100644
+--- a/media/gpu/mac/video_toolbox_video_decoder.cc
++++ b/media/gpu/mac/video_toolbox_video_decoder.cc
+@@ -49,8 +49,13 @@ bool InitializeVP9() {
+ #if BUILDFLAG(IS_MAC)
+   VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+   return VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9);
++#elif BUILDFLAG(IS_IOS)
++  if (__builtin_available(iOS 26.2, *)) {
++    VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
++    return VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9);
++  }
++  return false;
+ #else
+-  // TODO(crbug.com/40269929): Enable VP9 on iOS.
+   return false;
+ #endif
+ }

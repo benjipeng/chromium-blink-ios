@@ -128,6 +128,65 @@ write_args() {
 }
 
 # Production roots live in the patched .gn so nested queries inherit them too.
+# Provisions the digest-pinned mac-arm PGO profile into src/chrome/build/pgo_profiles/
+# identically on both Linux and macOS hosts before GN runs.
+provision_pgo_profile() {
+  local src_dir="$1"
+  local manifest="$REPO_ROOT/ci/pgo_profile.env"
+  [ -f "$manifest" ] || fail "Missing PGO manifest: $manifest"
+  # shellcheck source=../ci/pgo_profile.env
+  source "$manifest"
+  [ "${PGO_CHROMIUM_REV:-}" = "$CHROMIUM_REV" ]     || fail "ci/pgo_profile.env rev '${PGO_CHROMIUM_REV:-}' != CHROMIUM_REV '$CHROMIUM_REV'"
+  local ptr_file="$src_dir/chrome/build/mac-arm.pgo.txt"
+  [ -f "$ptr_file" ] || fail "Missing upstream PGO pointer: $ptr_file"
+  local expected_name
+  expected_name="$(tr -d '[:space:]' < "$ptr_file")"
+  [ "${PGO_PROFILE_FILE:-}" = "$expected_name" ]     || fail "PGO_PROFILE_FILE '${PGO_PROFILE_FILE:-}' != mac-arm.pgo.txt '$expected_name'"
+  grep -Fq "pgo_data_path = \"//chrome/build/pgo_profiles/$PGO_PROFILE_FILE\"" "$REPO_ROOT/args/device.gn"     || fail "args/device.gn pgo_data_path does not match $PGO_PROFILE_FILE"
+
+  local dest_dir="$src_dir/chrome/build/pgo_profiles"
+  local dest="$dest_dir/$PGO_PROFILE_FILE"
+  mkdir -p "$dest_dir"
+
+  verify_sha256() {
+    python3 - "$1" "$2" <<'PY'
+import hashlib, sys
+path, expected = sys.argv[1], sys.argv[2].lower()
+h = hashlib.sha256()
+with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+actual = h.hexdigest()
+if actual != expected:
+    sys.stderr.write(f"SHA-256 mismatch for {path}: expected {expected}, got {actual}\n")
+    sys.exit(1)
+PY
+  }
+
+  if [ -f "$dest" ]; then
+    verify_sha256 "$dest" "$PGO_PROFILE_SHA256" || fail "Corrupt existing PGO profile at $dest"
+    TZ=UTC0 touch -t 200001010000 "$dest"
+    log "Verified existing PGO profile $PGO_PROFILE_FILE"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp "$dest_dir/.pgo.XXXXXX")"
+  local url="https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/${PGO_PROFILE_FILE}?generation=${PGO_PROFILE_GENERATION}"
+  log "Downloading pinned PGO profile $PGO_PROFILE_FILE (generation $PGO_PROFILE_GENERATION)"
+  if ! curl -fsSL --retry 4 --retry-delay 2 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    fail "Failed to download PGO profile from $url"
+  fi
+  if ! verify_sha256 "$tmp" "$PGO_PROFILE_SHA256"; then
+    rm -f "$tmp"
+    fail "Downloaded PGO profile failed SHA-256 verification"
+  fi
+  TZ=UTC0 touch -t 200001010000 "$tmp"
+  mv -f "$tmp" "$dest"
+  log "Provisioned PGO profile $PGO_PROFILE_FILE ($(wc -c < "$dest") bytes)"
+}
+
 generate_graph() {
   local source_dir="$1" gn_binary="$2"
   (cd "$source_dir" && "$gn_binary" gen out/Release)
@@ -195,6 +254,7 @@ prepare_linux() {
   decrypt_stub "$LWORK/src"
   install_wrapper "$LWORK/src"
   write_args linux "$LOUT"
+  provision_pgo_profile "$LWORK/src"
   if [ "$role" = compile ] || [ "$role" = link ]; then
     restore_codegen_linux
     restore_apple_cache

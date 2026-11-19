@@ -1,0 +1,3265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink: zero-copy VideoToolbox system Picture-in-Picture
+
+diff --git a/content/browser/picture_in_picture/picture_in_picture_service_impl.cc b/content/browser/picture_in_picture/picture_in_picture_service_impl.cc
+index ad7ce57..cea5444 100644
+--- a/content/browser/picture_in_picture/picture_in_picture_service_impl.cc
++++ b/content/browser/picture_in_picture/picture_in_picture_service_impl.cc
+@@ -108,29 +108,20 @@ void PictureInPictureServiceImpl::StartSessionInternal(
+     return;
+   }
+ 
+-  gfx::Size window_size;
+-  mojo::PendingRemote<blink::mojom::PictureInPictureSession> session_remote;
+-
+-  auto result = GetController().StartSession(
++  GetController().StartSessionWithCallback(
+       this,
+       MediaPlayerId(render_frame_host().GetGlobalId(),
+                     pending_session->player_id),
+       std::move(pending_session->player_remote), pending_session->surface_id,
+       pending_session->natural_size, pending_session->show_play_pause_button,
+       std::move(pending_session->observer), pending_session->source_bounds,
+-      std::move(immersive_options), &session_remote, &window_size);
+-
+-  if (result == PictureInPictureResult::kSuccess) {
+-    // Frames are to be blocklisted from the back-forward cache because the
+-    // picture-in-picture continues to be displayed while the page is in the
+-    // cache instead of closing.
+-    static_cast<RenderFrameHostImpl&>(render_frame_host())
+-        .OnBackForwardCacheDisablingStickyFeatureUsed(
+-            blink::scheduler::WebSchedulerTrackedFeature::kPictureInPicture);
+-  }
++      std::move(immersive_options), std::move(pending_session->callback));
++}
+ 
+-  std::move(pending_session->callback)
+-      .Run(std::move(session_remote), window_size);
++void PictureInPictureServiceImpl::NotifyPictureInPictureStarted() {
++  static_cast<RenderFrameHostImpl&>(render_frame_host())
++      .OnBackForwardCacheDisablingStickyFeatureUsed(
++          blink::scheduler::WebSchedulerTrackedFeature::kPictureInPicture);
+ }
+ 
+ void PictureInPictureServiceImpl::StartSessionImmersive(
+diff --git a/content/browser/picture_in_picture/picture_in_picture_service_impl.h b/content/browser/picture_in_picture/picture_in_picture_service_impl.h
+index f833349..ba28af2 100644
+--- a/content/browser/picture_in_picture/picture_in_picture_service_impl.h
++++ b/content/browser/picture_in_picture/picture_in_picture_service_impl.h
+@@ -50,6 +50,9 @@ class CONTENT_EXPORT PictureInPictureServiceImpl final
+   PictureInPictureServiceImpl& operator=(const PictureInPictureServiceImpl&) =
+       delete;
+ 
++  // Notifies the owning RenderFrameHost that Picture-in-Picture is active.
++  void NotifyPictureInPictureStarted();
++
+   // PictureInPictureService implementation.
+   void StartSession(
+       uint32_t player_id,
+diff --git a/content/browser/picture_in_picture/picture_in_picture_session.cc b/content/browser/picture_in_picture/picture_in_picture_session.cc
+index 193ffd3..57ce703 100644
+--- a/content/browser/picture_in_picture/picture_in_picture_session.cc
++++ b/content/browser/picture_in_picture/picture_in_picture_session.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "content/browser/picture_in_picture/picture_in_picture_session.h"
++#include "build/build_config.h"
+ 
+ #include <utility>
+ 
+@@ -80,6 +81,9 @@ void PictureInPictureSession::OnPlayerGone() {
+   NotifyPictureInPictureStateChanged(false);
+   player_id_.reset();
+   GetController().SetPlaybackControlsVisibility(false);
++#if BUILDFLAG(IS_IOS)
++  GetController().Close(/*should_pause_video=*/false);
++#endif
+ }
+ 
+ void PictureInPictureSession::NotifyPictureInPictureStateChanged(
+diff --git a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
+index 216a175..867603b 100644
+--- a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
++++ b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
+@@ -7,12 +7,14 @@
+ #include <set>
+ #include <utility>
+ 
++#include "base/auto_reset.h"
+ #include "base/memory/weak_ptr.h"
+ #include "build/build_config.h"
+ #include "components/viz/common/surfaces/surface_id.h"
+ #include "content/browser/media/media_web_contents_observer.h"
+ #include "content/browser/media/session/media_session_impl.h"
+ #include "content/browser/picture_in_picture/document_picture_in_picture_window_controller_impl.h"
++#include "content/browser/picture_in_picture/picture_in_picture_service_impl.h"
+ #include "content/browser/picture_in_picture/picture_in_picture_session.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -35,8 +37,51 @@ PictureInPictureWindowController::GetOrCreateVideoPictureInPictureController(
+       web_contents);
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++struct VideoPictureInPictureWindowControllerImpl::PendingNativeStart {
++  PendingNativeStart(
++      PictureInPictureServiceImpl* service,
++      const MediaPlayerId& player_id,
++      mojo::PendingAssociatedRemote<media::mojom::MediaPlayer> player_remote,
++      const viz::SurfaceId& surface_id,
++      const gfx::Size& natural_size,
++      bool show_play_pause_button,
++      mojo::PendingRemote<blink::mojom::PictureInPictureSessionObserver>
++          observer,
++      const gfx::Rect& source_bounds,
++      base::UnguessableToken session_token,
++      StartSessionResultCallback callback)
++      : service(service),
++        player_id(player_id),
++        player_remote(std::move(player_remote)),
++        surface_id(surface_id),
++        natural_size(natural_size),
++        show_play_pause_button(show_play_pause_button),
++        observer(std::move(observer)),
++        source_bounds(source_bounds),
++        session_token(session_token),
++        callback(std::move(callback)) {}
++  ~PendingNativeStart() = default;
++
++  raw_ptr<PictureInPictureServiceImpl> service;
++  MediaPlayerId player_id;
++  mojo::AssociatedRemote<media::mojom::MediaPlayer> player_remote;
++  viz::SurfaceId surface_id;
++  gfx::Size natural_size;
++  bool show_play_pause_button;
++  mojo::PendingRemote<blink::mojom::PictureInPictureSessionObserver> observer;
++  gfx::Rect source_bounds;
++  base::UnguessableToken session_token;
++  StartSessionResultCallback callback;
++};
++#endif
++
+ VideoPictureInPictureWindowControllerImpl::
+-    ~VideoPictureInPictureWindowControllerImpl() = default;
++    ~VideoPictureInPictureWindowControllerImpl() {
++#if BUILDFLAG(IS_IOS)
++  CancelPendingNativeStart();
++#endif
++}
+ 
+ VideoPictureInPictureWindowControllerImpl::
+     VideoPictureInPictureWindowControllerImpl(WebContents* web_contents)
+@@ -108,6 +153,9 @@ void VideoPictureInPictureWindowControllerImpl::FocusInitiator() {
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::Close(bool should_pause_video) {
++#if BUILDFLAG(IS_IOS)
++  CancelPendingNativeStart();
++#endif
+   if (!window_ || !window_->IsVisible())
+     return;
+ 
+@@ -390,6 +438,198 @@ PictureInPictureResult VideoPictureInPictureWindowControllerImpl::StartSession(
+   return result;
+ }
+ 
++void VideoPictureInPictureWindowControllerImpl::StartSessionWithCallback(
++    PictureInPictureServiceImpl* service,
++    const MediaPlayerId& player_id,
++    mojo::PendingAssociatedRemote<media::mojom::MediaPlayer> player_remote,
++    const viz::SurfaceId& surface_id,
++    const gfx::Size& natural_size,
++    bool show_play_pause_button,
++    mojo::PendingRemote<blink::mojom::PictureInPictureSessionObserver> observer,
++    const gfx::Rect& source_bounds,
++    std::optional<content::ImmersiveOptions> immersive_options,
++    StartSessionResultCallback callback) {
++#if BUILDFLAG(IS_IOS)
++  if (!immersive_options.has_value()) {
++    WebContentsDelegate* delegate = web_contents()->GetDelegate();
++    PictureInPictureResult result = PictureInPictureResult::kNotSupported;
++    if (delegate && delegate->IsPictureInPictureEnabled()) {
++      base::WeakPtr<WebContents> weak_wc = web_contents()->GetWeakPtr();
++      result = GetWebContentsImpl()->EnterPictureInPicture();
++      if (!weak_wc) {
++        std::move(callback).Run(mojo::NullRemote(), gfx::Size());
++        return;
++      }
++    }
++    if (result != PictureInPictureResult::kSuccess) {
++      std::move(callback).Run(mojo::NullRemote(), gfx::Size());
++      return;
++    }
++
++    if (!window_) {
++      window_ =
++          GetContentClient()->browser()->CreateWindowForVideoPictureInPicture(
++              this);
++    }
++    if (!window_) {
++      std::move(callback).Run(mojo::NullRemote(), gfx::Size());
++      return;
++    }
++
++    if (window_->SupportsAsyncStart()) {
++      CancelPendingNativeStart();
++      if (active_session_) {
++        DetachActiveSystemPiPIfNeeded();
++        active_session_->Disconnect();
++        active_session_.reset();
++        pip_session_media_position_ = std::nullopt;
++      }
++
++      is_immersive_ = false;
++      source_bounds_ = source_bounds;
++      surface_id_ = surface_id;
++      const base::UnguessableToken session_token =
++          base::UnguessableToken::Create();
++      pending_native_start_ = std::make_unique<PendingNativeStart>(
++          service, player_id, std::move(player_remote), surface_id,
++          natural_size, show_play_pause_button, std::move(observer),
++          source_bounds, session_token, std::move(callback));
++
++      pending_native_start_->player_remote.set_disconnect_handler(
++          base::BindOnce(&VideoPictureInPictureWindowControllerImpl::
++                             CancelPendingNativeStart,
++                         weak_ptr_factory_.GetWeakPtr()));
++
++      window_->SetSystemPiPBackgroundCallback(base::BindRepeating(
++          &VideoPictureInPictureWindowControllerImpl::
++              OnSystemPiPBackgroundChanged,
++          weak_ptr_factory_.GetWeakPtr()));
++      window_->UpdateNaturalSize(natural_size);
++      window_->SetSurfaceId(surface_id);
++      window_->PrepareSystemPictureInPicture(session_token);
++
++      pending_native_start_->player_remote->AttachSystemPictureInPicture(
++          session_token,
++          base::BindOnce(&VideoPictureInPictureWindowControllerImpl::
++                             OnSystemPiPPlayerAttached,
++                         weak_ptr_factory_.GetWeakPtr(), session_token));
++      return;
++    }
++  }
++#endif
++
++  gfx::Size window_size;
++  mojo::PendingRemote<blink::mojom::PictureInPictureSession> session_remote;
++  auto result = StartSession(
++      service, player_id, std::move(player_remote), surface_id, natural_size,
++      show_play_pause_button, std::move(observer), source_bounds,
++      std::move(immersive_options), &session_remote, &window_size);
++  if (result == PictureInPictureResult::kSuccess) {
++    service->NotifyPictureInPictureStarted();
++  }
++  std::move(callback).Run(std::move(session_remote), window_size);
++}
++
++#if BUILDFLAG(IS_IOS)
++void VideoPictureInPictureWindowControllerImpl::CancelPendingNativeStart() {
++  if (!pending_native_start_) {
++    return;
++  }
++  auto pending = std::move(pending_native_start_);
++  if (pending->player_remote.is_bound()) {
++    pending->player_remote->DetachSystemPictureInPicture(
++        pending->session_token);
++  }
++  if (window_) {
++    window_->CancelPendingStart();
++  }
++  if (pending->callback) {
++    std::move(pending->callback).Run(mojo::NullRemote(), gfx::Size());
++  }
++}
++
++void VideoPictureInPictureWindowControllerImpl::DetachActiveSystemPiPIfNeeded() {
++  if (!active_system_pip_token_.has_value()) {
++    return;
++  }
++  const base::UnguessableToken token = *active_system_pip_token_;
++  active_system_pip_token_.reset();
++  if (active_session_ && active_session_->GetMediaPlayerRemote().is_bound()) {
++    active_session_->GetMediaPlayerRemote()->DetachSystemPictureInPicture(
++        token);
++  }
++}
++
++void VideoPictureInPictureWindowControllerImpl::OnSystemPiPPlayerAttached(
++    const base::UnguessableToken& session_token,
++    bool supported) {
++  if (!pending_native_start_ ||
++      pending_native_start_->session_token != session_token) {
++    return;
++  }
++  if (!supported || !window_) {
++    CancelPendingNativeStart();
++    return;
++  }
++  window_->StartSystemPictureInPicture(
++      session_token,
++      base::BindOnce(&VideoPictureInPictureWindowControllerImpl::
++                         OnSystemPiPStartCompleted,
++                     weak_ptr_factory_.GetWeakPtr(), session_token));
++}
++
++void VideoPictureInPictureWindowControllerImpl::OnSystemPiPStartCompleted(
++    const base::UnguessableToken& session_token,
++    bool success,
++    const gfx::Size& window_size) {
++  if (!pending_native_start_ ||
++      pending_native_start_->session_token != session_token) {
++    return;
++  }
++  if (!success || !window_ || !web_contents() ||
++      web_contents()->IsBeingDestroyed()) {
++    CancelPendingNativeStart();
++    return;
++  }
++
++  auto pending = std::move(pending_native_start_);
++  mojo::PendingRemote<blink::mojom::PictureInPictureSession> session_remote;
++  active_session_ = std::make_unique<PictureInPictureSession>(
++      pending->service, pending->player_id, pending->player_remote.Unbind(),
++      session_remote.InitWithNewPipeAndPassReceiver(),
++      std::move(pending->observer));
++  active_system_pip_token_ = session_token;
++
++  SetShowPlayPauseButton(pending->show_play_pause_button);
++  UpdatePlaybackState();
++  UpdateMediaPosition();
++  Show();
++
++  if (on_window_created_notify_observers_callback_) {
++    std::move(on_window_created_notify_observers_callback_).Run();
++  }
++  pending->service->NotifyPictureInPictureStarted();
++
++  const gfx::Size reported_size =
++      window_size.IsEmpty() ? GetSize() : window_size;
++  std::move(pending->callback).Run(std::move(session_remote), reported_size);
++}
++
++void VideoPictureInPictureWindowControllerImpl::OnSystemPiPBackgroundChanged(
++    bool backgrounded) {
++  if (active_session_ && active_system_pip_token_.has_value() &&
++      active_session_->GetMediaPlayerRemote().is_bound()) {
++    active_session_->GetMediaPlayerRemote()
++        ->SetSystemPictureInPictureBackgrounded(*active_system_pip_token_,
++                                                backgrounded);
++  } else if (pending_native_start_ &&
++             pending_native_start_->player_remote.is_bound()) {
++    pending_native_start_->player_remote->SetSystemPictureInPictureBackgrounded(
++        pending_native_start_->session_token, backgrounded);
++  }
++}
++#endif
++
+ void VideoPictureInPictureWindowControllerImpl::
+     RequestImmersivePlaybackConfirmation(
+         const content::ImmersiveOptions& default_options,
+@@ -408,6 +648,11 @@ void VideoPictureInPictureWindowControllerImpl::
+ 
+ void VideoPictureInPictureWindowControllerImpl::OnServiceDeleted(
+     PictureInPictureServiceImpl* service) {
++#if BUILDFLAG(IS_IOS)
++  if (pending_native_start_ && pending_native_start_->service == service) {
++    CancelPendingNativeStart();
++  }
++#endif
+   if (!active_session_ || active_session_->service() != service)
+     return;
+ 
+@@ -689,6 +934,10 @@ void VideoPictureInPictureWindowControllerImpl::MediaMutedStatusChanged(
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::WebContentsDestroyed() {
++#if BUILDFLAG(IS_IOS)
++  CancelPendingNativeStart();
++  DetachActiveSystemPiPIfNeeded();
++#endif
+   if (window_) {
+     window_->Close();
+   }
+@@ -700,6 +949,9 @@ void VideoPictureInPictureWindowControllerImpl::WebContentsDestroyed() {
+ void VideoPictureInPictureWindowControllerImpl::OnLeavingPictureInPicture(
+     bool should_pause_video) {
+   CHECK(active_session_, base::NotFatalUntil::M159);
++#if BUILDFLAG(IS_IOS)
++  DetachActiveSystemPiPIfNeeded();
++#endif
+ 
+   if (IsPlayerActive() && should_pause_video) {
+     // Pause the current video so there is only one video playing at a time.
+@@ -715,6 +967,12 @@ void VideoPictureInPictureWindowControllerImpl::OnLeavingPictureInPicture(
+ 
+ void VideoPictureInPictureWindowControllerImpl::CloseInternal(
+     bool should_pause_video) {
++#if BUILDFLAG(IS_IOS)
++  if (in_close_internal_) {
++    return;
++  }
++  base::AutoReset<bool> closing_guard(&in_close_internal_, true);
++#endif
+   // `web_contents()` can be null during `WebContents` destruction. If this
+   // controller is notified of destruction first, it clears its pointer via
+   // `Observe(nullptr)`. If `PictureInPictureWindowManager` tries to close the
+diff --git a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.h b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.h
+index 48e8523..02113c4 100644
+--- a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.h
++++ b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.h
+@@ -5,8 +5,14 @@
+ #ifndef CONTENT_BROWSER_PICTURE_IN_PICTURE_VIDEO_PICTURE_IN_PICTURE_WINDOW_CONTROLLER_IMPL_H_
+ #define CONTENT_BROWSER_PICTURE_IN_PICTURE_VIDEO_PICTURE_IN_PICTURE_WINDOW_CONTROLLER_IMPL_H_
+ 
++#include <memory>
++#include <optional>
+ #include <set>
+ 
++#include "base/memory/weak_ptr.h"
++#include "base/unguessable_token.h"
++#include "build/build_config.h"
++
+ #include "components/viz/common/surfaces/parent_local_surface_id_allocator.h"
+ #include "content/common/content_export.h"
+ #include "content/public/browser/immersive_playback_options.h"
+@@ -157,6 +163,23 @@ class CONTENT_EXPORT VideoPictureInPictureWindowControllerImpl
+           session_remote,
+       gfx::Size* window_size);
+ 
++  using StartSessionResultCallback = base::OnceCallback<void(
++      mojo::PendingRemote<blink::mojom::PictureInPictureSession>,
++      const gfx::Size&)>;
++
++  void StartSessionWithCallback(
++      PictureInPictureServiceImpl* service,
++      const MediaPlayerId& player_id,
++      mojo::PendingAssociatedRemote<media::mojom::MediaPlayer> player_remote,
++      const viz::SurfaceId& surface_id,
++      const gfx::Size& natural_size,
++      bool show_play_pause_button,
++      mojo::PendingRemote<blink::mojom::PictureInPictureSessionObserver>
++          observer,
++      const gfx::Rect& source_bounds,
++      std::optional<content::ImmersiveOptions> immersive_options,
++      StartSessionResultCallback callback);
++
+   using RequestImmersivePlaybackConfirmationCallback =
+       base::OnceCallback<void(content::ImmersivePlaybackConfirmationResult)>;
+ 
+@@ -279,6 +302,24 @@ class CONTENT_EXPORT VideoPictureInPictureWindowControllerImpl
+   // Callback to notify the observers about the video PiP window creation event.
+   base::OnceClosure on_window_created_notify_observers_callback_;
+ 
++#if BUILDFLAG(IS_IOS)
++  struct PendingNativeStart;
++  void CancelPendingNativeStart();
++  void DetachActiveSystemPiPIfNeeded();
++  void OnSystemPiPPlayerAttached(const base::UnguessableToken& session_token,
++                                 bool supported);
++  void OnSystemPiPStartCompleted(const base::UnguessableToken& session_token,
++                                 bool success,
++                                 const gfx::Size& window_size);
++  void OnSystemPiPBackgroundChanged(bool backgrounded);
++
++  std::unique_ptr<PendingNativeStart> pending_native_start_;
++  std::optional<base::UnguessableToken> active_system_pip_token_;
++  bool in_close_internal_ = false;
++  base::WeakPtrFactory<VideoPictureInPictureWindowControllerImpl>
++      weak_ptr_factory_{this};
++#endif
++
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+ 
+diff --git a/content/public/browser/overlay_window.h b/content/public/browser/overlay_window.h
+index ca3a18a..4e64697 100644
+--- a/content/public/browser/overlay_window.h
++++ b/content/public/browser/overlay_window.h
+@@ -7,6 +7,8 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/callback.h"
++#include "base/unguessable_token.h"
+ #include "build/build_config.h"
+ #include "content/public/browser/immersive_playback_options.h"
+ #include "services/media_session/public/cpp/media_image.h"
+@@ -70,6 +72,18 @@ class VideoOverlayWindow {
+   virtual void SetSurfaceId(const viz::SurfaceId& surface_id) = 0;
+   virtual void SetPlaybackControlsVisibility(bool is_visible) = 0;
+   virtual void SetImmersiveVideoOptions(const ImmersiveOptions& options) = 0;
++
++  // Optional async system Picture-in-Picture hooks (used by iOS AVKit).
++  virtual bool SupportsAsyncStart() const { return false; }
++  virtual void PrepareSystemPictureInPicture(
++      const base::UnguessableToken& session_token) {}
++  virtual void StartSystemPictureInPicture(
++      const base::UnguessableToken& session_token,
++      base::OnceCallback<void(bool success, const gfx::Size& window_size)>
++          callback) {}
++  virtual void SetSystemPiPBackgroundCallback(
++      base::RepeatingCallback<void(bool backgrounded)> callback) {}
++  virtual void CancelPendingStart() {}
+ };
+ 
+ }  // namespace content
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+index 73fa9f7..a1c79db 100644
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -49,6 +49,8 @@ source_set("content") {
+     "web_state/crc_web_view_proxy_impl.h",
+     "web_state/crc_web_view_proxy_impl.mm",
+     "web_state/crc_web_viewport_container_view.h",
++    "picture_in_picture/ios_video_overlay_window.h",
++    "picture_in_picture/ios_video_overlay_window.mm",
+     "web_state/crc_web_viewport_container_view.mm",
+   ]
+   public_deps = [ "//ui/base/mojom" ]
+@@ -88,7 +90,18 @@ source_set("content") {
+     "//net",
+     "//third_party/abseil-cpp:absl",
+     "//third_party/blink/public/common",
++    "//media",
++    "//third_party/libyuv",
+     "//ui/base",
++    "//ui/gfx/geometry",
++  ]
++  frameworks = [
++    "AVFoundation.framework",
++    "AVKit.framework",
++    "CoreMedia.framework",
++    "CoreVideo.framework",
++    "QuartzCore.framework",
++    "UIKit.framework",
+   ]
+   if (enable_extensions_core) {
+     deps += [
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index 6b954a9..37c310b 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -8,6 +8,8 @@ include_rules = [
+   "+components/javascript_dialogs",
+   "+components/js_injection",
+   "+content/public/browser",
++  "+media/base",
++  "+third_party/libyuv",
+   # keep-sorted end
+ ]
+ specific_include_rules = {
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index 45efec8..3330e9b 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -41,6 +41,7 @@ source_set("init") {
+     "//content/public/common/",
+     "//content/public/renderer",
+     "//ios/web/content",
++    "//ios/web/content",
+     "//ios/web/content:ui",
+     "//ios/web/content/common:non_code_constants",
+     "//ios/web/public",
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index bec4760..ff2809c 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -54,6 +54,8 @@
+ #import "ios/web/content/common/constants.h"
+ #import "ios/web/content/content_browser_context.h"
+ #import "ios/web/content/init/ios_browser_main_parts.h"
++#import "content/public/browser/overlay_window.h"
++#import "ios/web/content/picture_in_picture/ios_video_overlay_window.h"
+ #import "ios/web/content/ui/web_contents_view_delegate_impl.h"
+ #import "ios/web/public/browser_state.h"
+ #import "services/network/public/cpp/resource_request.h"
+@@ -258,6 +260,12 @@ IOSContentBrowserClient::CreateDevToolsManagerDelegate() {
+   return std::make_unique<content::DevToolsManagerDelegate>();
+ }
+ 
++std::unique_ptr<content::VideoOverlayWindow>
++IOSContentBrowserClient::CreateWindowForVideoPictureInPicture(
++    content::VideoPictureInPictureWindowController* controller) {
++  return std::make_unique<IOSVideoOverlayWindow>(controller);
++}
++
+ void IOSContentBrowserClient::OverrideWebPreferences(
+     content::WebContents* web_contents,
+     content::SiteInstance& main_frame_site,
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index 6ac2605..c7b5f69 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -33,6 +33,9 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+       content::BrowserContext* context) override;
+   std::unique_ptr<content::DevToolsManagerDelegate>
+   CreateDevToolsManagerDelegate() override;
++  std::unique_ptr<content::VideoOverlayWindow>
++  CreateWindowForVideoPictureInPicture(
++      content::VideoPictureInPictureWindowController* controller) override;
+   void OverrideWebPreferences(content::WebContents* web_contents,
+                               content::SiteInstance& main_frame_site,
+                               blink::web_pref::WebPreferences* prefs) override;
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.h b/ios/web/content/picture_in_picture/ios_video_overlay_window.h
+new file mode 100644
+index 0000000..5df249f
+--- /dev/null
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.h
+@@ -0,0 +1,112 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_WEB_CONTENT_PICTURE_IN_PICTURE_IOS_VIDEO_OVERLAY_WINDOW_H_
++#define IOS_WEB_CONTENT_PICTURE_IN_PICTURE_IOS_VIDEO_OVERLAY_WINDOW_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/unguessable_token.h"
++#include "content/public/browser/overlay_window.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace content {
++class VideoPictureInPictureWindowController;
++}  // namespace content
++
++namespace web {
++
++// Native iOS VideoOverlayWindow backed by AVSampleBufferDisplayLayer +
++// AVPictureInPictureController. Consumes zero-copy VideoToolbox CVPixelBuffers
++// (with bounded pooled NV12/P010 software fallback) directly in-process.
++class IOSVideoOverlayWindow final : public content::VideoOverlayWindow {
++ public:
++  explicit IOSVideoOverlayWindow(
++      content::VideoPictureInPictureWindowController* controller);
++  IOSVideoOverlayWindow(const IOSVideoOverlayWindow&) = delete;
++  IOSVideoOverlayWindow& operator=(const IOSVideoOverlayWindow&) = delete;
++  ~IOSVideoOverlayWindow() override;
++
++  // content::VideoOverlayWindow:
++  bool IsActive() const override;
++  void Close() override;
++  void ShowInactive() override;
++  void Hide() override;
++  bool IsVisible() const override;
++  gfx::Rect GetBounds() override;
++  void UpdateNaturalSize(const gfx::Size& natural_size) override;
++  void SetPlaybackState(PlaybackState playback_state) override;
++  void SetPlayPauseButtonVisibility(bool is_visible) override;
++  void SetSkipAdButtonVisibility(bool is_visible) override;
++  void SetNextTrackButtonVisibility(bool is_visible) override;
++  void SetPreviousTrackButtonVisibility(bool is_visible) override;
++  void SetHidePictureInPictureButtonVisibility(bool is_visible) override;
++  void SetMicrophoneMuted(bool muted) override;
++  void SetCameraState(bool turned_on) override;
++  void SetMediaMuted(bool muted) override;
++  void SetToggleMicrophoneButtonVisibility(bool is_visible) override;
++  void SetToggleCameraButtonVisibility(bool is_visible) override;
++  void SetHangUpButtonVisibility(bool is_visible) override;
++  void SetNextSlideButtonVisibility(bool is_visible) override;
++  void SetPreviousSlideButtonVisibility(bool is_visible) override;
++  void SetMediaPosition(const media_session::MediaPosition& position) override;
++  void SetSourceTitle(const std::u16string& source_title) override;
++  void SetFaviconImages(
++      const std::vector<media_session::MediaImage>& images) override;
++  void SetSurfaceId(const viz::SurfaceId& surface_id) override;
++  void SetPlaybackControlsVisibility(bool is_visible) override;
++  void SetImmersiveVideoOptions(
++      const content::ImmersiveOptions& options) override;
++
++  bool SupportsAsyncStart() const override;
++  void PrepareSystemPictureInPicture(
++      const base::UnguessableToken& session_token) override;
++  void StartSystemPictureInPicture(
++      const base::UnguessableToken& session_token,
++      base::OnceCallback<void(bool success, const gfx::Size& window_size)>
++          callback) override;
++  void SetSystemPiPBackgroundCallback(
++      base::RepeatingCallback<void(bool backgrounded)> callback) override;
++  void CancelPendingStart() override;
++
++  // Callbacks invoked on the main/UI thread by the Objective-C AVKit bridge.
++  void OnAVKitDidStart(uint64_t generation, const gfx::Size& render_size);
++  void OnAVKitFailedToStart(uint64_t generation);
++  void OnAVKitDidStop(uint64_t generation, bool should_pause_video);
++  void OnAVKitSetPlaying(bool playing);
++  void OnAVKitRenderSizeChanged(const gfx::Size& render_size);
++  void OnAVKitRestoreUI(base::OnceCallback<void(bool)> completion);
++  void OnSceneBackgroundChanged(bool backgrounded);
++
++ private:
++  struct Impl;
++
++  void CompletePendingStart(bool success, const gfx::Size& size);
++  void UnregisterCurrentSessionSink();
++
++  raw_ptr<content::VideoPictureInPictureWindowController> controller_;
++  std::unique_ptr<Impl> impl_;
++  std::optional<base::UnguessableToken> session_token_;
++  uint64_t generation_ = 0;
++  bool is_visible_ = false;
++  bool is_starting_ = false;
++  gfx::Size natural_size_{320, 180};
++  gfx::Size render_size_;
++  PlaybackState playback_state_ = PlaybackState::kPlaying;
++  std::optional<media_session::MediaPosition> media_position_;
++  base::OnceCallback<void(bool, const gfx::Size&)> pending_start_callback_;
++  base::RepeatingCallback<void(bool)> background_callback_;
++  base::WeakPtrFactory<IOSVideoOverlayWindow> weak_ptr_factory_{this};
++};
++
++}  // namespace web
++
++#endif  // IOS_WEB_CONTENT_PICTURE_IN_PICTURE_IOS_VIDEO_OVERLAY_WINDOW_H_
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+new file mode 100644
+index 0000000..6c9f7f9
+--- /dev/null
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+@@ -0,0 +1,1303 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/web/content/picture_in_picture/ios_video_overlay_window.h"
++
++#import <AVFoundation/AVFoundation.h>
++#import <AVKit/AVKit.h>
++#import <CoreMedia/CoreMedia.h>
++#import <CoreVideo/CoreVideo.h>
++#import <QuartzCore/QuartzCore.h>
++#import <UIKit/UIKit.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <utility>
++
++#include "base/apple/foundation_util.h"
++#include "base/apple/scoped_cftyperef.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/synchronization/lock.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "content/public/browser/video_picture_in_picture_window_controller.h"
++#include "content/public/browser/web_contents.h"
++#include "media/base/mac/ios_pip_frame_hub.h"
++#include "media/base/video_frame.h"
++#include "third_party/libyuv/include/libyuv/convert_from.h"
++#include "third_party/libyuv/include/libyuv/planar_functions.h"
++#include "ui/gfx/color_space.h"
++
++namespace {
++
++constexpr int kMaxSwPoolBuffers = 6;
++constexpr int kMaxConsecutiveDecodeFailures = 3;
++constexpr double kStartTimeoutSeconds = 6.0;
++
++UIWindow* FindTargetWindow(
++    content::VideoPictureInPictureWindowController* controller) {
++  if (controller && controller->GetWebContents()) {
++    UIView* native_view = controller->GetWebContents()->GetNativeView().Get();
++    if (native_view && native_view.window) {
++      return native_view.window;
++    }
++  }
++  for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
++    UIWindowScene* ws = base::apple::ObjCCast<UIWindowScene>(scene);
++    if (!ws) {
++      continue;
++    }
++    if (ws.activationState == UISceneActivationStateForegroundActive ||
++        ws.activationState == UISceneActivationStateForegroundInactive) {
++      for (UIWindow* w in ws.windows) {
++        if (w.isKeyWindow && w.rootViewController.view) {
++          return w;
++        }
++      }
++      for (UIWindow* w in ws.windows) {
++        if (!w.hidden && w.rootViewController.view) {
++          return w;
++        }
++      }
++    }
++  }
++  return nil;
++}
++
++void ApplyColorSpaceAttachments(CVPixelBufferRef buffer,
++                                const media::VideoFrame& frame) {
++  const gfx::ColorSpace cs = frame.ColorSpace();
++  if (!cs.IsValid()) {
++    return;
++  }
++  CFStringRef primaries = nullptr;
++  switch (cs.GetPrimaryID()) {
++    case gfx::ColorSpace::PrimaryID::BT709:
++      primaries = kCVImageBufferColorPrimaries_ITU_R_709_2;
++      break;
++    case gfx::ColorSpace::PrimaryID::BT2020:
++      primaries = kCVImageBufferColorPrimaries_ITU_R_2020;
++      break;
++    case gfx::ColorSpace::PrimaryID::P3:
++      primaries = kCVImageBufferColorPrimaries_P3_D65;
++      break;
++    default:
++      break;
++  }
++  if (primaries) {
++    CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, primaries,
++                          kCVAttachmentMode_ShouldPropagate);
++  }
++
++  CFStringRef transfer = nullptr;
++  switch (cs.GetTransferID()) {
++    case gfx::ColorSpace::TransferID::BT709:
++    case gfx::ColorSpace::TransferID::SMPTE170M:
++      transfer = kCVImageBufferTransferFunction_ITU_R_709_2;
++      break;
++    case gfx::ColorSpace::TransferID::PQ:
++      transfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++      break;
++    case gfx::ColorSpace::TransferID::HLG:
++      transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++      break;
++    case gfx::ColorSpace::TransferID::SRGB:
++      transfer = kCVImageBufferTransferFunction_sRGB;
++      break;
++    default:
++      break;
++  }
++  if (transfer) {
++    CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, transfer,
++                          kCVAttachmentMode_ShouldPropagate);
++  }
++
++  CFStringRef matrix = nullptr;
++  switch (cs.GetMatrixID()) {
++    case gfx::ColorSpace::MatrixID::BT709:
++      matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++      break;
++    case gfx::ColorSpace::MatrixID::BT2020_NCL:
++      matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020;
++      break;
++    case gfx::ColorSpace::MatrixID::SMPTE170M:
++    case gfx::ColorSpace::MatrixID::BT470BG:
++      matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++      break;
++    default:
++      break;
++  }
++  if (matrix) {
++    CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, matrix,
++                          kCVAttachmentMode_ShouldPropagate);
++  }
++}
++
++void ApplyCleanApertureAndAspect(CVPixelBufferRef buffer,
++                                 const media::VideoFrame& frame) {
++  const gfx::Rect vis = frame.visible_rect();
++  const int coded_w = static_cast<int>(CVPixelBufferGetWidth(buffer));
++  const int coded_h = static_cast<int>(CVPixelBufferGetHeight(buffer));
++  if (vis.width() > 0 && vis.height() > 0 &&
++      (vis.x() != 0 || vis.y() != 0 || vis.width() != coded_w ||
++       vis.height() != coded_h)) {
++    const double horiz_offset =
++        (vis.x() + vis.width() * 0.5) - (coded_w * 0.5);
++    const double vert_offset =
++        (vis.y() + vis.height() * 0.5) - (coded_h * 0.5);
++    NSDictionary* clean_aperture = @{
++      (__bridge NSString*)kCVImageBufferCleanApertureWidthKey : @(vis.width()),
++      (__bridge NSString*)kCVImageBufferCleanApertureHeightKey : @(vis.height()),
++      (__bridge NSString*)
++          kCVImageBufferCleanApertureHorizontalOffsetKey : @(horiz_offset),
++      (__bridge NSString*)
++          kCVImageBufferCleanApertureVerticalOffsetKey : @(vert_offset),
++    };
++    CVBufferSetAttachment(buffer, kCVImageBufferCleanApertureKey,
++                          (__bridge CFDictionaryRef)clean_aperture,
++                          kCVAttachmentMode_ShouldPropagate);
++  }
++
++  const gfx::Size nat = frame.natural_size();
++  if (vis.width() > 0 && vis.height() > 0 && nat.width() > 0 &&
++      nat.height() > 0 && (nat.width() != vis.width() ||
++                           nat.height() != vis.height())) {
++    const int64_t h_spacing =
++        static_cast<int64_t>(nat.width()) * vis.height();
++    const int64_t v_spacing =
++        static_cast<int64_t>(nat.height()) * vis.width();
++    if (h_spacing > 0 && v_spacing > 0) {
++      NSDictionary* par = @{
++        (__bridge NSString*)
++            kCVImageBufferPixelAspectRatioHorizontalSpacingKey : @(h_spacing),
++        (__bridge NSString*)
++            kCVImageBufferPixelAspectRatioVerticalSpacingKey : @(v_spacing),
++      };
++      CVBufferSetAttachment(buffer, kCVImageBufferPixelAspectRatioKey,
++                            (__bridge CFDictionaryRef)par,
++                            kCVAttachmentMode_ShouldPropagate);
++    }
++  }
++}
++
++class SoftwarePixelBufferPool {
++ public:
++  SoftwarePixelBufferPool() = default;
++  ~SoftwarePixelBufferPool() { Reset(); }
++
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> Convert(
++      const media::VideoFrame& frame) {
++    if (!frame.HasDirectCpuAccess()) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++    const media::VideoPixelFormat fmt = frame.format();
++    const bool is_10bit = (fmt == media::PIXEL_FORMAT_YUV420P10 ||
++                           fmt == media::PIXEL_FORMAT_P010LE);
++    const bool is_8bit = (fmt == media::PIXEL_FORMAT_I420 ||
++                          fmt == media::PIXEL_FORMAT_I420A ||
++                          fmt == media::PIXEL_FORMAT_NV12);
++    if (!is_8bit && !is_10bit) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++
++    const int width = frame.coded_size().width();
++    const int height = frame.coded_size().height();
++    if (width <= 0 || height <= 0) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++
++    const bool full_range =
++        frame.ColorSpace().GetRangeID() == gfx::ColorSpace::RangeID::FULL;
++    OSType cv_fmt;
++    if (is_10bit) {
++      cv_fmt = full_range ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
++                          : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++    } else {
++      cv_fmt = full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                          : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++    }
++
++    if (!pool_ || pool_width_ != width || pool_height_ != height ||
++        pool_format_ != cv_fmt) {
++      Reset();
++      NSDictionary* attrs = @{
++        (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey : @(cv_fmt),
++        (__bridge NSString*)kCVPixelBufferWidthKey : @(width),
++        (__bridge NSString*)kCVPixelBufferHeightKey : @(height),
++        (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey : @{},
++      };
++      CVPixelBufferPoolRef raw_pool = nullptr;
++      if (CVPixelBufferPoolCreate(kCFAllocatorDefault, nullptr,
++                                  (__bridge CFDictionaryRef)attrs,
++                                  &raw_pool) != kCVReturnSuccess ||
++          !raw_pool) {
++        return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++      }
++      pool_.reset(raw_pool);
++      pool_width_ = width;
++      pool_height_ = height;
++      pool_format_ = cv_fmt;
++    }
++
++    NSDictionary* aux = @{
++      (__bridge NSString*)
++          kCVPixelBufferPoolAllocationThresholdKey : @(kMaxSwPoolBuffers),
++    };
++    CVPixelBufferRef raw_buf = nullptr;
++    if (CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
++            kCFAllocatorDefault, pool_.get(), (__bridge CFDictionaryRef)aux,
++            &raw_buf) != kCVReturnSuccess ||
++        !raw_buf) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> dst(raw_buf);
++
++    if (CVPixelBufferLockBaseAddress(dst.get(), 0) != kCVReturnSuccess) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++
++    uint8_t* dst_y = static_cast<uint8_t*>(
++        CVPixelBufferGetBaseAddressOfPlane(dst.get(), 0));
++    uint8_t* dst_uv = static_cast<uint8_t*>(
++        CVPixelBufferGetBaseAddressOfPlane(dst.get(), 1));
++    const int dst_stride_y =
++        static_cast<int>(CVPixelBufferGetBytesPerRowOfPlane(dst.get(), 0));
++    const int dst_stride_uv =
++        static_cast<int>(CVPixelBufferGetBytesPerRowOfPlane(dst.get(), 1));
++
++    bool ok = false;
++    if (fmt == media::PIXEL_FORMAT_I420 || fmt == media::PIXEL_FORMAT_I420A) {
++      ok = libyuv::I420ToNV12(
++               frame.data(media::VideoFrame::Plane::kY),
++               frame.stride(media::VideoFrame::Plane::kY),
++               frame.data(media::VideoFrame::Plane::kU),
++               frame.stride(media::VideoFrame::Plane::kU),
++               frame.data(media::VideoFrame::Plane::kV),
++               frame.stride(media::VideoFrame::Plane::kV), dst_y, dst_stride_y,
++               dst_uv, dst_stride_uv, width, height) == 0;
++    } else if (fmt == media::PIXEL_FORMAT_NV12) {
++      ok = libyuv::NV12Copy(
++               frame.data(media::VideoFrame::Plane::kY),
++               frame.stride(media::VideoFrame::Plane::kY),
++               frame.data(media::VideoFrame::Plane::kUV),
++               frame.stride(media::VideoFrame::Plane::kUV), dst_y, dst_stride_y,
++               dst_uv, dst_stride_uv, width, height) == 0;
++    } else if (fmt == media::PIXEL_FORMAT_YUV420P10) {
++      ok = libyuv::I010ToP010(
++               reinterpret_cast<const uint16_t*>(
++                   frame.data(media::VideoFrame::Plane::kY)),
++               frame.stride(media::VideoFrame::Plane::kY) / 2,
++               reinterpret_cast<const uint16_t*>(
++                   frame.data(media::VideoFrame::Plane::kU)),
++               frame.stride(media::VideoFrame::Plane::kU) / 2,
++               reinterpret_cast<const uint16_t*>(
++                   frame.data(media::VideoFrame::Plane::kV)),
++               frame.stride(media::VideoFrame::Plane::kV) / 2,
++               reinterpret_cast<uint16_t*>(dst_y), dst_stride_y / 2,
++               reinterpret_cast<uint16_t*>(dst_uv), dst_stride_uv / 2, width,
++               height) == 0;
++    } else if (fmt == media::PIXEL_FORMAT_P010LE) {
++      const int uv_width_elems = 2 * ((width + 1) / 2);
++      const int uv_height = (height + 1) / 2;
++      libyuv::CopyPlane_16(reinterpret_cast<const uint16_t*>(
++                               frame.data(media::VideoFrame::Plane::kY)),
++                           frame.stride(media::VideoFrame::Plane::kY) / 2,
++                           reinterpret_cast<uint16_t*>(dst_y), dst_stride_y / 2,
++                           width, height);
++      libyuv::CopyPlane_16(reinterpret_cast<const uint16_t*>(
++                               frame.data(media::VideoFrame::Plane::kUV)),
++                           frame.stride(media::VideoFrame::Plane::kUV) / 2,
++                           reinterpret_cast<uint16_t*>(dst_uv),
++                           dst_stride_uv / 2, uv_width_elems, uv_height);
++      ok = true;
++    }
++
++    CVPixelBufferUnlockBaseAddress(dst.get(), 0);
++    if (!ok) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++    ApplyColorSpaceAttachments(dst.get(), frame);
++    ApplyCleanApertureAndAspect(dst.get(), frame);
++    return dst;
++  }
++
++  void Reset() {
++    if (pool_) {
++      CVPixelBufferPoolFlush(pool_.get(), kCVPixelBufferPoolFlushExcessBuffers);
++      pool_.reset();
++    }
++    pool_width_ = 0;
++    pool_height_ = 0;
++    pool_format_ = 0;
++  }
++
++ private:
++  base::apple::ScopedCFTypeRef<CVPixelBufferPoolRef> pool_;
++  int pool_width_ = 0;
++  int pool_height_ = 0;
++  OSType pool_format_ = 0;
++};
++
++struct PendingFrameSlot {
++  scoped_refptr<media::VideoFrame> frame;
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> hw_buffer;
++  uint64_t generation = 0;
++};
++
++}  // namespace
++
++@interface CuriumPiPHostView : UIView
++@property(nonatomic, readonly) AVSampleBufferDisplayLayer* displayLayer;
++@end
++
++@implementation CuriumPiPHostView
++
+++ (Class)layerClass {
++  return [AVSampleBufferDisplayLayer class];
++}
++
++- (AVSampleBufferDisplayLayer*)displayLayer {
++  return base::apple::ObjCCastStrict<AVSampleBufferDisplayLayer>(self.layer);
++}
++
++@end
++
++@interface CuriumPiPBridge
++    : NSObject <AVPictureInPictureControllerDelegate,
++                AVPictureInPictureSampleBufferPlaybackDelegate>
++- (instancetype)initWithOwner:(base::WeakPtr<web::IOSVideoOverlayWindow>)owner
++                     uiRunner:
++                         (scoped_refptr<base::SequencedTaskRunner>)uiRunner;
++- (void)prepareHostInWindow:(UIWindow*)window
++                naturalSize:(gfx::Size)naturalSize
++                 generation:(uint64_t)generation;
++- (void)startPiPForGeneration:(uint64_t)generation;
++- (void)stopPiPAndDetach:(BOOL)removeImage;
++- (void)updatePlaybackPaused:(BOOL)paused
++                    position:
++                        (std::optional<media_session::MediaPosition>)position;
++- (void)enqueueLatestFrame:(scoped_refptr<media::VideoFrame>)frame
++                  hwBuffer:
++                      (base::apple::ScopedCFTypeRef<CVPixelBufferRef>)hwBuffer
++                generation:(uint64_t)generation;
++@end
++
++@implementation CuriumPiPBridge {
++  base::WeakPtr<web::IOSVideoOverlayWindow> _owner;
++  scoped_refptr<base::SequencedTaskRunner> _uiRunner;
++  dispatch_queue_t _renderQueue;
++
++  // Main-thread owned UI/AVKit state.
++  CuriumPiPHostView* _hostView;
++  AVSampleBufferDisplayLayer* _displayLayer;
++  AVPictureInPictureController* _pipController;
++  __weak UIWindowScene* _windowScene;
++
++  id _didEnterBgObserver;
++  id _willEnterFgObserver;
++  id _failedToDecodeObserver;
++  id _requiresFlushObserver;
++
++  BOOL _observingPossible;
++  BOOL _waitingForPossible;
++  BOOL _pipActive;
++  BOOL _startAttemptActive;
++  uint64_t _startAttemptGeneration;
++  BOOL _mainPlaybackPaused;
++  double _mainDurationSeconds;
++  double _mainPlaybackRate;
++  double _mainPositionSeconds;
++  base::TimeTicks _mainPositionTimestamp;
++  uint64_t _activeGeneration;
++  std::atomic<uint64_t> _atomicGeneration;
++
++  // Render-queue-only owned rendering state (never mutated from main thread).
++  AVSampleBufferVideoRenderer* _renderRenderer;
++  base::apple::ScopedCFTypeRef<CMTimebaseRef> _renderTimebase;
++  BOOL _renderPlaybackPaused;
++  double _renderPlaybackRate;
++  BOOL _renderTimebasePrimed;
++  BOOL _isFlushing;
++  int _consecutiveFailures;
++
++  base::Lock _slotLock;
++  std::optional<PendingFrameSlot> _latestSlot;
++  bool _drainScheduled;
++  SoftwarePixelBufferPool _swPool;
++}
++
++- (instancetype)initWithOwner:(base::WeakPtr<web::IOSVideoOverlayWindow>)owner
++                     uiRunner:
++                         (scoped_refptr<base::SequencedTaskRunner>)uiRunner {
++  self = [super init];
++  if (self) {
++    _owner = std::move(owner);
++    _uiRunner = std::move(uiRunner);
++    _renderQueue = dispatch_queue_create("com.curium.ios.pip.renderer",
++                                         DISPATCH_QUEUE_SERIAL);
++    _atomicGeneration.store(0, std::memory_order_release);
++    _mainPlaybackRate = 1.0;
++    _mainDurationSeconds = NAN;
++    _renderPlaybackRate = 1.0;
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [self teardownObserversAndViews];
++}
++
++- (void)teardownObserversAndViews {
++  NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
++  if (_didEnterBgObserver) {
++    [nc removeObserver:_didEnterBgObserver];
++    _didEnterBgObserver = nil;
++  }
++  if (_willEnterFgObserver) {
++    [nc removeObserver:_willEnterFgObserver];
++    _willEnterFgObserver = nil;
++  }
++  if (_failedToDecodeObserver) {
++    [nc removeObserver:_failedToDecodeObserver];
++    _failedToDecodeObserver = nil;
++  }
++  if (_requiresFlushObserver) {
++    [nc removeObserver:_requiresFlushObserver];
++    _requiresFlushObserver = nil;
++  }
++  if (_observingPossible && _pipController) {
++    [_pipController removeObserver:self forKeyPath:@"pictureInPicturePossible"];
++    _observingPossible = NO;
++  }
++  _waitingForPossible = NO;
++  _startAttemptActive = NO;
++  _pipController.delegate = nil;
++  _pipController = nil;
++  _displayLayer = nil;
++  [_hostView removeFromSuperview];
++  _hostView = nil;
++  dispatch_queue_t q = _renderQueue;
++  if (q) {
++    dispatch_async(q, ^{
++      self->_renderRenderer = nil;
++      self->_renderTimebase.reset();
++      self->_renderTimebasePrimed = NO;
++      self->_isFlushing = NO;
++      self->_swPool.Reset();
++    });
++  }
++}
++
++- (void)prepareHostInWindow:(UIWindow*)window
++                naturalSize:(gfx::Size)naturalSize
++                 generation:(uint64_t)generation {
++  _activeGeneration = generation;
++  _atomicGeneration.store(generation, std::memory_order_release);
++  _startAttemptActive = NO;
++
++  if (!window || !window.rootViewController.view) {
++    return;
++  }
++
++  UIView* rootView = window.rootViewController.view;
++  if (!_hostView || _hostView.superview != rootView) {
++    [self teardownObserversAndViews];
++
++    const CGFloat w = naturalSize.width() > 0 ? 160.0 : 160.0;
++    const CGFloat aspect =
++        (naturalSize.width() > 0 && naturalSize.height() > 0)
++            ? static_cast<CGFloat>(naturalSize.height()) /
++                  static_cast<CGFloat>(naturalSize.width())
++            : (9.0 / 16.0);
++    const CGFloat h = std::clamp(w * aspect, 48.0, 240.0);
++
++    _hostView = [[CuriumPiPHostView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
++    _hostView.userInteractionEnabled = NO;
++    _hostView.backgroundColor = UIColor.clearColor;
++    _hostView.opaque = NO;
++    _hostView.accessibilityElementsHidden = YES;
++    // Place beneath opaque browser chrome, outside per-tab view subtrees.
++    [rootView insertSubview:_hostView atIndex:0];
++
++    _displayLayer = _hostView.displayLayer;
++    _displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
++    AVSampleBufferVideoRenderer* newRenderer =
++        _displayLayer.sampleBufferRenderer;
++
++    base::apple::ScopedCFTypeRef<CMTimebaseRef> newTimebase;
++    CMTimebaseRef raw_tb = nullptr;
++    if (CMTimebaseCreateWithSourceClock(kCFAllocatorDefault,
++                                        CMClockGetHostTimeClock(),
++                                        &raw_tb) == noErr &&
++        raw_tb) {
++      newTimebase.reset(raw_tb);
++      CMTimebaseSetTime(newTimebase.get(), kCMTimeZero);
++      CMTimebaseSetRate(newTimebase.get(), _mainPlaybackPaused ? 0.0 : 1.0);
++      _displayLayer.controlTimebase = newTimebase.get();
++    }
++    const BOOL initialPaused = _mainPlaybackPaused;
++    const double initialRate = _mainPlaybackRate;
++    __block base::apple::ScopedCFTypeRef<CMTimebaseRef> tbForQueue =
++        std::move(newTimebase);
++    dispatch_async(_renderQueue, ^{
++      self->_renderRenderer = newRenderer;
++      self->_renderTimebase = std::move(tbForQueue);
++      self->_renderPlaybackPaused = initialPaused;
++      self->_renderPlaybackRate = initialRate;
++      self->_renderTimebasePrimed = NO;
++      self->_isFlushing = NO;
++      self->_consecutiveFailures = 0;
++    });
++
++    AVPictureInPictureControllerContentSource* source =
++        [[AVPictureInPictureControllerContentSource alloc]
++            initWithSampleBufferDisplayLayer:_displayLayer
++                            playbackDelegate:self];
++    _pipController =
++        [[AVPictureInPictureController alloc] initWithContentSource:source];
++    _pipController.delegate = self;
++    _pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
++    _pipController.requiresLinearPlayback = YES;
++
++    [_pipController addObserver:self
++                     forKeyPath:@"pictureInPicturePossible"
++                        options:NSKeyValueObservingOptionNew
++                        context:nil];
++    _observingPossible = YES;
++
++    _windowScene = window.windowScene;
++    NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
++    __weak CuriumPiPBridge* weakSelf = self;
++    _didEnterBgObserver =
++        [nc addObserverForName:UISceneDidEnterBackgroundNotification
++                        object:_windowScene
++                         queue:NSOperationQueue.mainQueue
++                    usingBlock:^(NSNotification*) {
++                      [weakSelf notifySceneBackgrounded:YES];
++                    }];
++    _willEnterFgObserver =
++        [nc addObserverForName:UISceneWillEnterForegroundNotification
++                        object:_windowScene
++                         queue:NSOperationQueue.mainQueue
++                    usingBlock:^(NSNotification*) {
++                      [weakSelf notifySceneBackgrounded:NO];
++                    }];
++    _failedToDecodeObserver =
++        [nc addObserverForName:AVSampleBufferVideoRendererDidFailToDecodeNotification
++                        object:newRenderer
++                         queue:nil
++                    usingBlock:^(NSNotification* note) {
++                      NSError* err = note.userInfo
++                          [AVSampleBufferVideoRendererDidFailToDecodeNotificationErrorKey];
++                      LOG(WARNING) << "iOS PiP renderer decode failure: "
++                                   << (err ? err.localizedDescription.UTF8String
++                                           : "unknown");
++                      [weakSelf scheduleRendererRecoveryForGeneration:generation];
++                    }];
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    _requiresFlushObserver = [nc
++        addObserverForName:
++            AVSampleBufferVideoRendererRequiresFlushToResumeDecodingDidChangeNotification
++                    object:newRenderer
++                     queue:nil
++                usingBlock:^(NSNotification*) {
++                  [weakSelf scheduleRendererRecoveryForGeneration:generation];
++                }];
++#pragma clang diagnostic pop
++  } else {
++    dispatch_async(_renderQueue, ^{
++      [self flushRendererLockedWithRemoval:YES generation:generation];
++    });
++  }
++}
++
++- (void)startPiPForGeneration:(uint64_t)generation {
++  if (_activeGeneration != generation || !_pipController) {
++    [self notifyFailedToStartForGeneration:generation];
++    return;
++  }
++  if (![AVPictureInPictureController isPictureInPictureSupported]) {
++    [self notifyFailedToStartForGeneration:generation];
++    return;
++  }
++
++  _startAttemptGeneration = generation;
++  _startAttemptActive = YES;
++  [_pipController invalidatePlaybackState];
++
++  if (_pipController.isPictureInPictureActive) {
++    [self notifyDidStartForGeneration:generation];
++    return;
++  }
++
++  if (_pipController.isPictureInPicturePossible) {
++    _waitingForPossible = NO;
++    [_pipController startPictureInPicture];
++  } else {
++    _waitingForPossible = YES;
++  }
++
++  __weak CuriumPiPBridge* weakSelf = self;
++  dispatch_after(
++      dispatch_time(DISPATCH_TIME_NOW,
++                    static_cast<int64_t>(kStartTimeoutSeconds * NSEC_PER_SEC)),
++      dispatch_get_main_queue(), ^{
++        CuriumPiPBridge* strongSelf = weakSelf;
++        if (!strongSelf || strongSelf->_activeGeneration != generation) {
++          return;
++        }
++        if (!strongSelf->_pipActive) {
++          strongSelf->_waitingForPossible = NO;
++          [strongSelf notifyFailedToStartForGeneration:generation];
++        }
++      });
++}
++
++- (void)stopPiPAndDetach:(BOOL)removeImage {
++  const uint64_t nextGen = _activeGeneration + 1;
++  _activeGeneration = nextGen;
++  _atomicGeneration.store(nextGen, std::memory_order_release);
++  _waitingForPossible = NO;
++  _startAttemptActive = NO;
++  _pipActive = NO;
++
++  {
++    base::AutoLock lock(_slotLock);
++    _latestSlot.reset();
++  }
++
++  if (_pipController && _pipController.isPictureInPictureActive) {
++    [_pipController stopPictureInPicture];
++  }
++
++  dispatch_async(_renderQueue, ^{
++    self->_renderTimebasePrimed = NO;
++    self->_swPool.Reset();
++    if (self->_renderRenderer) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++      [self->_renderRenderer flushWithRemovalOfDisplayedImage:removeImage
++                                            completionHandler:nil];
++#pragma clang diagnostic pop
++    }
++  });
++}
++
++- (void)updatePlaybackPaused:(BOOL)paused
++                    position:
++                        (std::optional<media_session::MediaPosition>)position {
++  _mainPlaybackPaused = paused;
++  const bool hasPos = position.has_value();
++  double posSec = _mainPositionSeconds;
++  double rate = paused ? 0.0 : 1.0;
++  if (hasPos) {
++    const base::TimeDelta dur = position->duration();
++    _mainDurationSeconds = dur.is_max() ? INFINITY : dur.InSecondsF();
++    rate = paused ? 0.0 : position->playback_rate();
++    _mainPlaybackRate = rate;
++    posSec = position->GetPosition().InSecondsF();
++    _mainPositionSeconds = posSec;
++    _mainPositionTimestamp = base::TimeTicks::Now();
++  }
++  dispatch_async(_renderQueue, ^{
++    self->_renderPlaybackPaused = paused;
++    self->_renderPlaybackRate = rate;
++    if (self->_renderTimebase && self->_renderTimebasePrimed) {
++      if (hasPos) {
++        CMTime anchor = CMTimeMakeWithSeconds(posSec, 1000000);
++        CMTimebaseSetRateAndAnchorTime(
++            self->_renderTimebase.get(), rate, anchor,
++            CMClockGetTime(CMClockGetHostTimeClock()));
++      } else {
++        CMTimebaseSetRate(self->_renderTimebase.get(), rate);
++      }
++    }
++  });
++  [_pipController invalidatePlaybackState];
++}
++
++- (void)enqueueLatestFrame:(scoped_refptr<media::VideoFrame>)frame
++                  hwBuffer:
++                      (base::apple::ScopedCFTypeRef<CVPixelBufferRef>)hwBuffer
++                generation:(uint64_t)generation {
++  if (!frame ||
++      _atomicGeneration.load(std::memory_order_acquire) != generation) {
++    return;
++  }
++  if (frame->timestamp() == media::kNoTimestamp) {
++    return;
++  }
++
++  bool shouldSchedule = false;
++  {
++    base::AutoLock lock(_slotLock);
++    _latestSlot = PendingFrameSlot{std::move(frame), std::move(hwBuffer),
++                                   generation};
++    if (!_drainScheduled) {
++      _drainScheduled = true;
++      shouldSchedule = true;
++    }
++  }
++  if (shouldSchedule) {
++    __weak CuriumPiPBridge* weakSelf = self;
++    dispatch_async(_renderQueue, ^{
++      [weakSelf drainLatestFrameOnRenderQueue];
++    });
++  }
++}
++
++- (void)drainLatestFrameOnRenderQueue {
++  std::optional<PendingFrameSlot> slot;
++  {
++    base::AutoLock lock(_slotLock);
++    slot = std::move(_latestSlot);
++    _latestSlot.reset();
++    _drainScheduled = false;
++  }
++  if (!slot.has_value() || !slot->frame) {
++    return;
++  }
++  if (_atomicGeneration.load(std::memory_order_acquire) != slot->generation) {
++    return;
++  }
++  AVSampleBufferVideoRenderer* renderer = _renderRenderer;
++  if (!renderer || _isFlushing) {
++    return;
++  }
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  const BOOL needsFlush =
++      renderer.status == AVQueuedSampleBufferRenderingStatusFailed ||
++      renderer.requiresFlushToResumeDecoding;
++#pragma clang diagnostic pop
++  if (needsFlush) {
++    [self flushRendererLockedWithRemoval:NO generation:slot->generation];
++    return;
++  }
++  if (!renderer.isReadyForMoreMediaData) {
++    return;
++  }
++
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixelBuffer =
++      std::move(slot->hw_buffer);
++  if (!pixelBuffer) {
++    if (slot->frame->HasDirectCpuAccess()) {
++      pixelBuffer = _swPool.Convert(*slot->frame);
++    }
++  }
++  if (!pixelBuffer) {
++    return;
++  }
++
++  CMVideoFormatDescriptionRef rawDesc = nullptr;
++  if (CMVideoFormatDescriptionCreateForImageBuffer(
++          kCFAllocatorDefault, pixelBuffer.get(), &rawDesc) != noErr ||
++      !rawDesc) {
++    return;
++  }
++  base::apple::ScopedCFTypeRef<CMVideoFormatDescriptionRef> formatDesc(rawDesc);
++
++  const CMTime pts = CMTimeMake(slot->frame->timestamp().InMicroseconds(), 1000000);
++  CMTime duration = kCMTimeInvalid;
++  if (slot->frame->metadata().frame_duration.has_value() &&
++      slot->frame->metadata().frame_duration->is_positive()) {
++    duration = CMTimeMake(
++        slot->frame->metadata().frame_duration->InMicroseconds(), 1000000);
++  }
++  CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
++
++  CMSampleBufferRef rawSample = nullptr;
++  if (CMSampleBufferCreateReadyWithImageBuffer(
++          kCFAllocatorDefault, pixelBuffer.get(), formatDesc.get(), &timing,
++          &rawSample) != noErr ||
++      !rawSample) {
++    return;
++  }
++  base::apple::ScopedCFTypeRef<CMSampleBufferRef> sample(rawSample);
++
++  if (_renderTimebase) {
++    const double effRate = _renderPlaybackPaused ? 0.0 : _renderPlaybackRate;
++    if (!_renderTimebasePrimed) {
++      CMTimebaseSetRateAndAnchorTime(_renderTimebase.get(), effRate, pts,
++                                     CMClockGetTime(CMClockGetHostTimeClock()));
++      _renderTimebasePrimed = YES;
++    } else {
++      const CMTime currentTb = CMTimebaseGetTime(_renderTimebase.get());
++      const double drift =
++          std::fabs(CMTimeGetSeconds(CMTimeSubtract(pts, currentTb)));
++      if (drift > 0.35) {
++        CMTimebaseSetRateAndAnchorTime(
++            _renderTimebase.get(), effRate, pts,
++            CMClockGetTime(CMClockGetHostTimeClock()));
++      }
++    }
++  }
++
++  [renderer enqueueSampleBuffer:sample.get()];
++  _consecutiveFailures = 0;
++}
++
++- (void)scheduleRendererRecoveryForGeneration:(uint64_t)generation {
++  __weak CuriumPiPBridge* weakSelf = self;
++  dispatch_async(_renderQueue, ^{
++    [weakSelf flushRendererLockedWithRemoval:NO generation:generation];
++  });
++}
++
++- (void)flushRendererLockedWithRemoval:(BOOL)removeImage
++                            generation:(uint64_t)generation {
++  if (_atomicGeneration.load(std::memory_order_acquire) != generation ||
++      !_renderRenderer || _isFlushing) {
++    return;
++  }
++  if (++_consecutiveFailures > kMaxConsecutiveDecodeFailures) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      if (self->_activeGeneration == generation && self->_pipActive) {
++        [self->_pipController stopPictureInPicture];
++      }
++    });
++    return;
++  }
++  _isFlushing = YES;
++  _renderTimebasePrimed = NO;
++  __weak CuriumPiPBridge* weakSelf = self;
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  [_renderRenderer flushWithRemovalOfDisplayedImage:removeImage
++                            completionHandler:^{
++                              dispatch_async(self->_renderQueue, ^{
++                                CuriumPiPBridge* strongSelf = weakSelf;
++                                if (!strongSelf ||
++                                    strongSelf->_atomicGeneration.load(
++                                        std::memory_order_acquire) !=
++                                        generation) {
++                                  return;
++                                }
++                                strongSelf->_isFlushing = NO;
++                              });
++                            }];
++#pragma clang diagnostic pop
++}
++
++- (void)observeValueForKeyPath:(NSString*)keyPath
++                      ofObject:(id)object
++                        change:(NSDictionary<NSKeyValueChangeKey, id>*)change
++                       context:(void*)context {
++  if (object == _pipController &&
++      [keyPath isEqualToString:@"pictureInPicturePossible"]) {
++    if (_waitingForPossible && _pipController.isPictureInPicturePossible) {
++      _waitingForPossible = NO;
++      [_pipController startPictureInPicture];
++    }
++    return;
++  }
++  [super observeValueForKeyPath:keyPath
++                       ofObject:object
++                         change:change
++                        context:context];
++}
++
++- (void)notifyDidStartForGeneration:(uint64_t)generation {
++  _pipActive = YES;
++  _waitingForPossible = NO;
++  const gfx::Size sz(static_cast<int>(_hostView.bounds.size.width),
++                     static_cast<int>(_hostView.bounds.size.height));
++  auto owner = _owner;
++  _uiRunner->PostTask(FROM_HERE, base::BindOnce(
++                                     &web::IOSVideoOverlayWindow::OnAVKitDidStart,
++                                     owner, generation, sz));
++}
++
++- (void)notifyFailedToStartForGeneration:(uint64_t)generation {
++  _pipActive = NO;
++  _waitingForPossible = NO;
++  auto owner = _owner;
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitFailedToStart, owner,
++                     generation));
++}
++
++- (void)notifySceneBackgrounded:(BOOL)backgrounded {
++  auto owner = _owner;
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnSceneBackgroundChanged,
++                     owner, backgrounded));
++}
++
++#pragma mark - AVPictureInPictureControllerDelegate
++
++- (void)pictureInPictureControllerDidStartPictureInPicture:
++    (AVPictureInPictureController*)pictureInPictureController {
++  if (pictureInPictureController != _pipController || !_startAttemptActive ||
++      _activeGeneration != _startAttemptGeneration) {
++    [pictureInPictureController stopPictureInPicture];
++    return;
++  }
++  _startAttemptActive = NO;
++  [self notifyDidStartForGeneration:_startAttemptGeneration];
++}
++
++- (void)pictureInPictureController:
++            (AVPictureInPictureController*)pictureInPictureController
++    failedToStartPictureInPictureWithError:(NSError*)error {
++  LOG(WARNING) << "AVPictureInPictureController failed to start: "
++               << (error ? error.localizedDescription.UTF8String : "unknown");
++  if (pictureInPictureController != _pipController || !_startAttemptActive ||
++      _activeGeneration != _startAttemptGeneration) {
++    return;
++  }
++  _startAttemptActive = NO;
++  [self notifyFailedToStartForGeneration:_startAttemptGeneration];
++}
++
++- (void)pictureInPictureControllerDidStopPictureInPicture:
++    (AVPictureInPictureController*)pictureInPictureController {
++  if (pictureInPictureController != _pipController) {
++    return;
++  }
++  const uint64_t gen = _activeGeneration;
++  _startAttemptActive = NO;
++  _pipActive = NO;
++  auto owner = _owner;
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitDidStop, owner, gen,
++                     /*should_pause_video=*/false));
++}
++
++- (void)pictureInPictureController:
++            (AVPictureInPictureController*)pictureInPictureController
++    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:
++        (void (^)(BOOL restored))completionHandler {
++  auto owner = _owner;
++  __block void (^completion)(BOOL) = [completionHandler copy];
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitRestoreUI, owner,
++                     base::BindOnce(^(bool restored) {
++                       if (completion) {
++                         completion(restored);
++                       }
++                     })));
++}
++
++#pragma mark - AVPictureInPictureSampleBufferPlaybackDelegate
++
++- (void)pictureInPictureController:
++            (AVPictureInPictureController*)pictureInPictureController
++                        setPlaying:(BOOL)playing {
++  auto owner = _owner;
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitSetPlaying, owner,
++                     playing));
++}
++
++- (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:
++    (AVPictureInPictureController*)pictureInPictureController {
++  if (std::isnan(_mainDurationSeconds) || std::isinf(_mainDurationSeconds)) {
++    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
++  }
++  double estPos = _mainPositionSeconds;
++  if (!_mainPlaybackPaused && !_mainPositionTimestamp.is_null()) {
++    estPos += (base::TimeTicks::Now() - _mainPositionTimestamp).InSecondsF() *
++              _mainPlaybackRate;
++  }
++  const double span = std::max(std::max(0.0, _mainDurationSeconds), estPos);
++  return CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(span, 1000));
++}
++
++- (BOOL)pictureInPictureControllerIsPlaybackPaused:
++    (AVPictureInPictureController*)pictureInPictureController {
++  return _mainPlaybackPaused;
++}
++
++- (void)pictureInPictureController:
++            (AVPictureInPictureController*)pictureInPictureController
++         didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
++  if (newRenderSize.width <= 0 || newRenderSize.height <= 0) {
++    return;
++  }
++  const CGFloat scale =
++      _windowScene ? _windowScene.screen.scale : UIScreen.mainScreen.scale;
++  const int ptsW = std::max(
++      1, static_cast<int>(std::lround(newRenderSize.width / std::max<CGFloat>(scale, 1.0))));
++  const int ptsH = std::max(
++      1, static_cast<int>(std::lround(newRenderSize.height / std::max<CGFloat>(scale, 1.0))));
++  auto owner = _owner;
++  _uiRunner->PostTask(
++      FROM_HERE,
++      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitRenderSizeChanged,
++                     owner, gfx::Size(ptsW, ptsH)));
++}
++
++- (void)pictureInPictureController:
++            (AVPictureInPictureController*)pictureInPictureController
++                    skipByInterval:(CMTime)skipInterval
++                 completionHandler:(void (^)(void))completionHandler {
++  if (completionHandler) {
++    completionHandler();
++  }
++}
++
++@end
++
++namespace web {
++
++struct IOSVideoOverlayWindow::Impl {
++  CuriumPiPBridge* bridge = nil;
++};
++
++IOSVideoOverlayWindow::IOSVideoOverlayWindow(
++    content::VideoPictureInPictureWindowController* controller)
++    : controller_(controller), impl_(std::make_unique<Impl>()) {
++  impl_->bridge = [[CuriumPiPBridge alloc]
++      initWithOwner:weak_ptr_factory_.GetWeakPtr()
++           uiRunner:base::SequencedTaskRunner::GetCurrentDefault()];
++}
++
++IOSVideoOverlayWindow::~IOSVideoOverlayWindow() {
++  UnregisterCurrentSessionSink();
++  CompletePendingStart(/*success=*/false, gfx::Size());
++  [impl_->bridge stopPiPAndDetach:YES];
++  [impl_->bridge teardownObserversAndViews];
++}
++
++bool IOSVideoOverlayWindow::IsActive() const {
++  return is_visible_;
++}
++
++void IOSVideoOverlayWindow::Close() {
++  CancelPendingStart();
++  UnregisterCurrentSessionSink();
++  is_visible_ = false;
++  [impl_->bridge stopPiPAndDetach:YES];
++}
++
++void IOSVideoOverlayWindow::ShowInactive() {
++  is_visible_ = true;
++}
++
++void IOSVideoOverlayWindow::Hide() {
++  CancelPendingStart();
++  UnregisterCurrentSessionSink();
++  is_visible_ = false;
++  [impl_->bridge stopPiPAndDetach:YES];
++}
++
++bool IOSVideoOverlayWindow::IsVisible() const {
++  return is_visible_;
++}
++
++gfx::Rect IOSVideoOverlayWindow::GetBounds() {
++  const gfx::Size sz = render_size_.IsEmpty() ? natural_size_ : render_size_;
++  return gfx::Rect(sz);
++}
++
++void IOSVideoOverlayWindow::UpdateNaturalSize(const gfx::Size& natural_size) {
++  if (!natural_size.IsEmpty()) {
++    natural_size_ = natural_size;
++  }
++}
++
++void IOSVideoOverlayWindow::SetPlaybackState(PlaybackState playback_state) {
++  playback_state_ = playback_state;
++  const BOOL paused = (playback_state != PlaybackState::kPlaying);
++  [impl_->bridge updatePlaybackPaused:paused position:media_position_];
++}
++
++void IOSVideoOverlayWindow::SetPlayPauseButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetSkipAdButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetNextTrackButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetPreviousTrackButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetHidePictureInPictureButtonVisibility(
++    bool is_visible) {}
++void IOSVideoOverlayWindow::SetMicrophoneMuted(bool muted) {}
++void IOSVideoOverlayWindow::SetCameraState(bool turned_on) {}
++void IOSVideoOverlayWindow::SetMediaMuted(bool muted) {}
++void IOSVideoOverlayWindow::SetToggleMicrophoneButtonVisibility(
++    bool is_visible) {}
++void IOSVideoOverlayWindow::SetToggleCameraButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetHangUpButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetNextSlideButtonVisibility(bool is_visible) {}
++void IOSVideoOverlayWindow::SetPreviousSlideButtonVisibility(bool is_visible) {}
++
++void IOSVideoOverlayWindow::SetMediaPosition(
++    const media_session::MediaPosition& position) {
++  media_position_ = position;
++  const BOOL paused = (playback_state_ != PlaybackState::kPlaying);
++  [impl_->bridge updatePlaybackPaused:paused position:media_position_];
++}
++
++void IOSVideoOverlayWindow::SetSourceTitle(const std::u16string& source_title) {
++}
++
++void IOSVideoOverlayWindow::SetFaviconImages(
++    const std::vector<media_session::MediaImage>& images) {}
++
++void IOSVideoOverlayWindow::SetSurfaceId(const viz::SurfaceId& surface_id) {}
++
++void IOSVideoOverlayWindow::SetPlaybackControlsVisibility(bool is_visible) {}
++
++void IOSVideoOverlayWindow::SetImmersiveVideoOptions(
++    const content::ImmersiveOptions& options) {}
++
++bool IOSVideoOverlayWindow::SupportsAsyncStart() const {
++  return true;
++}
++
++void IOSVideoOverlayWindow::PrepareSystemPictureInPicture(
++    const base::UnguessableToken& session_token) {
++  UnregisterCurrentSessionSink();
++  ++generation_;
++  session_token_ = session_token;
++  const uint64_t gen = generation_;
++
++  UIWindow* targetWindow = FindTargetWindow(controller_);
++  [impl_->bridge prepareHostInWindow:targetWindow
++                         naturalSize:natural_size_
++                          generation:gen];
++
++  CuriumPiPBridge* bridge = impl_->bridge;
++  media::RegisterIOSPiPSessionSink(
++      session_token,
++      base::BindRepeating(
++          [](CuriumPiPBridge* bridge_ref, uint64_t expected_gen,
++             scoped_refptr<media::VideoFrame> frame,
++             base::apple::ScopedCFTypeRef<CVPixelBufferRef> hw_buffer) {
++            [bridge_ref enqueueLatestFrame:std::move(frame)
++                                  hwBuffer:std::move(hw_buffer)
++                                generation:expected_gen];
++          },
++          bridge, gen));
++}
++
++void IOSVideoOverlayWindow::StartSystemPictureInPicture(
++    const base::UnguessableToken& session_token,
++    base::OnceCallback<void(bool success, const gfx::Size& window_size)>
++        callback) {
++  if (!session_token_.has_value() || *session_token_ != session_token) {
++    std::move(callback).Run(false, gfx::Size());
++    return;
++  }
++  pending_start_callback_ = std::move(callback);
++  is_starting_ = true;
++  [impl_->bridge startPiPForGeneration:generation_];
++}
++
++void IOSVideoOverlayWindow::SetSystemPiPBackgroundCallback(
++    base::RepeatingCallback<void(bool backgrounded)> callback) {
++  background_callback_ = std::move(callback);
++}
++
++void IOSVideoOverlayWindow::CancelPendingStart() {
++  if (!is_starting_ && !pending_start_callback_ && !session_token_.has_value()) {
++    return;
++  }
++  ++generation_;
++  is_starting_ = false;
++  UnregisterCurrentSessionSink();
++  CompletePendingStart(/*success=*/false, gfx::Size());
++  [impl_->bridge stopPiPAndDetach:YES];
++}
++
++void IOSVideoOverlayWindow::OnAVKitDidStart(uint64_t generation,
++                                            const gfx::Size& render_size) {
++  if (generation != generation_) {
++    return;
++  }
++  is_starting_ = false;
++  is_visible_ = true;
++  if (!render_size.IsEmpty()) {
++    render_size_ = render_size;
++  }
++  CompletePendingStart(/*success=*/true, GetBounds().size());
++}
++
++void IOSVideoOverlayWindow::OnAVKitFailedToStart(uint64_t generation) {
++  if (generation != generation_) {
++    return;
++  }
++  is_starting_ = false;
++  is_visible_ = false;
++  UnregisterCurrentSessionSink();
++  CompletePendingStart(/*success=*/false, gfx::Size());
++}
++
++void IOSVideoOverlayWindow::OnAVKitDidStop(uint64_t generation,
++                                           bool should_pause_video) {
++  if (generation != generation_) {
++    return;
++  }
++  is_starting_ = false;
++  is_visible_ = false;
++  UnregisterCurrentSessionSink();
++  if (pending_start_callback_) {
++    CompletePendingStart(/*success=*/false, gfx::Size());
++    return;
++  }
++  if (controller_) {
++    controller_->OnWindowDestroyed(should_pause_video);
++  }
++}
++
++void IOSVideoOverlayWindow::OnAVKitSetPlaying(bool playing) {
++  if (!controller_) {
++    return;
++  }
++  if (playing) {
++    controller_->Play();
++  } else {
++    controller_->Pause();
++  }
++}
++
++void IOSVideoOverlayWindow::OnAVKitRenderSizeChanged(
++    const gfx::Size& render_size) {
++  if (render_size.IsEmpty()) {
++    return;
++  }
++  render_size_ = render_size;
++  if (controller_) {
++    controller_->UpdateLayerBounds();
++  }
++}
++
++void IOSVideoOverlayWindow::OnAVKitRestoreUI(
++    base::OnceCallback<void(bool)> completion) {
++  if (controller_) {
++    controller_->FocusInitiator();
++  }
++  std::move(completion).Run(true);
++}
++
++void IOSVideoOverlayWindow::OnSceneBackgroundChanged(bool backgrounded) {
++  if (background_callback_) {
++    background_callback_.Run(backgrounded);
++  }
++}
++
++void IOSVideoOverlayWindow::CompletePendingStart(bool success,
++                                                 const gfx::Size& size) {
++  if (pending_start_callback_) {
++    std::move(pending_start_callback_).Run(success, size);
++  }
++}
++
++void IOSVideoOverlayWindow::UnregisterCurrentSessionSink() {
++  if (session_token_.has_value()) {
++    media::UnregisterIOSPiPSessionSink(*session_token_);
++    session_token_.reset();
++  }
++}
++
++}  // namespace web
+diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
+index e57fc2d..092233c 100644
+--- a/ios/web/content/web_state/content_web_state.h
++++ b/ios/web/content/web_state/content_web_state.h
+@@ -251,6 +251,10 @@ class ContentWebState : public WebState,
+ 
+   content::JavaScriptDialogManager* GetJavaScriptDialogManager(
+       content::WebContents* source) override;
++  bool IsPictureInPictureEnabled() const override;
++  content::PictureInPictureResult EnterPictureInPicture(
++      content::WebContents* web_contents) override;
++  void ExitPictureInPicture() override;
+   void RequestMediaAccessPermission(
+       content::WebContents* web_contents,
+       const content::MediaStreamRequest& request,
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index 7722339..fee9cfe 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -21,7 +21,10 @@
+ #import "content/public/browser/file_select_listener.h"
+ #import "content/public/browser/javascript_dialog_manager.h"
+ #import "content/public/browser/media_capture_devices.h"
++#import <AVKit/AVKit.h>
++
+ #import "content/public/browser/navigation_entry.h"
++#import "content/public/browser/video_picture_in_picture_window_controller.h"
+ #import "content/public/browser/navigation_handle.h"
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/render_process_host.h"
+@@ -1102,6 +1105,28 @@ void FilesChosen(scoped_refptr<content::FileSelectListener> listener,
+   return dialog;
+ }
+ 
++bool ContentWebState::IsPictureInPictureEnabled() const {
++  return [AVPictureInPictureController isPictureInPictureSupported];
++}
++
++content::PictureInPictureResult ContentWebState::EnterPictureInPicture(
++    content::WebContents* web_contents) {
++  if (![AVPictureInPictureController isPictureInPictureSupported]) {
++    return content::PictureInPictureResult::kNotSupported;
++  }
++  return content::PictureInPictureResult::kSuccess;
++}
++
++void ContentWebState::ExitPictureInPicture() {
++  if (!web_contents_) {
++    return;
++  }
++  if (auto* controller = content::PictureInPictureWindowController::
++          GetOrCreateVideoPictureInPictureController(web_contents_.get())) {
++    controller->Close(/*should_pause_video=*/false);
++  }
++}
++
+ namespace {
+ 
+ // The capture device the page asked for, or the first one.
+diff --git a/media/base/mac/BUILD.gn b/media/base/mac/BUILD.gn
+index 91ef45a..839d832 100644
+--- a/media/base/mac/BUILD.gn
++++ b/media/base/mac/BUILD.gn
+@@ -40,10 +40,22 @@ source_set("mac") {
+   }
+   configs += [ "//media:subcomponent_config" ]
+ 
++  if (is_ios) {
++    sources += [
++      "ios_pip_buffer_registry.h",
++      "ios_pip_buffer_registry.mm",
++      "ios_pip_frame_hub.h",
++      "ios_pip_frame_hub.mm",
++    ]
++  }
++
+   deps = [
+     "//media/base",
+     "//ui/gfx:color_space",
+   ]
++  if (is_ios) {
++    deps += [ "//gpu/command_buffer/common" ]
++  }
+ }
+ 
+ source_set("unit_tests") {
+diff --git a/media/base/mac/ios_pip_buffer_registry.h b/media/base/mac/ios_pip_buffer_registry.h
+new file mode 100644
+index 0000000..880658b
+--- /dev/null
++++ b/media/base/mac/ios_pip_buffer_registry.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_BASE_MAC_IOS_PIP_BUFFER_REGISTRY_H_
++#define MEDIA_BASE_MAC_IOS_PIP_BUFFER_REGISTRY_H_
++
++#include <CoreVideo/CoreVideo.h>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/unguessable_token.h"
++#include "gpu/command_buffer/common/mailbox.h"
++#include "media/base/media_export.h"
++
++namespace media {
++
++// Registers a retained VideoToolbox CVPixelBuffer alongside its originating
++// SharedImage mailbox so an in-process iOS Picture-in-Picture consumer can
++// safely acquire its own reference after Mojo VideoFrame deserialization.
++MEDIA_EXPORT void RegisterIOSPiPPixelBuffer(
++    const base::UnguessableToken& token,
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixel_buffer,
++    const gpu::Mailbox& mailbox);
++
++// Returns a newly retained CVPixelBufferRef iff |token| is registered and its
++// originating mailbox matches |expected_mailbox|.
++MEDIA_EXPORT base::apple::ScopedCFTypeRef<CVPixelBufferRef>
++CopyIOSPiPPixelBuffer(const base::UnguessableToken& token,
++                      const gpu::Mailbox& expected_mailbox);
++
++// Removes |token| from the registry and releases the registry's reference
++// outside the internal lock. Safe to call on any sequence.
++MEDIA_EXPORT void UnregisterIOSPiPPixelBuffer(
++    const base::UnguessableToken& token);
++
++}  // namespace media
++
++#endif  // MEDIA_BASE_MAC_IOS_PIP_BUFFER_REGISTRY_H_
+diff --git a/media/base/mac/ios_pip_buffer_registry.mm b/media/base/mac/ios_pip_buffer_registry.mm
+new file mode 100644
+index 0000000..63381fc
+--- /dev/null
++++ b/media/base/mac/ios_pip_buffer_registry.mm
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/base/mac/ios_pip_buffer_registry.h"
++
++#include <unordered_map>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++
++namespace media {
++
++namespace {
++
++struct BufferEntry {
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixel_buffer;
++  gpu::Mailbox mailbox;
++};
++
++class IOSPiPBufferRegistry {
++ public:
++  void Register(const base::UnguessableToken& token,
++                base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixel_buffer,
++                const gpu::Mailbox& mailbox) {
++    if (token.is_empty() || !pixel_buffer) {
++      return;
++    }
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> evicted;
++    {
++      base::AutoLock auto_lock(lock_);
++      auto it = entries_.find(token);
++      if (it != entries_.end()) {
++        evicted = std::move(it->second.pixel_buffer);
++        it->second.pixel_buffer = std::move(pixel_buffer);
++        it->second.mailbox = mailbox;
++      } else {
++        entries_.emplace(token, BufferEntry{std::move(pixel_buffer), mailbox});
++      }
++    }
++  }
++
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> Copy(
++      const base::UnguessableToken& token,
++      const gpu::Mailbox& expected_mailbox) {
++    if (token.is_empty() || expected_mailbox.IsZero()) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++    base::AutoLock auto_lock(lock_);
++    auto it = entries_.find(token);
++    if (it == entries_.end() || it->second.mailbox != expected_mailbox ||
++        !it->second.pixel_buffer) {
++      return base::apple::ScopedCFTypeRef<CVPixelBufferRef>();
++    }
++    return base::apple::ScopedCFTypeRef<CVPixelBufferRef>(
++        it->second.pixel_buffer.get(), base::scoped_policy::RETAIN);
++  }
++
++  void Unregister(const base::UnguessableToken& token) {
++    if (token.is_empty()) {
++      return;
++    }
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> released;
++    {
++      base::AutoLock auto_lock(lock_);
++      auto it = entries_.find(token);
++      if (it != entries_.end()) {
++        released = std::move(it->second.pixel_buffer);
++        entries_.erase(it);
++      }
++    }
++    // |released| drops its CF reference after unlocking.
++  }
++
++ private:
++  base::Lock lock_;
++  std::unordered_map<base::UnguessableToken,
++                     BufferEntry,
++                     base::UnguessableTokenHash>
++      entries_ GUARDED_BY(lock_);
++};
++
++IOSPiPBufferRegistry& GetRegistry() {
++  static base::NoDestructor<IOSPiPBufferRegistry> instance;
++  return *instance;
++}
++
++}  // namespace
++
++void RegisterIOSPiPPixelBuffer(
++    const base::UnguessableToken& token,
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixel_buffer,
++    const gpu::Mailbox& mailbox) {
++  GetRegistry().Register(token, std::move(pixel_buffer), mailbox);
++}
++
++base::apple::ScopedCFTypeRef<CVPixelBufferRef> CopyIOSPiPPixelBuffer(
++    const base::UnguessableToken& token,
++    const gpu::Mailbox& expected_mailbox) {
++  return GetRegistry().Copy(token, expected_mailbox);
++}
++
++void UnregisterIOSPiPPixelBuffer(const base::UnguessableToken& token) {
++  GetRegistry().Unregister(token);
++}
++
++}  // namespace media
+diff --git a/media/base/mac/ios_pip_frame_hub.h b/media/base/mac/ios_pip_frame_hub.h
+new file mode 100644
+index 0000000..7b63b44
+--- /dev/null
++++ b/media/base/mac/ios_pip_frame_hub.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_BASE_MAC_IOS_PIP_FRAME_HUB_H_
++#define MEDIA_BASE_MAC_IOS_PIP_FRAME_HUB_H_
++
++#include <CoreVideo/CoreVideo.h>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/unguessable_token.h"
++#include "media/base/media_export.h"
++
++namespace media {
++
++class VideoFrame;
++
++// Invoked on the VideoFrameCompositor sequence when a frame is produced for an
++// active in-process iOS Picture-in-Picture session. |hw_pixel_buffer| is
++// populated (with an owning retain) when the frame was backed by a registered
++// VideoToolbox CVPixelBuffer; otherwise software consumers may inspect |frame|.
++using IOSPiPFrameCallback = base::RepeatingCallback<void(
++    scoped_refptr<VideoFrame> frame,
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> hw_pixel_buffer)>;
++
++MEDIA_EXPORT void RegisterIOSPiPSessionSink(
++    const base::UnguessableToken& session_token,
++    IOSPiPFrameCallback callback);
++
++MEDIA_EXPORT void UnregisterIOSPiPSessionSink(
++    const base::UnguessableToken& session_token);
++
++MEDIA_EXPORT void DeliverIOSPiPFrame(
++    const base::UnguessableToken& session_token,
++    scoped_refptr<VideoFrame> frame);
++
++}  // namespace media
++
++#endif  // MEDIA_BASE_MAC_IOS_PIP_FRAME_HUB_H_
+diff --git a/media/base/mac/ios_pip_frame_hub.mm b/media/base/mac/ios_pip_frame_hub.mm
+new file mode 100644
+index 0000000..eac9428
+--- /dev/null
++++ b/media/base/mac/ios_pip_frame_hub.mm
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/base/mac/ios_pip_frame_hub.h"
++
++#include <unordered_map>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "media/base/mac/ios_pip_buffer_registry.h"
++#include "media/base/video_frame.h"
++
++namespace media {
++
++namespace {
++
++class IOSPiPFrameHub {
++ public:
++  void Register(const base::UnguessableToken& session_token,
++                IOSPiPFrameCallback callback) {
++    if (session_token.is_empty() || !callback) {
++      return;
++    }
++    base::AutoLock auto_lock(lock_);
++    sinks_[session_token] = std::move(callback);
++  }
++
++  void Unregister(const base::UnguessableToken& session_token) {
++    if (session_token.is_empty()) {
++      return;
++    }
++    IOSPiPFrameCallback removed;
++    {
++      base::AutoLock auto_lock(lock_);
++      auto it = sinks_.find(session_token);
++      if (it != sinks_.end()) {
++        removed = std::move(it->second);
++        sinks_.erase(it);
++      }
++    }
++  }
++
++  void Deliver(const base::UnguessableToken& session_token,
++               scoped_refptr<VideoFrame> frame) {
++    if (session_token.is_empty() || !frame) {
++      return;
++    }
++    IOSPiPFrameCallback callback;
++    {
++      base::AutoLock auto_lock(lock_);
++      auto it = sinks_.find(session_token);
++      if (it == sinks_.end()) {
++        return;
++      }
++      callback = it->second;
++    }
++
++    // Resolve the VideoToolbox CVPixelBuffer while holding a reference to the
++    // renderer |frame| so the producer VideoFrame cannot be recycled mid-lookup.
++    base::apple::ScopedCFTypeRef<CVPixelBufferRef> hw_pixel_buffer;
++    if (frame->metadata().ios_pip_buffer_token.has_value() &&
++        frame->HasSharedImage() && frame->shared_image()) {
++      hw_pixel_buffer = CopyIOSPiPPixelBuffer(
++          *frame->metadata().ios_pip_buffer_token,
++          frame->shared_image()->mailbox());
++    }
++
++    callback.Run(std::move(frame), std::move(hw_pixel_buffer));
++  }
++
++ private:
++  base::Lock lock_;
++  std::unordered_map<base::UnguessableToken,
++                     IOSPiPFrameCallback,
++                     base::UnguessableTokenHash>
++      sinks_ GUARDED_BY(lock_);
++};
++
++IOSPiPFrameHub& GetHub() {
++  static base::NoDestructor<IOSPiPFrameHub> instance;
++  return *instance;
++}
++
++}  // namespace
++
++void RegisterIOSPiPSessionSink(const base::UnguessableToken& session_token,
++                               IOSPiPFrameCallback callback) {
++  GetHub().Register(session_token, std::move(callback));
++}
++
++void UnregisterIOSPiPSessionSink(const base::UnguessableToken& session_token) {
++  GetHub().Unregister(session_token);
++}
++
++void DeliverIOSPiPFrame(const base::UnguessableToken& session_token,
++                        scoped_refptr<VideoFrame> frame) {
++  GetHub().Deliver(session_token, std::move(frame));
++}
++
++}  // namespace media
+diff --git a/media/base/video_frame_metadata.cc b/media/base/video_frame_metadata.cc
+index 6428193..9d6f2a4 100644
+--- a/media/base/video_frame_metadata.cc
++++ b/media/base/video_frame_metadata.cc
+@@ -109,6 +109,9 @@ void VideoFrameMetadata::MergeMetadataFrom(
+ #if BUILDFLAG(IS_ANDROID)
+   MERGE_OPTIONAL_FIELD(ycbcr_info, metadata_source);
+ #endif
++#if BUILDFLAG(IS_IOS)
++  MERGE_OPTIONAL_FIELD(ios_pip_buffer_token, metadata_source);
++#endif
+ }
+ 
+ #undef MERGE_VALUE_FIELD
+diff --git a/media/base/video_frame_metadata.h b/media/base/video_frame_metadata.h
+index c3013c7..486feb1 100644
+--- a/media/base/video_frame_metadata.h
++++ b/media/base/video_frame_metadata.h
+@@ -265,6 +265,12 @@ struct MEDIA_EXPORT VideoFrameMetadata {
+   // or Camera2 via ImageReader.
+   std::optional<gpu::VulkanYCbCrInfo> ycbcr_info;
+ #endif
++
++#if BUILDFLAG(IS_IOS)
++  // Process-local token identifying the retained VideoToolbox CVPixelBuffer
++  // registered for in-process zero-copy system Picture-in-Picture.
++  std::optional<base::UnguessableToken> ios_pip_buffer_token;
++#endif
+ };
+ 
+ }  // namespace media
+diff --git a/media/gpu/mac/video_toolbox_frame_converter.cc b/media/gpu/mac/video_toolbox_frame_converter.cc
+index 3c55dc2..1434939 100644
+--- a/media/gpu/mac/video_toolbox_frame_converter.cc
++++ b/media/gpu/mac/video_toolbox_frame_converter.cc
+@@ -22,6 +22,11 @@
+ #include "media/base/format_utils.h"
+ #include "media/base/mac/color_space_util_mac.h"
+ #include "media/base/mac/video_frame_mac.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "base/unguessable_token.h"
++#include "media/base/mac/ios_pip_buffer_registry.h"
++#endif
+ #include "media/base/media_log.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/video_types.h"
+@@ -193,6 +198,13 @@ void VideoToolboxFrameConverter::Convert(
+   }
+ 
+ 
++#if BUILDFLAG(IS_IOS)
++  base::apple::ScopedCFTypeRef<CVPixelBufferRef> pip_pixel_buffer;
++  if (image && !metadata->session_metadata.has_alpha) {
++    pip_pixel_buffer.reset(image.get(), base::scoped_policy::RETAIN);
++  }
++#endif
++
+   // |image| must be retained until after the release sync token passes.
+   VideoFrame::ReleaseMailboxCB release_cb = base::BindPostTask(
+       gpu_task_runner_,
+@@ -209,6 +221,17 @@ void VideoToolboxFrameConverter::Convert(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (pip_pixel_buffer) {
++    const base::UnguessableToken pip_token = base::UnguessableToken::Create();
++    RegisterIOSPiPPixelBuffer(pip_token, std::move(pip_pixel_buffer),
++                              shared_image->mailbox());
++    frame->metadata().ios_pip_buffer_token = pip_token;
++    frame->AddDestructionObserver(
++        base::BindOnce(&UnregisterIOSPiPPixelBuffer, pip_token));
++  }
++#endif
++
+   frame->set_hdr_metadata(metadata->hdr_metadata);
+   if (metadata->duration != kNoTimestamp && !metadata->duration.is_zero()) {
+     frame->metadata().frame_duration = metadata->duration;
+diff --git a/media/mojo/mojom/media_player.mojom b/media/mojo/mojom/media_player.mojom
+index 8dcfa93..00078fb 100644
+--- a/media/mojo/mojom/media_player.mojom
++++ b/media/mojo/mojom/media_player.mojom
+@@ -6,6 +6,7 @@ module media.mojom;
+ 
+ import "media/mojo/mojom/media_types.mojom";
+ import "mojo/public/mojom/base/time.mojom";
++import "mojo/public/mojom/base/unguessable_token.mojom";
+ import "services/media_session/public/mojom/media_session.mojom";
+ import "ui/gfx/geometry/mojom/geometry.mojom";
+ 
+@@ -73,6 +74,22 @@ interface MediaPlayer {
+ 
+   // Request the media player to save the current video frame.
+   RequestSaveVideoFrame();
++
++  // Attaches an in-process iOS system Picture-in-Picture frame sink keyed by
++  // |session|. Returns false if the player cannot supply frames to system PiP.
++  [EnableIf=is_ios]
++  AttachSystemPictureInPicture(mojo_base.mojom.UnguessableToken session)
++      => (bool supported);
++
++  // Notifies the selected player whether the owning scene is backgrounded while
++  // system Picture-in-Picture is active, suppressing Viz submission when true.
++  [EnableIf=is_ios]
++  SetSystemPictureInPictureBackgrounded(
++      mojo_base.mojom.UnguessableToken session, bool backgrounded);
++
++  // Detaches the active system Picture-in-Picture session from this player.
++  [EnableIf=is_ios]
++  DetachSystemPictureInPicture(mojo_base.mojom.UnguessableToken session);
+ };
+ 
+ // Implemented by the MediaWebContentsObserver. The remote lives in the renderer
+diff --git a/media/mojo/mojom/media_types.mojom b/media/mojo/mojom/media_types.mojom
+index cb50caa..124e912 100644
+--- a/media/mojo/mojom/media_types.mojom
++++ b/media/mojo/mojom/media_types.mojom
+@@ -505,6 +505,9 @@ struct VideoFrameMetadata {
+ 
+   [EnableIf=is_android]
+   gpu.mojom.VulkanYCbCrInfo? ycbcr_info;
++
++  [EnableIf=is_ios]
++  mojo_base.mojom.UnguessableToken? ios_pip_buffer_token;
+ };
+ 
+ // This defines a mojo transport format for media::VideoFrame.
+diff --git a/media/mojo/mojom/video_frame_metadata_mojom_traits.cc b/media/mojo/mojom/video_frame_metadata_mojom_traits.cc
+index 5c4620c..b0fac66 100644
+--- a/media/mojo/mojom/video_frame_metadata_mojom_traits.cc
++++ b/media/mojo/mojom/video_frame_metadata_mojom_traits.cc
+@@ -147,6 +147,11 @@ bool StructTraits<media::mojom::VideoFrameMetadataDataView,
+   READ_AND_ASSIGN_OPT(gpu::VulkanYCbCrInfo, ycbcr_info, YcbcrInfo);
+ #endif
+ 
++#if BUILDFLAG(IS_IOS)
++  READ_AND_ASSIGN_OPT(base::UnguessableToken, ios_pip_buffer_token,
++                      IosPipBufferToken);
++#endif
++
+   return true;
+ }
+ 
+diff --git a/media/mojo/mojom/video_frame_metadata_mojom_traits.h b/media/mojo/mojom/video_frame_metadata_mojom_traits.h
+index 8ef981d..c40d867 100644
+--- a/media/mojo/mojom/video_frame_metadata_mojom_traits.h
++++ b/media/mojo/mojom/video_frame_metadata_mojom_traits.h
+@@ -248,6 +248,13 @@ struct StructTraits<media::mojom::VideoFrameMetadataDataView,
+   }
+ #endif
+ 
++#if BUILDFLAG(IS_IOS)
++  static const std::optional<base::UnguessableToken>& ios_pip_buffer_token(
++      const media::VideoFrameMetadata& input) {
++    return input.ios_pip_buffer_token;
++  }
++#endif
++
+   static bool Read(media::mojom::VideoFrameMetadataDataView input,
+                    media::VideoFrameMetadata* output);
+ };
+diff --git a/third_party/blink/public/platform/web_media_player.h b/third_party/blink/public/platform/web_media_player.h
+index 6741447..827e814 100644
+--- a/third_party/blink/public/platform/web_media_player.h
++++ b/third_party/blink/public/platform/web_media_player.h
+@@ -36,6 +36,8 @@
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
++#include "base/unguessable_token.h"
++#include "build/build_config.h"
+ #include "components/viz/common/surfaces/surface_id.h"
+ #include "media/base/picture_in_picture_events_info.h"
+ #include "media/base/video_frame.h"
+@@ -502,6 +504,18 @@ class WebMediaPlayer {
+   // Called when the media element's frame becomes visible. See the comment for
+   // `OnFrameHidden()` for details.
+   virtual void OnFrameShown() {}
++
++#if BUILDFLAG(IS_IOS)
++  virtual bool AttachSystemPictureInPicture(
++      const base::UnguessableToken& session) {
++    return false;
++  }
++  virtual void SetSystemPictureInPictureBackgrounded(
++      const base::UnguessableToken& session,
++      bool backgrounded) {}
++  virtual void DetachSystemPictureInPicture(
++      const base::UnguessableToken& session) {}
++#endif
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/public/platform/web_video_frame_submitter.h b/third_party/blink/public/platform/web_video_frame_submitter.h
+index ac8b09c..4bca0e2 100644
+--- a/third_party/blink/public/platform/web_video_frame_submitter.h
++++ b/third_party/blink/public/platform/web_video_frame_submitter.h
+@@ -86,6 +86,10 @@ class BLINK_PLATFORM_EXPORT WebVideoFrameSubmitter
+   // Set whether frames should always be submitted regardless of visibility.
+   virtual void SetForceSubmit(bool) = 0;
+ 
++  // Suppresses Viz frame submission while native iOS Picture-in-Picture
++  // owns video presentation in a backgrounded scene.
++  virtual void SetSuppressForSystemPiPBackground(bool) {}
++
+   // Returns an adaptive estimate of when the next frame will be displayed,
+   // based on the observed compositor receive to present latency.
+   // Returns std::nullopt if the adaptive estimate isn't available.
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.cc b/third_party/blink/renderer/core/html/media/html_media_element.cc
+index fcac35c..15ffc73 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_media_element.cc
+@@ -5462,6 +5462,33 @@ void HTMLMediaElement::RecordAutoPictureInPictureInfo(
+ 
+ void HTMLMediaElement::RequestSaveVideoFrame() {}
+ 
++#if BUILDFLAG(IS_IOS)
++void HTMLMediaElement::AttachSystemPictureInPicture(
++    const base::UnguessableToken& session,
++    AttachSystemPictureInPictureCallback callback) {
++  bool supported =
++      web_media_player_ &&
++      web_media_player_->AttachSystemPictureInPicture(session);
++  std::move(callback).Run(supported);
++}
++
++void HTMLMediaElement::SetSystemPictureInPictureBackgrounded(
++    const base::UnguessableToken& session,
++    bool backgrounded) {
++  if (web_media_player_) {
++    web_media_player_->SetSystemPictureInPictureBackgrounded(session,
++                                                             backgrounded);
++  }
++}
++
++void HTMLMediaElement::DetachSystemPictureInPicture(
++    const base::UnguessableToken& session) {
++  if (web_media_player_) {
++    web_media_player_->DetachSystemPictureInPicture(session);
++  }
++}
++#endif
++
+ bool HTMLMediaElement::MediaShouldBeOpaque() const {
+   return !IsMediaDataCorsSameOrigin() && ready_state_ < kHaveMetadata &&
+          network_state_maximum_ >= NetworkState::kNetworkLoading;
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.h b/third_party/blink/renderer/core/html/media/html_media_element.h
+index dfbc60a..e5be898 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.h
++++ b/third_party/blink/renderer/core/html/media/html_media_element.h
+@@ -685,6 +685,16 @@ class CORE_EXPORT HTMLMediaElement
+       const media::PictureInPictureEventsInfo::AutoPipInfo&
+           auto_picture_in_picture_info) override;
+   void RequestSaveVideoFrame() override;
++#if BUILDFLAG(IS_IOS)
++  void AttachSystemPictureInPicture(
++      const base::UnguessableToken& session,
++      AttachSystemPictureInPictureCallback callback) override;
++  void SetSystemPictureInPictureBackgrounded(
++      const base::UnguessableToken& session,
++      bool backgrounded) override;
++  void DetachSystemPictureInPicture(
++      const base::UnguessableToken& session) override;
++#endif
+ 
+   void LoadTimerFired(TimerBase*);
+   void ProgressEventTimerFired();
+diff --git a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+index 235575b..9411b46 100644
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.h"
++#include "build/build_config.h"
+ 
+ #include <limits>
+ #include <utility>
+@@ -270,11 +271,13 @@ void PictureInPictureControllerImpl::OnEnteredPictureInPicture(
+   picture_in_picture_element_ = element;
+   picture_in_picture_element_->OnEnteredPictureInPicture();
+ 
++#if !BUILDFLAG(IS_IOS)
+   // Request that viz does not throttle our LayerTree's BeginFrame messages, in
+   // case this page generates them as a side-effect of driving picture-in-
+   // picture content.  See the header file for more details, or
+   // https://crbug.com/1232173
+   SetMayThrottleIfUndrawnFrames(false);
++#endif
+ 
+   picture_in_picture_window_ = MakeGarbageCollected<PictureInPictureWindow>(
+       GetExecutionContext(), picture_in_picture_window_size);
+@@ -286,12 +289,14 @@ void PictureInPictureControllerImpl::OnEnteredPictureInPicture(
+   if (resolver)
+     resolver->Resolve(picture_in_picture_window_);
+ 
++#if !BUILDFLAG(IS_IOS)
+   // Unregister the video frame sink from the element since it will be moved
+   // to be the child of the PiP window frame sink.
+   if (picture_in_picture_element_->GetWebMediaPlayer()) {
+     picture_in_picture_element_->GetWebMediaPlayer()
+         ->UnregisterFrameSinkHierarchy();
+   }
++#endif
+ 
+   // We need to initialize the media position for this window as we won't be
+   // updated with a position until the next time the player forces an update.
+@@ -330,11 +335,13 @@ void PictureInPictureControllerImpl::OnExitedPictureInPicture(
+   if (!GetSupplementable()->IsActive())
+     return;
+ 
++#if !BUILDFLAG(IS_IOS)
+   // Now that this widget is not responsible for providing the content for a
+   // Picture in Picture window, we should not be producing CompositorFrames
+   // while the widget is hidden.  Let viz know that throttling us is okay if we
+   // do that.
+   SetMayThrottleIfUndrawnFrames(true);
++#endif
+ 
+   // The Picture-in-Picture window and the Picture-in-Picture element
+   // should be either both set or both null.
+@@ -352,11 +359,13 @@ void PictureInPictureControllerImpl::OnExitedPictureInPicture(
+ 
+     picture_in_picture_window_ = nullptr;
+ 
++#if !BUILDFLAG(IS_IOS)
+     // Register the video frame sink back to the element when the PiP window
+     // is closed and if the video is not unset.
+     if (element->GetWebMediaPlayer()) {
+       element->GetWebMediaPlayer()->RegisterFrameSinkHierarchy();
+     }
++#endif
+   }
+ 
+   if (resolver)
+diff --git a/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc b/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
+index 6d01524..cfc3cf8 100644
+--- a/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
++++ b/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
+@@ -223,6 +223,10 @@ void VideoFrameSubmitter::DidReceiveFrame() {
+ bool VideoFrameSubmitter::IsDrivingFrameUpdates() const {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+ 
++  if (suppress_for_system_pip_background_) {
++    return false;
++  }
++
+   // We drive frame updates only when we believe that something is consuming
+   // them.  This is different than VideoLayer, which drives updates any time
+   // they're in the layer tree.
+@@ -535,7 +539,8 @@ void VideoFrameSubmitter::OnBeginFrame(
+   // Don't call UpdateCurrentFrame() for MISSED BeginFrames. Also don't call it
+   // after StopRendering() has been called (forbidden by API contract).
+   viz::BeginFrameAck current_begin_frame_ack(args, false);
+-  if (args.type == viz::BeginFrameArgs::MISSED || !is_rendering_) {
++  if (args.type == viz::BeginFrameArgs::MISSED || !is_rendering_ ||
++      suppress_for_system_pip_background_) {
+     compositor_frame_sink_->DidNotProduceFrame(current_begin_frame_ack);
+     frame_sorter_.AddFrameResult(
+         args,
+@@ -909,8 +914,20 @@ void VideoFrameSubmitter::SubmitSingleFrame() {
+   }
+ }
+ 
++void VideoFrameSubmitter::SetSuppressForSystemPiPBackground(bool suppress) {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  if (suppress_for_system_pip_background_ == suppress) {
++    return;
++  }
++  suppress_for_system_pip_background_ = suppress;
++  UpdateSubmissionState();
++}
++
+ bool VideoFrameSubmitter::ShouldSubmit() const {
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++  if (suppress_for_system_pip_background_) {
++    return false;
++  }
+   return (is_surface_visible_ && is_page_visible_) || force_submit_;
+ }
+ 
+diff --git a/third_party/blink/renderer/platform/graphics/video_frame_submitter.h b/third_party/blink/renderer/platform/graphics/video_frame_submitter.h
+index 015441a..434ed4d 100644
+--- a/third_party/blink/renderer/platform/graphics/video_frame_submitter.h
++++ b/third_party/blink/renderer/platform/graphics/video_frame_submitter.h
+@@ -70,6 +70,7 @@ class PLATFORM_EXPORT VideoFrameSubmitter
+   void SetIsPageVisible(bool is_visible) override;
+   void SetForceBeginFrames(bool force_begin_frames) override;
+   void SetForceSubmit(bool) override;
++  void SetSuppressForSystemPiPBackground(bool) override;
+   std::optional<base::TimeTicks> GetExpectedDisplayTime() const override;
+ 
+   // viz::ContextLostObserver implementation.
+@@ -225,6 +226,9 @@ class PLATFORM_EXPORT VideoFrameSubmitter
+   // by Picture-in-Picture mode to ensure submission occurs even off-screen.
+   bool force_submit_ = false;
+ 
++  // Suppresses Viz submission while native system PiP renders in background.
++  bool suppress_for_system_pip_background_ = false;
++
+   // Needs to be initialized in implementation because media isn't a public_dep
+   // of blink/platform.
+   media::VideoTransformation transform_;
+diff --git a/third_party/blink/renderer/platform/media/video_frame_compositor.cc b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+index a0e4a3f..93a7c75 100644
+--- a/third_party/blink/renderer/platform/media/video_frame_compositor.cc
++++ b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+@@ -15,6 +15,11 @@
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/video_frame.h"
++#include <algorithm>
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "media/base/mac/ios_pip_frame_hub.h"
++#endif
+ #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+@@ -265,6 +270,13 @@ void VideoFrameCompositor::UpdateCurrentFrameIfStale(UpdateType type) {
+   if (!rendering_ || !is_background_rendering_)
+     return;
+ 
++#if BUILDFLAG(IS_IOS)
++  // Native system PiP already drives background rendering at video cadence.
++  if (ios_pip_session_token_.has_value()) {
++    return;
++  }
++#endif
++
+   // If we have a client, and it is currently rendering, then it's not stale
+   // since the client is driving the frame updates at the proper rate.
+   if (type != UpdateType::kBypassClient && IsClientSinkAvailable() &&
+@@ -379,6 +391,13 @@ bool VideoFrameCompositor::ProcessNewFrame(
+   // Copy to a local variable to avoid potential deadlock when executing the
+   // callback.
+   OnNewFramePresentedCB frame_presented_cb;
++#if BUILDFLAG(IS_IOS)
++  scoped_refptr<media::VideoFrame> pip_frame;
++  std::optional<base::UnguessableToken> pip_session = ios_pip_session_token_;
++  if (pip_session.has_value()) {
++    pip_frame = frame;
++  }
++#endif
+   {
+     base::AutoLock lock(current_frame_lock_);
+ 
+@@ -390,6 +409,17 @@ bool VideoFrameCompositor::ProcessNewFrame(
+     frame_presented_cb = std::move(new_presented_frame_cb_);
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (pip_frame && pip_session.has_value()) {
++    media::DeliverIOSPiPFrame(*pip_session, std::move(pip_frame));
++    if (ios_pip_backgrounded_ || !IsClientSinkAvailable() ||
++        !client_->IsDrivingFrameUpdates()) {
++      base::AutoLock lock(current_frame_lock_);
++      rendered_last_frame_ = true;
++    }
++  }
++#endif
++
+   if (new_processed_frame_cb_) {
+     std::move(new_processed_frame_cb_)
+         .Run(tick_clock_->NowTicks(), is_frame_readable);
+@@ -415,6 +445,94 @@ void VideoFrameCompositor::SetForceSubmit(bool force_submit) {
+     submitter_->SetForceSubmit(force_submit);
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++base::TimeDelta VideoFrameCompositor::ComputeSystemPiPRenderInterval() {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  constexpr base::TimeDelta kDefaultInterval = base::Milliseconds(33);
++  constexpr base::TimeDelta kMinInterval = base::Milliseconds(16);
++  constexpr base::TimeDelta kMaxInterval = base::Milliseconds(67);
++  base::TimeDelta preferred = kDefaultInterval;
++  {
++    base::AutoLock lock(callback_lock_);
++    if (callback_) {
++      const base::TimeDelta candidate = callback_->GetPreferredRenderInterval();
++      if (candidate.is_positive() &&
++          !candidate.is_max() &&
++          candidate < base::Seconds(1)) {
++        preferred = candidate;
++      }
++    }
++  }
++  return std::clamp(preferred, kMinInterval, kMaxInterval);
++}
++
++void VideoFrameCompositor::RearmBackgroundTimer() {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  const bool use_fast_pip_cadence =
++      ios_pip_session_token_.has_value() &&
++      (ios_pip_backgrounded_ || !IsClientSinkAvailable() ||
++       !client_->IsDrivingFrameUpdates());
++  const base::TimeDelta delay =
++      use_fast_pip_cadence
++          ? ComputeSystemPiPRenderInterval()
++          : base::Milliseconds(kBackgroundRenderingTimeoutMs);
++  background_rendering_timer_.Start(
++      FROM_HERE, delay,
++      ConvertToBaseRepeatingCallback(CrossThreadBindRepeating(
++          &VideoFrameCompositor::BackgroundRender,
++          CrossThreadUnretained(this), RenderingMode::kBackground)));
++}
++
++void VideoFrameCompositor::AttachSystemPictureInPicture(
++    const base::UnguessableToken& session) {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  ios_pip_session_token_ = session;
++  ios_pip_backgrounded_ = false;
++  ios_pip_next_deadline_ = base::TimeTicks();
++  if (current_frame_) {
++    media::DeliverIOSPiPFrame(session, current_frame_);
++  }
++  if (rendering_ && background_rendering_enabled_) {
++    RearmBackgroundTimer();
++  }
++}
++
++void VideoFrameCompositor::SetSystemPictureInPictureBackgrounded(
++    const base::UnguessableToken& session,
++    bool backgrounded) {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  if (!ios_pip_session_token_.has_value() ||
++      *ios_pip_session_token_ != session) {
++    return;
++  }
++  ios_pip_backgrounded_ = backgrounded;
++  if (submitter_) {
++    submitter_->SetSuppressForSystemPiPBackground(backgrounded);
++  }
++  if (rendering_ && background_rendering_enabled_) {
++    RearmBackgroundTimer();
++  }
++}
++
++void VideoFrameCompositor::DetachSystemPictureInPicture(
++    const base::UnguessableToken& session) {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  if (!ios_pip_session_token_.has_value() ||
++      *ios_pip_session_token_ != session) {
++    return;
++  }
++  ios_pip_session_token_.reset();
++  ios_pip_backgrounded_ = false;
++  ios_pip_next_deadline_ = base::TimeTicks();
++  if (submitter_) {
++    submitter_->SetSuppressForSystemPiPBackground(false);
++  }
++  if (rendering_ && background_rendering_enabled_) {
++    RearmBackgroundTimer();
++  }
++}
++#endif
++
+ base::TimeDelta VideoFrameCompositor::GetLastIntervalWithoutLock()
+     NO_THREAD_SAFETY_ANALYSIS {
+   DCHECK(task_runner_->BelongsToCurrentThread());
+@@ -427,6 +545,24 @@ void VideoFrameCompositor::BackgroundRender(RenderingMode mode) {
+   DCHECK(task_runner_->BelongsToCurrentThread());
+   const base::TimeTicks now = tick_clock_->NowTicks();
+   last_background_render_ = now;
++#if BUILDFLAG(IS_IOS)
++  if (ios_pip_session_token_.has_value()) {
++    const base::TimeDelta interval = ComputeSystemPiPRenderInterval();
++    base::TimeTicks deadline_min = now;
++    if (!ios_pip_next_deadline_.is_null() &&
++        ios_pip_next_deadline_ >= now - interval * 2 &&
++        ios_pip_next_deadline_ <= now + interval * 2) {
++      deadline_min = ios_pip_next_deadline_;
++    }
++    const base::TimeTicks deadline_max = deadline_min + interval;
++    ios_pip_next_deadline_ = deadline_max;
++    bool new_frame = CallRender(deadline_min, deadline_max, mode);
++    if (new_frame && !ios_pip_backgrounded_ && IsClientSinkAvailable()) {
++      client_->DidReceiveFrame();
++    }
++    return;
++  }
++#endif
+   bool new_frame = CallRender(now, now + GetLastIntervalWithoutLock(), mode);
+   if (new_frame && IsClientSinkAvailable())
+     client_->DidReceiveFrame();
+@@ -443,35 +579,39 @@ bool VideoFrameCompositor::CallRender(base::TimeTicks deadline_min,
+     have_unseen_frame = !rendered_last_frame_ && HasCurrentFrame();
+   }
+ 
+-  base::AutoLock lock(callback_lock_);
++  bool new_frame = false;
++  {
++    base::AutoLock lock(callback_lock_);
+ 
+-  if (!callback_) {
+-    // Even if we no longer have a callback, return true if we have a frame
+-    // which |client_| hasn't seen before.
+-    return have_unseen_frame;
+-  }
++    if (!callback_) {
++      // Even if we no longer have a callback, return true if we have a frame
++      // which |client_| hasn't seen before.
++      return have_unseen_frame;
++    }
+ 
+-  DCHECK(rendering_);
+-
+-  // If the previous frame was never rendered and we're in the normal rendering
+-  // mode and haven't just exited background rendering, let the client know.
+-  //
+-  // We don't signal for mode == kBackground since we expect to drop frames. We
+-  // also don't signal for mode == kStartup since UpdateCurrentFrame() may occur
+-  // before the PutCurrentFrame() for the kStartup induced CallRender().
+-  const bool was_background_rendering = is_background_rendering_;
+-  if (have_unseen_frame && mode == RenderingMode::kNormal &&
+-      !was_background_rendering) {
+-    callback_->OnFrameDropped();
+-  }
++    DCHECK(rendering_);
++
++    // If the previous frame was never rendered and we're in the normal rendering
++    // mode and haven't just exited background rendering, let the client know.
++    //
++    // We don't signal for mode == kBackground since we expect to drop frames. We
++    // also don't signal for mode == kStartup since UpdateCurrentFrame() may occur
++    // before the PutCurrentFrame() for the kStartup induced CallRender().
++    const bool was_background_rendering = is_background_rendering_;
++    if (have_unseen_frame && mode == RenderingMode::kNormal &&
++        !was_background_rendering) {
++      callback_->OnFrameDropped();
++    }
+ 
+-  const bool new_frame = ProcessNewFrame(
+-      callback_->Render(deadline_min, deadline_max, mode), deadline_min, false);
++    new_frame = ProcessNewFrame(
++        callback_->Render(deadline_min, deadline_max, mode), deadline_min,
++        false);
+ 
+-  // In cases where mode == kStartup we still want to treat it like background
+-  // rendering mode since CallRender() wasn't generated by UpdateCurrentFrame().
+-  is_background_rendering_ = mode != RenderingMode::kNormal;
+-  last_interval_ = deadline_max - deadline_min;
++    // In cases where mode == kStartup we still want to treat it like background
++    // rendering mode since CallRender() wasn't generated by UpdateCurrentFrame().
++    is_background_rendering_ = mode != RenderingMode::kNormal;
++    last_interval_ = deadline_max - deadline_min;
++  }
+ 
+   // We may create a new frame here with background rendering, but the provider
+   // has no way of knowing that a new frame had been processed, so keep track of
+@@ -481,8 +621,13 @@ bool VideoFrameCompositor::CallRender(base::TimeTicks deadline_min,
+ 
+   // Restart the background rendering timer whether we're background rendering
+   // or not; in either case we should wait for |kBackgroundRenderingTimeoutMs|.
+-  if (background_rendering_enabled_)
++  if (background_rendering_enabled_) {
++#if BUILDFLAG(IS_IOS)
++    RearmBackgroundTimer();
++#else
+     background_rendering_timer_.Reset();
++#endif
++  }
+   return new_frame || had_new_background_frame;
+ }
+ 
+diff --git a/third_party/blink/renderer/platform/media/video_frame_compositor.h b/third_party/blink/renderer/platform/media/video_frame_compositor.h
+index 8f474a1..c0ac025 100644
+--- a/third_party/blink/renderer/platform/media/video_frame_compositor.h
++++ b/third_party/blink/renderer/platform/media/video_frame_compositor.h
+@@ -14,6 +14,8 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/thread_annotations.h"
+ #include "base/time/tick_clock.h"
++#include "base/unguessable_token.h"
++#include "build/build_config.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "cc/layers/surface_layer.h"
+@@ -157,6 +159,13 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+ 
+   // Notifies the |submitter_| that the frames must be submitted.
+   void SetForceSubmit(bool force_submit);
++#if BUILDFLAG(IS_IOS)
++  void AttachSystemPictureInPicture(const base::UnguessableToken& session);
++  void SetSystemPictureInPictureBackgrounded(
++      const base::UnguessableToken& session,
++      bool backgrounded);
++  void DetachSystemPictureInPicture(const base::UnguessableToken& session);
++#endif
+ 
+   void set_tick_clock_for_testing(const base::TickClock* tick_clock) {
+     tick_clock_ = tick_clock;
+@@ -280,6 +289,14 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+   base::TimeDelta last_interval_ GUARDED_BY(callback_lock_) =
+       base::Seconds(1.0 / 60);
+ 
++#if BUILDFLAG(IS_IOS)
++  void RearmBackgroundTimer();
++  base::TimeDelta ComputeSystemPiPRenderInterval();
++  std::optional<base::UnguessableToken> ios_pip_session_token_;
++  bool ios_pip_backgrounded_ = false;
++  base::TimeTicks ios_pip_next_deadline_;
++#endif
++
+   std::unique_ptr<WebVideoFrameSubmitter> submitter_;
+ 
+   base::WeakPtrFactory<VideoFrameCompositor> weak_ptr_factory_{this};
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index aeb168f..3ab0247 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -871,20 +871,29 @@ void WebMediaPlayerImpl::OnDisplayTypeChanged(
+   DVLOG(2) << __func__ << ": display_type=" << static_cast<int>(display_type);
+ 
+   if (surface_layer_for_video_enabled_) {
+-    PostCrossThreadTask(
+-        *vfc_task_runner_, FROM_HERE,
+-        CrossThreadBindOnce(
+-            &VideoFrameCompositor::SetForceSubmit,
+-            CrossThreadUnretained(compositor_.get()),
+-            display_type ==
+-                WebMediaPlayer::DisplayType::kVideoPictureInPicture));
++#if BUILDFLAG(IS_IOS)
++    const bool keep_inline_for_system_pip =
++        display_type == WebMediaPlayer::DisplayType::kVideoPictureInPicture &&
++        ios_pip_session_token_.has_value();
++#else
++    const bool keep_inline_for_system_pip = false;
++#endif
++    if (!keep_inline_for_system_pip) {
++      PostCrossThreadTask(
++          *vfc_task_runner_, FROM_HERE,
++          CrossThreadBindOnce(
++              &VideoFrameCompositor::SetForceSubmit,
++              CrossThreadUnretained(compositor_.get()),
++              display_type ==
++                  WebMediaPlayer::DisplayType::kVideoPictureInPicture));
++    }
+ 
+     if (display_type == WebMediaPlayer::DisplayType::kVideoPictureInPicture) {
+       // In picture in picture mode, since the video is compositing in the PIP
+       // windows, stop composting it in the original window. One exception is
+       // for persistent video, where can happen in auto-pip mode, where the
+       // video is not playing in the regular Picture-in-Picture mode.
+-      if (!client_->IsInAutoPIP()) {
++      if (!client_->IsInAutoPIP() && !keep_inline_for_system_pip) {
+         client_->SetCcLayer(nullptr);
+       }
+ 
+@@ -921,6 +930,51 @@ void WebMediaPlayerImpl::OnDisplayTypeChanged(
+   UpdatePlayState();
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++bool WebMediaPlayerImpl::AttachSystemPictureInPicture(
++    const base::UnguessableToken& session) {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++  if (!compositor_ || !vfc_task_runner_ || session.is_empty()) {
++    return false;
++  }
++  ios_pip_session_token_ = session;
++  PostCrossThreadTask(
++      *vfc_task_runner_, FROM_HERE,
++      CrossThreadBindOnce(&VideoFrameCompositor::AttachSystemPictureInPicture,
++                          CrossThreadUnretained(compositor_.get()), session));
++  return true;
++}
++
++void WebMediaPlayerImpl::SetSystemPictureInPictureBackgrounded(
++    const base::UnguessableToken& session,
++    bool backgrounded) {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++  if (!compositor_ || !vfc_task_runner_) {
++    return;
++  }
++  PostCrossThreadTask(
++      *vfc_task_runner_, FROM_HERE,
++      CrossThreadBindOnce(
++          &VideoFrameCompositor::SetSystemPictureInPictureBackgrounded,
++          CrossThreadUnretained(compositor_.get()), session, backgrounded));
++}
++
++void WebMediaPlayerImpl::DetachSystemPictureInPicture(
++    const base::UnguessableToken& session) {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++  if (ios_pip_session_token_.has_value() && *ios_pip_session_token_ == session) {
++    ios_pip_session_token_.reset();
++  }
++  if (!compositor_ || !vfc_task_runner_) {
++    return;
++  }
++  PostCrossThreadTask(
++      *vfc_task_runner_, FROM_HERE,
++      CrossThreadBindOnce(&VideoFrameCompositor::DetachSystemPictureInPicture,
++                          CrossThreadUnretained(compositor_.get()), session));
++}
++#endif
++
+ void WebMediaPlayerImpl::DoLoad(LoadType load_type,
+                                 const KURL& url,
+                                 CorsMode cors_mode,
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.h b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+index 5452644..bcf1522 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.h
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+@@ -288,6 +288,15 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+       WebFullscreenVideoStatus fullscreen_video_status) override;
+   void OnHasNativeControlsChanged(bool) override;
+   void OnDisplayTypeChanged(WebMediaPlayer::DisplayType display_type) override;
++#if BUILDFLAG(IS_IOS)
++  bool AttachSystemPictureInPicture(
++      const base::UnguessableToken& session) override;
++  void SetSystemPictureInPictureBackgrounded(
++      const base::UnguessableToken& session,
++      bool backgrounded) override;
++  void DetachSystemPictureInPicture(
++      const base::UnguessableToken& session) override;
++#endif
+ 
+   // WebMediaPlayerDelegate::Observer implementation.
+   void OnPageHidden() override;
+@@ -1125,6 +1134,9 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+   bool is_dominant_visible_content_ = false;
+ 
+   bool is_effectively_fullscreen_ = false;
++#if BUILDFLAG(IS_IOS)
++  std::optional<base::UnguessableToken> ios_pip_session_token_;
++#endif
+ 
+   base::CancelableOnceClosure have_enough_after_lazy_load_cb_;
+ 

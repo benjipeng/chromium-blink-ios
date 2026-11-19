@@ -28,6 +28,10 @@ SLICES = {
     "ios-arm64-simulator": "iPhoneSimulator",
 }
 EXTENSION_DIRS = {"bundled_extensions", "web_extensions"}
+ALLOWED_LPROJ = {
+    "Base.lproj", "en.lproj", "en_GB.lproj",
+    "zh_CN.lproj", "zh_TW.lproj", "zh_HK.lproj", "ja.lproj",
+}
 EXCLUDED = {
     "Chromium", "Frameworks", "_CodeSignature", "Assets.car", "Settings.bundle",
     "Intents.intentdefinition", "Metadata.appintents", "Info.plist", "PkgInfo",
@@ -79,7 +83,7 @@ def is_resource(path: PurePosixPath) -> bool:
     if len(path.parts) > 1:
         # Extension packages need their manifests and rule lists, which are JSON.
         return (path.parts[0] in EXTENSION_DIRS
-                or (path.parts[0].endswith(".lproj") and path.suffix != ".json"))
+                or (path.parts[0] in ALLOWED_LPROJ and path.suffix != ".json"))
     return (path.name == "icudtl.dat" or path.suffix in {".pak", ".js"}
             or path.match("error_page_*.html"))
 
