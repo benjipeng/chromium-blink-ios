@@ -29,10 +29,10 @@ index 6c37a6d..6942101 100644
    } else if (is_win) {
 diff --git a/v8/src/base/platform/ios-jit-memory.cc b/v8/src/base/platform/ios-jit-memory.cc
 new file mode 100644
-index 0000000..fbac921
+index 0000000..5ce8804
 --- /dev/null
 +++ b/v8/src/base/platform/ios-jit-memory.cc
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,394 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -41,9 +41,10 @@ index 0000000..fbac921
 +
 +#if defined(V8_OS_IOS)
 +
-+#include <TargetConditionals.h>
 +#include <dlfcn.h>
 +#include <libkern/OSCacheControl.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
 +#include <mach/mach.h>
 +#include <mach/vm_map.h>
 +#include <setjmp.h>
@@ -79,12 +80,15 @@ index 0000000..fbac921
 +constexpr size_t kMaxTxmPoolSize = 256 * 1024 * 1024;
 +constexpr uintptr_t kStikDebugStubReturn = 0xE0000069ULL;
 +
-+std::mutex g_init_mutex;
++// Leaked on purpose: a global std::mutex needs an exit-time destructor.
++std::mutex& InitMutex() {
++  static std::mutex* const mutex = new std::mutex();
++  return *mutex;
++}
 +bool g_initialized = false;
 +bool g_txm_pool_leased = false;
 +
 +using PthreadJitWriteProtectFn = void (*)(int);
-+using BeMemoryWitnessSupportedFn = int (*)();
 +
 +std::atomic<PthreadJitWriteProtectFn> g_pthread_jit_write_protect{nullptr};
 +
@@ -193,6 +197,27 @@ index 0000000..fbac921
 +      std::memory_order_release);
 +}
 +
++// The engine ships as one device binary, and its simulator slice is that same
++// code relabeled with vtool, so TARGET_OS_SIMULATOR cannot tell the two apart.
++// The main executable's LC_BUILD_VERSION names the platform dyld is running.
++bool IsRunningInSimulator() {
++  const mach_header* header = _dyld_get_image_header(0);
++  if (header == nullptr || header->magic != MH_MAGIC_64) {
++    return false;
++  }
++  const auto* command = reinterpret_cast<const load_command*>(
++      reinterpret_cast<const uint8_t*>(header) + sizeof(mach_header_64));
++  for (uint32_t i = 0; i < header->ncmds; ++i) {
++    if (command->cmd == LC_BUILD_VERSION) {
++      return reinterpret_cast<const build_version_command*>(command)
++                 ->platform == PLATFORM_IOSSIMULATOR;
++    }
++    command = reinterpret_cast<const load_command*>(
++        reinterpret_cast<const uint8_t*>(command) + command->cmdsize);
++  }
++  return false;
++}
++
 +IOSJitMode ProbeNativeMapJit() {
 +  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
 +  void* mem = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -200,16 +225,6 @@ index 0000000..fbac921
 +  if (mem == MAP_FAILED) {
 +    return IOSJitMode::kDisabled;
 +  }
-+
-+#if !TARGET_OS_SIMULATOR
-+  auto be_supported = reinterpret_cast<BeMemoryWitnessSupportedFn>(
-+      dlsym(RTLD_DEFAULT,
-+            "be_memory_inline_jit_restrict_with_witness_supported"));
-+  if (be_supported && be_supported() != 0) {
-+    munmap(mem, page_size);
-+    return IOSJitMode::kBrowserEngineCore;
-+  }
-+#endif
 +
 +  ResolveNativeWriteProtect();
 +  volatile bool ok = false;
@@ -237,7 +252,7 @@ index 0000000..fbac921
 +                     uintptr_t* out_rx_base,
 +                     size_t* out_rx_size,
 +                     intptr_t* out_rw_delta) {
-+#if !TARGET_OS_SIMULATOR && (defined(__arm64__) || defined(__aarch64__))
++#if defined(__arm64__) || defined(__aarch64__)
 +  if (!IsTracedAndDebugged()) {
 +    return false;
 +  }
@@ -323,14 +338,20 @@ index 0000000..fbac921
 +// static
 +IOSJitMode IOSJitMemory::Initialize(size_t pool_size_bytes,
 +                                    bool allow_txm_brk) {
-+  std::lock_guard<std::mutex> lock(g_init_mutex);
++  std::lock_guard<std::mutex> lock(InitMutex());
 +  if (g_initialized) {
 +    return GetMode();
 +  }
 +  g_initialized = true;
 +
-+  IOSJitMode native_mode = ProbeNativeMapJit();
-+  if (native_mode != IOSJitMode::kDisabled) {
++  // On the Simulator, MAP_JIT behaves as on macOS and V8's own code range can
++  // follow the probe's scratch mapping. On a device, a process gets a single
++  // MAP_JIT region, which the probe would spend before V8 reserves its code
++  // range, and TXM rejects writable executable pages anyway. Devices therefore
++  // use only the debugger-blessed TXM pool. BrowserEngineCore is never
++  // selected: it requires BrowserEngineKit entitlements that Curium lacks.
++  if (IsRunningInSimulator()) {
++    const IOSJitMode native_mode = ProbeNativeMapJit();
 +    mode_.store(static_cast<int>(native_mode), std::memory_order_release);
 +    return native_mode;
 +  }
@@ -356,7 +377,7 @@ index 0000000..fbac921
 +
 +// static
 +void* IOSJitMemory::TryAcquireTxmPool(size_t length, size_t alignment) {
-+  std::lock_guard<std::mutex> lock(g_init_mutex);
++  std::lock_guard<std::mutex> lock(InitMutex());
 +  if (!IsTxmDualMap() || g_txm_pool_leased) {
 +    return nullptr;
 +  }
@@ -374,7 +395,7 @@ index 0000000..fbac921
 +
 +// static
 +bool IOSJitMemory::ReleaseTxmPool(void* address) {
-+  std::lock_guard<std::mutex> lock(g_init_mutex);
++  std::lock_guard<std::mutex> lock(InitMutex());
 +  if (reinterpret_cast<uintptr_t>(address) !=
 +      txm_rx_base_.load(std::memory_order_relaxed)) {
 +    return false;

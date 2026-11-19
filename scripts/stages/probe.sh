@@ -105,6 +105,7 @@ obj/third_party/blink/renderer/platform/media/media/video_frame_compositor.o
 obj/third_party/blink/renderer/platform/media/media/web_media_player_impl.o
 obj/content/app/app/content_main.o
 obj/v8/v8_libbase/ios-jit-memory.o
+obj/third_party/blink/renderer/modules/webaudio/webaudio/audio_context.o
 EOF
   python3 - <<'PY'
 import os

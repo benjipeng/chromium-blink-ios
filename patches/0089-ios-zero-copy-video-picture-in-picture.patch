@@ -3264,3 +3264,35 @@ index 5452644..bcf1522 100644
  
    base::CancelableOnceClosure have_enough_after_lazy_load_cb_;
  
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_context.h b/third_party/blink/renderer/modules/webaudio/audio_context.h
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.h
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.h
+@@ -11,6 +11,7 @@
+ #include "base/gtest_prod_util.h"
+ #include "base/sequence_checker.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "media/mojo/mojom/media_player.mojom-blink.h"
+ #include "third_party/blink/public/mojom/mediastream/media_devices.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
+@@ -202,6 +203,20 @@
+       const media::PictureInPictureEventsInfo::AutoPipInfo&
+           auto_picture_in_picture_info) override {}
+   void RequestSaveVideoFrame() override {}
++#if BUILDFLAG(IS_IOS)
++  // System Picture-in-Picture is video-only; an AudioContext never supplies
++  // frames.
++  void AttachSystemPictureInPicture(
++      const base::UnguessableToken& session,
++      AttachSystemPictureInPictureCallback callback) override {
++    std::move(callback).Run(false);
++  }
++  void SetSystemPictureInPictureBackgrounded(
++      const base::UnguessableToken& session,
++      bool backgrounded) override {}
++  void DetachSystemPictureInPicture(
++      const base::UnguessableToken& session) override {}
++#endif
+ 
+   // BaseAudioContext override to enable UseCounter.
+   // https://webaudio.github.io/web-audio-api/#BaseAudioContext

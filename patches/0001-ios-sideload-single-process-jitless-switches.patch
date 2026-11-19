@@ -3,21 +3,24 @@ From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS Blink: single-process, dual-mode JIT/jitless V8, and RAM-scaled budgets
 
 diff --git a/content/app/content_main.cc b/content/app/content_main.cc
-index 53ad968..9a2f7af 100644
+index 53ad968..0b7b0ae 100644
 --- a/content/app/content_main.cc
 +++ b/content/app/content_main.cc
-@@ -27,6 +27,10 @@
+@@ -26,7 +26,13 @@
+ #include "base/profiler/sample_metadata.h"
  #include "base/run_loop.h"
  #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
  #include "base/synchronization/condition_variable.h"
 +#include <stdlib.h>
 +#include <string>
++#include <vector>
 +
 +#include "base/system/sys_info.h"
  #include "base/task/single_thread_task_executor.h"
  #include "base/task/thread_pool/thread_pool_instance.h"
  #include "base/threading/platform_thread.h"
-@@ -113,6 +117,152 @@ void SetupSignalHandlers() {
+@@ -113,6 +119,151 @@ void SetupSignalHandlers() {
  
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
  
@@ -43,10 +46,10 @@ index 53ad968..9a2f7af 100644
 +}
 +
 +// [ios-blink-sideload] Dual-mode single-process defaults for sideloaded iOS.
-+// Runs V8 in full JIT mode when JIT memory is available (BrowserEngineCore,
-+// native MAP_JIT on Simulator / pre-TXM, or iOS 26/27 TXM dual-mapped pool via
-+// StikDebug universal.js under LiveContainer / explicit --curium-enable-jit),
-+// and fails closed to jitless + DrumBrake Wasm otherwise.
++// Runs V8 with JIT when JIT memory is available (native MAP_JIT on the
++// Simulator, or on a device the TXM dual-mapped pool blessed by StikDebug
++// under LiveContainer or with --curium-enable-jit), and fails closed to
++// jitless + DrumBrake Wasm otherwise.
 +void AppendSideloadSwitches(base::CommandLine* command_line) {
 +  // blink::switches::kJavaScriptFlags; spelled out to keep content/app free of
 +  // a direct Blink dependency.
@@ -77,8 +80,8 @@ index 53ad968..9a2f7af 100644
 +  //  - --curium-enable-jit explicitly requests JIT (including TXM brk #0xf00d).
 +  //  - Inside LiveContainer (LC_HOME_PATH set), auto-probe JIT including TXM
 +  //    when a debugger is attached ("Launch with JIT").
-+  //  - Outside LiveContainer, probe only non-trapping paths (BrowserEngineCore
-+  //    or native MAP_JIT) so Xcode/LLDB sessions never hit spurious brk traps.
++  //  - Outside LiveContainer, devices stay jitless so Xcode/LLDB sessions
++  //    never hit spurious brk traps; the Simulator still uses native MAP_JIT.
 +  bool jit_enabled = false;
 +  const bool force_disable_jit = command_line->HasSwitch("curium-disable-jit");
 +  if (!force_disable_jit && V8IOSJitPrepareForProcess != nullptr) {
@@ -105,33 +108,32 @@ index 53ad968..9a2f7af 100644
 +    jit_enabled = (jit_mode != 0);
 +  }
 +
-+  // Preserve caller-supplied --js-flags while ensuring RAM-scaled heap caps
-+  // and (when in jitless mode) authoritative --jitless / --wasm-jitless flags.
-+  // Keep --wasm-jitless last because V8 ignores flags after any unrecognized
-+  // flag, and DrumBrake requires --wasm-jitless under --jitless.
++  // gin applies --js-flags one comma-separated item at a time, after V8's
++  // feature flags. Parsing each item on its own keeps an unrecognized caller
++  // flag from hiding ours, and appending the jitless items last keeps a caller
++  // negation from undoing them.
 +  const std::string existing_js_flags =
 +      command_line->GetSwitchValueASCII(kJsFlagsSwitch);
-+  std::string js_flags;
-+  if (!jit_enabled) {
-+    js_flags = "--jitless";
-+  }
++  std::vector<std::string> js_flags;
 +  if (!existing_js_flags.empty()) {
-+    if (!js_flags.empty()) js_flags += " ";
-+    js_flags += existing_js_flags;
++    js_flags.push_back(existing_js_flags);
 +  }
 +  if (existing_js_flags.find("--max-old-space-size=") == std::string::npos) {
-+    if (!js_flags.empty()) js_flags += " ";
-+    js_flags += "--max-old-space-size=" + base::NumberToString(old_space_mb);
++    js_flags.push_back("--max-old-space-size=" +
++                       base::NumberToString(old_space_mb));
 +  }
 +  if (existing_js_flags.find("--max-semi-space-size=") == std::string::npos) {
-+    if (!js_flags.empty()) js_flags += " ";
-+    js_flags += "--max-semi-space-size=" + base::NumberToString(semi_space_mb);
++    js_flags.push_back("--max-semi-space-size=" +
++                       base::NumberToString(semi_space_mb));
 +  }
 +  if (!jit_enabled) {
-+    js_flags += " --wasm-jitless";
++    // DrumBrake runs WebAssembly only with --wasm-jitless under --jitless.
++    js_flags.push_back("--jitless");
++    js_flags.push_back("--wasm-jitless");
 +  }
 +  command_line->RemoveSwitch(kJsFlagsSwitch);
-+  command_line->AppendSwitchASCII(kJsFlagsSwitch, js_flags);
++  command_line->AppendSwitchASCII(kJsFlagsSwitch,
++                                  base::JoinString(js_flags, ","));
 +
 +  // In-process, the GPU watchdog killing a slow GPU thread takes the whole app
 +  // down; a slow first GL/ANGLE init is expected here.
@@ -170,7 +172,7 @@ index 53ad968..9a2f7af 100644
  bool IsSubprocess() {
    auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kProcessType);
-@@ -288,6 +438,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+@@ -288,6 +439,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
      // Enable spatial navigation; we interpret remote control swipes as arrow
      // keys.
      command_line->AppendSwitch(switches::kEnableSpatialNavigation);
