@@ -1,0 +1,5 @@
+module CuriumEngineContract {
+  umbrella header "CuriumEngineContract.h"
+  export *
+  module * { export * }
+}

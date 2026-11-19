@@ -1,0 +1,30 @@
+#import <Foundation/Foundation.h>
+@import CuriumEngineContract;
+
+NS_ASSUME_NONNULL_BEGIN
+
+void CuriumSetDesktopSite(id<CrIOSTabHostingV1> tab, BOOL enabled);
+BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
+id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
+
+typedef void (^NS_SWIFT_UI_ACTOR CuriumExtensionResult)(
+    NSDictionary<NSString *, id> *_Nullable result, NSError *_Nullable error);
+
+void CuriumPrepareExtension(id<CrIOSExtensionManagingV1> manager,
+                            NSString *source, BOOL isStore,
+                            CuriumExtensionResult completion);
+void CuriumConfirmExtension(id<CrIOSExtensionManagingV1> manager, NSString *token,
+                            CuriumExtensionResult completion);
+void CuriumCancelExtension(id<CrIOSExtensionManagingV1> manager, NSString *token);
+void CuriumRemoveExtension(id<CrIOSExtensionManagingV1> manager, NSString *identifier,
+                           void (^NS_SWIFT_UI_ACTOR completion)(BOOL, NSError *_Nullable));
+
+NSDictionary<NSString *, id> *_Nullable CuriumExtensionAction(
+    id<CrIOSExtensionManagingV1> manager, NSString *identifier, int32_t tabID);
+NSNumber *_Nullable CuriumExtensionBlockedCount(
+    id<CrIOSExtensionManagingV1> manager, NSString *identifier, int32_t tabID);
+id<CrIOSExtensionPopupHostingV1> _Nullable CuriumExtensionPopup(
+    id<CrIOSExtensionManagingV1> manager, NSString *identifier, int32_t tabID,
+    NSError **error);
+
+NS_ASSUME_NONNULL_END

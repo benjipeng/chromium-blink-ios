@@ -1,83 +1,61 @@
-# chromium-blink-ios
+# Curium
 
-Zero-local-checkout build pipeline for **Chromium on iOS (`use_blink = true`)** targeting non-jailbroken devices (sideloading / LiveContainer) using 100% free public GitHub Actions infrastructure.
+Curium (`com.appautomaton.curium`) is a native iOS browser with a Liquid Glass shell and a Chromium engine: Blink, jitless V8, and Manifest V3 extensions. One repository and one integration branch, `main`, hold the app and the engine build. GitHub Actions compiles Chromium; Xcode with the iOS 27.2 SDK builds the app locally without an upstream Chromium checkout.
 
-Build and package in GitHub Actions. For local verification on Apple silicon, use the [simulator guide](docs/simulator.md) to prepare a disposable copy of an Actions IPA. Neither path needs a sibling project or a local Chromium source tree.
+## Local app and engine handoff
 
----
+Open `Curium.xcodeproj` and select the `Curium` scheme. The Swift shell in `Curium/` builds against the Objective-C interface in [`EngineContract/`](EngineContract/README.md). When engine linking is enabled, the project selects the device or simulator slice from `Vendor/CuriumEngine/`.
+
+```sh
+scripts/sync_curium_engine.py                  # Download the Actions artifact and verify the IPA
+scripts/sync_curium_engine.py --ipa /path/to/Chromium-Blink-159.0.8149.0-arm64.ipa
+scripts/sync_curium_engine.py --status         # Inspect the handoff offline
+```
+
+Assembly requires Xcode on Apple silicon; downloads also require the GitHub CLI (`gh`). The tool checks the IPA bytes before assembly. Use `--ipa … --skip-sha256` only for disposable local test IPAs; the manifest marks the result as unverified.
+
+[`Kernel.lock`](Kernel.lock) identifies [run 44328959472](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44328959472) and [artifact 14443178991](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44328959472/artifacts/14443178991) for Chromium `159.0.8149.0`. The run came from `probe/extensions-gn` at `1f76114fbc0d5ca7f2b748a4f19fedc4d39edd79`, the commit carried forward onto `main`. The branch name is historical provenance.
+
+The current `KERNEL_IPA_SHA256` value identifies GitHub's outer artifact ZIP. The downloaded IPA hashes to `b34c8abc851a36e05f9a171c2bf73469f168d4b2eb1cdcc8ff3761f8e5973c88`, matching the checksum published by Actions. Verified assembly rejects the current pin until it records the IPA digest.
+
+The handoff contains `EarlyMallocZoneRegistration.xcframework`, `chrome_framework.xcframework`, and `Lottie.xcframework` when present. Each contains an ad hoc signed `ios-arm64` and `ios-arm64-simulator` slice. `EngineResources/` keeps ICU data, resource packs, localizations, scripts, error pages, and bundled extensions. The manifest records the source digest and the number of files and bytes retained, plus the uncompressed bytes omitted from app resources. It records assembly time in UTC; set `SOURCE_DATE_EPOCH` to fix that timestamp for reproducible runs.
+
+The M159 IPA is an assembly baseline. The shell's standalone mode is the default until the headless bridge and its allocator companion are in the engine artifact. Use the [simulator guide](docs/simulator.md) to run the original Chromium app on a disposable simulator copy.
 
 ## Architecture
 
-Upstream Chromium (`M159+`) supports cross-compiling `target_os = "ios"` (`arm64`) on Linux hosts via `ios_sdk_developer_dir`, `ld64.lld`, `llvm-ar`, and `//build/toolchain/apple/apple_tool_wrapper.gni`. This repository exploits that split across GitHub's free public runners (`xcode-27` + 20-way concurrent `ubuntu-24.04`) and GitHub Container Registry (`ghcr.io`):
+The remote build uses a pruned, revision-pinned source snapshot from `sync-source.yml`. GitHub Actions stores it in GHCR. Linux cross-compiles arm64 iOS code with `ld64.lld`; macOS supplies the pinned Apple tools and packages the result.
 
-1. **Layer 0 — Pruned Source Snapshot (`sync-source.yml`)**
-   - Runs once per pinned Chromium revision (`version.lock`).
-   - Uses Git Protocol v2 `--filter=blob:none` + `--no-cone` sparse checkout (`scripts/sparse_checkout.conf`) and `.gclient` `checkout_configuration = "small"` (`target_os_only = True`) to exclude `blink/web_tests` (200k+ files) and heavy test corpora before blob download, while preserving `//extensions/`, `//components/crx_file/`, and `//chrome/*/extensions/` for Chrome Web Extensions bring-up.
-   - Installs Darwin `compiler-rt` builtins (`libclang_rt.ios.a`) into Linux `llvm-build`, strips `.git` metadata, and pushes 1.5 GB OCI chunks to `ghcr.io/<owner>/<repo>/chromium-ios-src:<rev>`.
-
-2. **0 SDK stub (`xcode-27`)**
-   - Extracts the minimal `iPhoneOS.sdk` + Swift stub from exactly the pinned Xcode build (any other build fails), encrypted with `CI_ARTIFACT_KEY` (`AES-256-CBC` PBKDF2). Runs only when that Xcode's stub is missing.
-
-3. **1 Codegen (`ubuntu-24.04`)**
-   - GN makes every action wait on the compiled objects of all its deps. `scripts/rewrite_ninja_graph.py --mode prune` drops those object edges after `gn gen` (keeping each generator's ordering as order-only deps).
-   - `scripts/plan_shards.py --mode codegen` plans host tools, Rust, generated files and every generated input of the Apple edges on the real graph, minus anything whose build would run target compile/link/Swift or Apple tools. `scripts/diagnose_graph.py --check` gates the plan before compiling, so codegen never strays into later stages.
-
-4. **2 Apple tools (`xcode-27`)**
-   - Unpacks codegen's tree, verifies every generated file the Apple edges read is present, and reduces the graph to those edges (`--mode apple-only`), so the Mac runs only `swift`, `compile_xcassets`, `compile_ib_files`, and `intentbuilderc`, recording host-independent outputs via `scripts/apple_tool_wrapper.py`.
-
-5. **3 Compile × 18 (`ubuntu-24.04`, parallel)**
-   - Splits every target object across 18 fixed partitions by SHA-1, compiled concurrently on 4-vCPU runners with a `ccache` bucket per partition (`symbol_level = 0`, `use_siso = false`, `clang_use_chrome_plugins = false`).
-   - Each partition publishes its objects with a manifest (identity, paths, sha256) as its own checkpoint, so a failed partition is the only one a later run repeats.
-
-6. **4 Link (`ubuntu-24.04` + 16 GB SSD swap)**
-   - Imports all partitions, verifies each against today's plan and its sha256s, replaces exactly those compile edges (`--mode link-only`), proves the remaining plan compiles nothing, then links `Chromium.app` via `ld64.lld` and defers AppIntents metadata extraction.
-
-7. **5 Package IPA (`xcode-27`)**
-   - Runs deferred `appintentsmetadataprocessor` (`extract_metadata.py`) against the linked `Chromium` binary, strips unused BrowserEngineKit `.appex` stubs, optionally applies ad-hoc App Group entitlements, validates Mach-O headers with `vtool`, and emits `Chromium-Blink-<version>-arm64.ipa`.
+| Stage | Runner | Work |
+| --- | --- | --- |
+| 0 · SDK stub | macOS | Extract the pinned Xcode iPhoneOS SDK and Swift stub; publish the encrypted artifact. |
+| 1 · Codegen | Linux | Apply patches, generate and audit the Ninja graph, and build host tools and generated inputs. |
+| 2 · Apple tools | macOS | Run the Apple-only edges for Swift, assets, interface files, and intents. |
+| 3 · Compile | Linux | Build target objects across 18 stable partitions in parallel, with a separate `ccache` bucket per partition. |
+| 4 · Link | Linux | Verify the partition manifests and object hashes, then link `Chromium.app` without compiling. |
+| 5 · Package | macOS | Extract deferred AppIntents metadata, prune unused extension stubs, sign as configured, and publish the IPA and its SHA-256. |
 
 ### Checkpoints and resumption
 
-Each stage (and each compile partition) publishes one **write-once** checkpoint in `ghcr.io`, named by a key over exactly the inputs that shape its output: its epoch in `ci/epochs.json`, the upstream key, the source and SDK artifacts by digest, and the scripts and config listed for it in `scripts/plan_pipeline.py`. Workflow YAML is orchestration only and never part of a key. A run plans first and then does only the missing work; every job re-checks its checkpoint before starting, so re-running failed jobs reuses anything already published. Registry errors stop the run rather than being mistaken for missing checkpoints. Builds stop before the job deadline to leave time to persist caches and checkpoints.
+The pipeline plans before compiling and reuses existing GHCR checkpoints for codegen, Apple tools, each compile partition, and link. Keys derive from stage epochs, upstream keys, source and SDK digests, and the files listed in `scripts/plan_pipeline.py`. Workflow YAML and local app files do not shape these keys. Each job checks again before starting; a registry error stops the run, and only a confirmed miss triggers work. Failed attempts can resume missing work without discarding published checkpoints.
 
----
+### CI efficiency and cache reuse rules
 
-## Repository Setup
+Keep `patches/`, `args/`, `version.lock`, and the planner's `COMMON` scripts unchanged during Swift and Liquid Glass work. Local app and handoff changes keep **100% of existing GHCR checkpoint keys reusable** for the same source and SDK inputs.
 
-1. Create a **public** GitHub repository (`benjipeng/chromium-blink-ios`).
-2. Configure a single repository secret for encrypting intra-workflow iOS SDK artifacts:
-   ```bash
-   gh secret set CI_ARTIFACT_KEY --body "$(openssl rand -hex 32)"
-   ```
-3. Run workflows in order:
-   - **Sync Pruned Source to GHCR** (`sync-source.yml`) — once per `version.lock` revision.
-   - **Build Chromium Blink iOS IPA** (`build-ipa.yml`) — reuses every finished checkpoint and runs only what is missing. To rebuild a stage on purpose, bump its epoch in `ci/epochs.json`. `inject_failure` exercises recovery paths.
-   - **Diagnose Build Graph** (`graph-diagnose.yml`) — regenerates the real graph and audits the codegen plan without compiling, comparing against a baseline run.
+Batch engine C++ changes and pin changes into a single candidate. The next wave combines staged patch 0087 (extension action badges, under `staging/patches/`), the headless `CrIOSBrowserHostV1` bridge (0088), and Chromium M160 (`160.0.8171.0`). Prepare the matching source snapshot and SDK stub, then gate the batch with `graph-diagnose.yml` against a known green graph. Build the IPA after the graph audit passes. Update `Kernel.lock` from the verified package after testing the engine contract.
 
----
+## Repository setup
+
+For a new GitHub deployment, use a public repository and configure the `CI_ARTIFACT_KEY` secret for SDK artifact encryption. Dispatch `sync-source.yml` for a new Chromium revision, and use `build-ipa.yml` to build the package and create any missing checkpoints. `graph-diagnose.yml` audits a candidate against its selected baseline. Bump a stage epoch in `ci/epochs.json` only when intentionally invalidating that checkpoint and its downstream keys.
 
 ## Layout
 
 | Path | Purpose |
-|---|---|
-| `version.lock` | Locked upstream `chromium/ci/ios-blink-rel-fyi` green SHA and metadata |
-| `args/device.gn` | Stripped release GN configuration (`use_blink = true`, `enable_rlz = false`) |
-| `patches/` | Ordered patch queue (`series` + single-process/jitless/UI/de-Googled fixes) |
-| `scripts/resolve_pin.py` | Queries Buildbucket `ios-blink-rel-fyi` for latest compile-green revision |
-| `scripts/sync_pruned_source.sh` | Blobless sparse checkout + pruned `gclient` sync + Darwin clang runtime |
-| `scripts/apple_tool_wrapper.py` | Record/replay wrapper for `//build/toolchain/apple/apple_tool_wrapper.gni` |
-| `ci/` | Stage epochs, per-host GN args, `ccache` settings |
-| `scripts/stage.sh` | The one driver every job calls: `./scripts/stage.sh <stage> <step>` |
-| `scripts/stages/<stage>.sh` | Each stage's own steps; editing one re-keys only that stage and the ones after it |
-| `scripts/plan_pipeline.py` | Keys, checkpoint probes, and the run plan (missing compile partitions only) |
-| `scripts/ninja_graph.py` | Ninja graph model and the stage contract (what each stage may run) |
-| `scripts/plan_shards.py` | Target lists: `codegen`, `apple-prebuild`, `c-shard` partitions |
-| `scripts/rewrite_ninja_graph.py` | Post-`gn gen` graph rewrites: `prune`, `apple-only`, `link-only` |
-| `scripts/diagnose_graph.py` | Audits a codegen plan against the stage contract (also the pre-build gate) |
-| `scripts/shard_artifact.py` | Packs a partition's objects with a manifest; verifies them on import |
-| `scripts/oci_artifacts.sh` | GHCR push/pull: tri-state existence, digest resolution, write-once pushes |
-| `scripts/run_with_budget.py` | Runs a build under a deadline and stops its whole process group cleanly |
-| `scripts/overlay_linux_host_deps.py` | Fetches Linux-host-only DEPS (`lss`, Dawn's Go) missing from the iOS snapshot |
-| `scripts/package_ipa.sh` | Post-link `Metadata.appintents` extraction, `.appex` pruning, and IPA build |
-| `helpers/extensions_ui/` | UI framework compiled and embedded by the Mac packaging job |
-| `tools/simulator/` | Local tools for verifying an Actions IPA without rebuilding Chromium |
-| `.github/workflows/` | `sync-source.yml`, `build-ipa.yml`, `graph-diagnose.yml`, and `bump-pin.yml` |
+| --- | --- |
+| `Curium/`, `Curium.xcodeproj` | Native app and local Xcode build. |
+| `EngineContract/` | Browser host and extension interfaces shared by the app and engine. |
+| `Kernel.lock`, `scripts/sync_curium_engine.py` | Pin and assemble the contents of ignored `Vendor/CuriumEngine/`. |
+| `version.lock`, `patches/`, `args/` | Upstream Chromium pin, ordered patch series, and GN configuration. |
+| `ci/`, `scripts/plan_pipeline.py`, `scripts/stages/` | Checkpoint inputs and the GitHub Actions build stages. |
+| `tools/simulator/` | Diagnostics for the standalone Chromium IPA. |

@@ -2,456 +2,9 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS Blink: integrate ExtensionsBrowserClient and ProfileIOS lifecycle
 
-diff --git a/ios/chrome/browser/profile/model/BUILD.gn b/ios/chrome/browser/profile/model/BUILD.gn
---- a/ios/chrome/browser/profile/model/BUILD.gn
-+++ b/ios/chrome/browser/profile/model/BUILD.gn
-@@ -2,6 +2,7 @@
- # Use of this source code is governed by a BSD-style license that can be
- # found in the LICENSE file.
- 
-+import("//extensions/buildflags/buildflags.gni")
- import("//ios/build/chrome_build.gni")
- 
- source_set("model") {
-@@ -63,9 +64,13 @@
-     "//ios/chrome/browser/supervised_user/model:sync_settings_factory",
-     "//ios/components/cookie_util",
-     "//ios/net",
-+    "//extensions/buildflags",
-     "//ios/web/public/thread",
-     "//net",
-   ]
-+  if (enable_extensions_core) {
-+    deps += [ "//ios/chrome/browser/extensions/model" ]
-+  }
- }
- 
- source_set("profile_ios_io_data") {
-diff --git a/ios/chrome/browser/profile/model/profile_ios_impl.mm b/ios/chrome/browser/profile/model/profile_ios_impl.mm
---- a/ios/chrome/browser/profile/model/profile_ios_impl.mm
-+++ b/ios/chrome/browser/profile/model/profile_ios_impl.mm
-@@ -34,7 +34,11 @@
- #import "components/supervised_user/core/common/features.h"
- #import "components/sync_preferences/pref_service_syncable.h"
- #import "components/user_prefs/user_prefs.h"
-+#import "extensions/buildflags/buildflags.h"
- #import "ios/chrome/browser/content_settings/model/host_content_settings_map_factory.h"
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
-+#endif
- #import "ios/chrome/browser/policy/model/browser_policy_connector_ios.h"
- #import "ios/chrome/browser/policy/model/profile_policy_connector.h"
- #import "ios/chrome/browser/policy/model/profile_policy_connector_factory.h"
-@@ -276,6 +280,9 @@
-   RegisterProfilePrefs(pref_registry_.get());
-   ProfileDependencyManagerIOS::GetInstance()->RegisterProfilePrefsForServices(
-       pref_registry_.get());
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  RegisterIOSExtensionPrefs(pref_registry_.get());
-+#endif
- 
-   // Create a SupervisedUserPrefStore and initialize it with empty data.
-   // The pref store will load Family Link Settings Service disk data after
-@@ -323,6 +330,9 @@
-     DestroyOffTheRecordProfile();
-   }
- 
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  ShutdownIOSExtensionsForProfile(this);
-+#endif
-   ProfileDependencyManagerIOS::GetInstance()->DestroyProfileServices(this);
-   // Warning: the order for shutting down the Profile's objects is important
-   // because of interdependencies. Ideally the order for shutting down the
-@@ -515,6 +525,9 @@
-   // The initialisation of the ProfileIOS is now complete and the services
-   // can be safely created.
-   ProfileDependencyManagerIOS::GetInstance()->CreateProfileServices(this);
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  InitializeIOSExtensionsForProfile(this);
-+#endif
- 
-   if (delegate_) {
-     delegate_->OnProfileCreationFinished(this, init_info.creation_mode,
-diff --git a/ios/chrome/browser/web/model/BUILD.gn b/ios/chrome/browser/web/model/BUILD.gn
---- a/ios/chrome/browser/web/model/BUILD.gn
-+++ b/ios/chrome/browser/web/model/BUILD.gn
-@@ -3,6 +3,7 @@
- # found in the LICENSE file.
- 
- import("//base/allocator/allocator.gni")
-+import("//extensions/buildflags/buildflags.gni")
- import("//ios/web/public/js_messaging/optimize_js.gni")
- 
- source_set("model") {
-@@ -256,6 +257,7 @@
-     ":model",
-     "//base/allocator:buildflags",
-     "//build:blink_buildflags",
-+    "//extensions/buildflags",
-     "//components/application_locale_storage",
-     "//components/autofill/core/common:features",
-     "//components/autofill/ios/browser",
-@@ -406,6 +408,9 @@
-     "UIKit.framework",
-     "Foundation.framework",
-   ]
-+  if (enable_extensions_core) {
-+    deps += [ "//ios/chrome/browser/extensions/model" ]
-+  }
- }
- 
- source_set("unit_tests_internal") {
-diff --git a/ios/chrome/browser/web/model/chrome_main_parts.mm b/ios/chrome/browser/web/model/chrome_main_parts.mm
---- a/ios/chrome/browser/web/model/chrome_main_parts.mm
-+++ b/ios/chrome/browser/web/model/chrome_main_parts.mm
-@@ -27,6 +27,10 @@
- #import "base/time/default_tick_clock.h"
- #import "base/trace_event/named_trigger.h"
- #import "build/blink_buildflags.h"
-+#import "extensions/buildflags/buildflags.h"
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
-+#endif
- #import "components/content_settings/core/common/content_settings_pattern.h"
- #import "components/crash/core/common/crash_key.h"
- #import "components/crash/core/common/crash_keys.h"
-@@ -328,6 +332,10 @@
-   base::trace_event::EmitNamedTrigger(
-       base::trace_event::kStartupTracingTriggerName);
- 
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  InitializeIOSExtensionsBrowserClient();
-+#endif
-+
-   // Ensure that the KeyedService factories are registered.
-   EnsureProfileKeyedServiceFactoriesBuilt();
-   ProfileDependencyManagerIOS::GetInstance()
-@@ -380,6 +388,9 @@
- }
- 
- void IOSChromeMainParts::PostMainMessageLoopRun() {
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  StartTearDownIOSExtensionsBrowserClient();
-+#endif
-   TranslateServiceIOS::Shutdown();
- 
-   segmentation_platform::UkmDatabaseClientHolder::GetClientInstance(nullptr)
-diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
---- a/ios/web/content/BUILD.gn
-+++ b/ios/web/content/BUILD.gn
-@@ -3,6 +3,7 @@
- # found in the LICENSE file.
- 
- import("//build/config/features.gni")
-+import("//extensions/buildflags/buildflags.gni")
- import("//ios/web/public/js_messaging/optimize_ts.gni")
- import("//testing/test.gni")
- 
-@@ -55,6 +56,7 @@
-     ":send_webkit_message_js",
-     "//base",
-     "//build:blink_buildflags",
-+    "//extensions/buildflags",
-     "//components/download/public/common:public",
-     "//components/embedder_support:user_agent",
-     "//components/embedder_support/ios:web_contents_delegate",
-@@ -88,6 +90,12 @@
-     "//third_party/blink/public/common",
-     "//ui/base",
-   ]
-+  if (enable_extensions_core) {
-+    deps += [
-+      "//extensions/browser",
-+      "//extensions/common",
-+    ]
-+  }
- }
- 
- source_set("threads") {
-diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
---- a/ios/web/content/init/BUILD.gn
-+++ b/ios/web/content/init/BUILD.gn
-@@ -52,6 +52,10 @@
-     "//ui/native_theme",
-   ]
-   if (enable_extensions_core) {
--    deps += [ "extensions:clients" ]
-+    deps += [
-+      "extensions:clients",
-+      "//extensions/browser",
-+      "//extensions/common",
-+    ]
-   }
- }
-diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
---- a/ios/web/content/init/ios_content_browser_client.cc
-+++ b/ios/web/content/init/ios_content_browser_client.cc
-@@ -3,6 +3,31 @@
- // found in the LICENSE file.
- 
- #include "ios/web/content/init/ios_content_browser_client.h"
-+
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+#include "base/functional/bind.h"
-+#include "content/public/browser/render_process_host.h"
-+#include "content/public/browser/security_principal.h"
-+#include "content/public/browser/service_worker_version_base_info.h"
-+#include "content/public/browser/site_instance.h"
-+#include "content/public/common/child_process_id.h"
-+#include "extensions/browser/api/web_request/extension_web_request_event_router.h"
-+#include "extensions/browser/event_router.h"
-+#include "extensions/browser/extension_protocols.h"
-+#include "extensions/browser/extension_registry.h"
-+#include "extensions/browser/extension_web_contents_observer.h"
-+#include "extensions/browser/extensions_browser_client.h"
-+#include "extensions/browser/process_map.h"
-+#include "extensions/browser/renderer_startup_helper.h"
-+#include "extensions/browser/service_worker/service_worker_host.h"
-+#include "extensions/common/constants.h"
-+#include "extensions/common/mojom/event_router.mojom.h"
-+#include "extensions/common/mojom/frame.mojom.h"
-+#include "extensions/common/mojom/renderer_host.mojom.h"
-+#include "extensions/common/mojom/service_worker_host.mojom.h"
-+#include "extensions/common/mojom/web_request_host.mojom.h"
-+#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
-+#endif
- 
- #import "base/memory/self_deleting.h"
- #import "components/embedder_support/user_agent_utils.h"
-@@ -120,6 +145,9 @@
-       content::kChromeUIScheme,
-       content::kChromeUIUntrustedScheme,
-       content::kChromeDevToolsScheme,
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+      extensions::kExtensionScheme,
-+#endif
-       url::kDataScheme,
-       url::kFileScheme,
-   };
-@@ -229,13 +257,19 @@
- IOSContentBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
-     const std::string& scheme,
-     content::FrameTreeNodeId frame_tree_node_id) {
--  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
--  if (scheme != content::kChromeUIScheme) {
--    return {};
--  }
-   content::WebContents* web_contents =
-       content::WebContents::FromFrameTreeNodeId(frame_tree_node_id);
-   if (!web_contents) {
-+    return {};
-+  }
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  if (scheme == extensions::kExtensionScheme) {
-+    return extensions::CreateExtensionNavigationURLLoaderFactory(
-+        web_contents->GetBrowserContext(), /*is_web_view_request=*/false);
-+  }
-+#endif
-+  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
-+  if (scheme != content::kChromeUIScheme) {
-     return {};
-   }
-   return CreateWebUIURLLoaderFactory(web_contents->GetBrowserContext());
-@@ -246,6 +280,12 @@
-     int render_frame_id,
-     const std::optional<url::Origin>& request_initiator_origin,
-     NonNetworkURLLoaderFactoryMap* factories) {
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  factories->emplace(
-+      extensions::kExtensionScheme,
-+      extensions::CreateExtensionURLLoaderFactory(
-+          content::ChildProcessId(render_process_id), render_frame_id));
-+#endif
-   // [ios-blink-sideload] Only chrome:// pages load chrome:// resources, such
-   // as the shared ones under chrome://resources.
-   if (!request_initiator_origin ||
-@@ -262,4 +302,119 @@
-       CreateWebUIURLLoaderFactory(render_frame_host->GetBrowserContext()));
- }
- 
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+void IOSContentBrowserClient::SiteInstanceGotProcessAndSite(
-+    content::SiteInstance* site_instance) {
-+  if (!site_instance || !site_instance->HasProcess()) {
-+    return;
-+  }
-+  const content::SecurityPrincipal& principal =
-+      site_instance->GetSecurityPrincipal();
-+  if (!principal.SchemeIs(extensions::kExtensionScheme) ||
-+      principal.IsSandboxed()) {
-+    return;
-+  }
-+  content::BrowserContext* context =
-+      site_instance->GetProcess()->GetBrowserContext();
-+  auto* client = extensions::ExtensionsBrowserClient::Get();
-+  if (!client || !client->IsValidContext(context)) {
-+    return;
-+  }
-+  extensions::ExtensionRegistry* registry =
-+      extensions::ExtensionRegistry::Get(context);
-+  if (!registry) {
-+    return;
-+  }
-+  const extensions::Extension* extension =
-+      registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
-+  if (!extension) {
-+    return;
-+  }
-+  extensions::ProcessMap::Get(context)->Insert(
-+      extension->id(), site_instance->GetProcess()->GetID());
-+}
-+
-+void IOSContentBrowserClient::ExposeInterfacesToRenderer(
-+    service_manager::BinderRegistry* registry,
-+    blink::AssociatedInterfaceRegistry* associated_registry,
-+    content::RenderProcessHost* render_process_host) {
-+  associated_registry->AddInterface<extensions::mojom::RendererHost>(
-+      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
-+                          render_process_host->GetID()));
-+  associated_registry->AddInterface<extensions::mojom::WebRequestHost>(
-+      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
-+                          render_process_host->GetID()));
-+}
-+
-+void IOSContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
-+    content::RenderFrameHost* render_frame_host,
-+    mojo::BinderMapWithContext<content::RenderFrameHost*>* map) {
-+  auto* client = extensions::ExtensionsBrowserClient::Get();
-+  if (!client || !render_frame_host) {
-+    return;
-+  }
-+  content::BrowserContext* context = render_frame_host->GetBrowserContext();
-+  if (!client->IsValidContext(context)) {
-+    return;
-+  }
-+  const extensions::Extension* extension = nullptr;
-+  const content::SecurityPrincipal& principal =
-+      render_frame_host->GetSiteInstance()->GetSecurityPrincipal();
-+  if (principal.SchemeIs(extensions::kExtensionScheme)) {
-+    if (auto* registry = extensions::ExtensionRegistry::Get(context)) {
-+      extension = registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
-+    }
-+  }
-+  client->RegisterBrowserInterfaceBindersForFrame(map, render_frame_host,
-+                                                  extension);
-+}
-+
-+void IOSContentBrowserClient::
-+    RegisterAssociatedInterfaceBindersForRenderFrameHost(
-+        content::RenderFrameHost& render_frame_host,
-+        blink::AssociatedInterfaceRegistry& associated_registry) {
-+  ContentBrowserClient::RegisterAssociatedInterfaceBindersForRenderFrameHost(
-+      render_frame_host, associated_registry);
-+  const content::ChildProcessId process_id =
-+      render_frame_host.GetProcess()->GetID();
-+  associated_registry.AddInterface<extensions::mojom::RendererHost>(
-+      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
-+                          process_id));
-+  associated_registry.AddInterface<extensions::mojom::EventRouter>(
-+      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
-+                          process_id));
-+  associated_registry.AddInterface<extensions::mojom::LocalFrameHost>(
-+      base::BindRepeating(
-+          [](content::RenderFrameHost* frame_host,
-+             mojo::PendingAssociatedReceiver<extensions::mojom::LocalFrameHost>
-+                 receiver) {
-+            extensions::ExtensionWebContentsObserver::BindLocalFrameHost(
-+                std::move(receiver), frame_host);
-+          },
-+          &render_frame_host));
-+}
-+
-+void IOSContentBrowserClient::
-+    RegisterAssociatedInterfaceBindersForServiceWorker(
-+        const content::ServiceWorkerVersionBaseInfo&
-+            service_worker_version_info,
-+        blink::AssociatedInterfaceRegistry& associated_registry) {
-+  if (!service_worker_version_info.process_id) {
-+    return;
-+  }
-+  associated_registry.AddInterface<extensions::mojom::RendererHost>(
-+      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
-+                          service_worker_version_info.process_id));
-+  associated_registry.AddInterface<extensions::mojom::ServiceWorkerHost>(
-+      base::BindRepeating(&extensions::ServiceWorkerHost::BindReceiver,
-+                          service_worker_version_info.process_id));
-+  associated_registry.AddInterface<extensions::mojom::WebRequestHost>(
-+      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
-+                          service_worker_version_info.process_id));
-+  associated_registry.AddInterface<extensions::mojom::EventRouter>(
-+      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
-+                          service_worker_version_info.process_id));
-+}
-+#endif
-+
- }  // namespace web
-diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
---- a/ios/web/content/init/ios_content_browser_client.h
-+++ b/ios/web/content/init/ios_content_browser_client.h
-@@ -7,6 +7,7 @@
- 
- #import "build/blink_buildflags.h"
- #include "content/public/browser/content_browser_client.h"
-+#include "extensions/buildflags/buildflags.h"
- 
- #if !BUILDFLAG(USE_BLINK)
- #error File can only be included when USE_BLINK is true
-@@ -55,6 +56,23 @@
-       int render_frame_id,
-       const std::optional<url::Origin>& request_initiator_origin,
-       NonNetworkURLLoaderFactoryMap* factories) override;
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  void SiteInstanceGotProcessAndSite(
-+      content::SiteInstance* site_instance) override;
-+  void ExposeInterfacesToRenderer(
-+      service_manager::BinderRegistry* registry,
-+      blink::AssociatedInterfaceRegistry* associated_registry,
-+      content::RenderProcessHost* render_process_host) override;
-+  void RegisterBrowserInterfaceBindersForFrame(
-+      content::RenderFrameHost* render_frame_host,
-+      mojo::BinderMapWithContext<content::RenderFrameHost*>* map) override;
-+  void RegisterAssociatedInterfaceBindersForRenderFrameHost(
-+      content::RenderFrameHost& render_frame_host,
-+      blink::AssociatedInterfaceRegistry& associated_registry) override;
-+  void RegisterAssociatedInterfaceBindersForServiceWorker(
-+      const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
-+      blink::AssociatedInterfaceRegistry& associated_registry) override;
-+#endif
- };
- 
- }  // namespace web
-diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
---- a/ios/web/content/web_state/content_web_state.mm
-+++ b/ios/web/content/web_state/content_web_state.mm
-@@ -27,6 +27,12 @@
- #import "content/public/browser/visibility.h"
- #import "content/public/browser/web_contents.h"
- #import "content/public/common/url_constants.h"
-+#import "extensions/buildflags/buildflags.h"
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+#import "extensions/browser/extensions_browser_client.h"
-+#import "extensions/browser/view_type_utils.h"
-+#import "extensions/common/mojom/view_type.mojom.h"
-+#endif
- #import "ios/web/content/content_browser_context.h"
- #import "ios/web/content/navigation/content_navigation_context.h"
- #import "ios/web/content/web_state/content_web_state_builder.h"
-@@ -189,6 +195,13 @@
-   }
-   web_contents_->SetDelegate(this);
-   WebContentsObserver::Observe(web_contents_.get());
-+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
-+  if (auto* extensions_client = extensions::ExtensionsBrowserClient::Get()) {
-+    extensions::SetViewType(web_contents_.get(),
-+                            extensions::mojom::ViewType::kTabContents);
-+    extensions_client->CreateExtensionWebContentsObserver(web_contents_.get());
-+  }
-+#endif
-   certificate_policy_cache_ =
-       std::make_unique<DummySessionCertificatePolicyCache>(
-           params.browser_state);
 diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
 new file mode 100644
+index 0000000..3a21971
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/BUILD.gn
 @@ -0,0 +1,53 @@
@@ -510,6 +63,7 @@ new file mode 100644
 +}
 diff --git a/ios/chrome/browser/extensions/model/DEPS b/ios/chrome/browser/extensions/model/DEPS
 new file mode 100644
+index 0000000..74ad1d8
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/DEPS
 @@ -0,0 +1,14 @@
@@ -529,6 +83,7 @@ new file mode 100644
 +]
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.h b/ios/chrome/browser/extensions/model/ios_extension_system.h
 new file mode 100644
+index 0000000..535ae49
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_system.h
 @@ -0,0 +1,92 @@
@@ -626,6 +181,7 @@ new file mode 100644
 +#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_H_
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_system.mm b/ios/chrome/browser/extensions/model/ios_extension_system.mm
 new file mode 100644
+index 0000000..7a1f51f
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_system.mm
 @@ -0,0 +1,352 @@
@@ -983,6 +539,7 @@ new file mode 100644
 +}  // namespace extensions
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_system_factory.h b/ios/chrome/browser/extensions/model/ios_extension_system_factory.h
 new file mode 100644
+index 0000000..a792bb5
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_system_factory.h
 @@ -0,0 +1,46 @@
@@ -1034,6 +591,7 @@ new file mode 100644
 +#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_SYSTEM_FACTORY_H_
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm b/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm
 new file mode 100644
+index 0000000..e2260ab
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_system_factory.mm
 @@ -0,0 +1,53 @@
@@ -1092,6 +650,7 @@ new file mode 100644
 +}  // namespace extensions
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
 new file mode 100644
+index 0000000..b42050b
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.h
 @@ -0,0 +1,38 @@
@@ -1135,6 +694,7 @@ new file mode 100644
 +#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSION_WEB_CONTENTS_OBSERVER_H_
 diff --git a/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
 new file mode 100644
+index 0000000..906be54
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extension_web_contents_observer.mm
 @@ -0,0 +1,30 @@
@@ -1170,6 +730,7 @@ new file mode 100644
 +}  // namespace extensions
 diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
 new file mode 100644
+index 0000000..1f77de7
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
 @@ -0,0 +1,266 @@
@@ -1441,6 +1002,7 @@ new file mode 100644
 +#endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_EXTENSIONS_BROWSER_CLIENT_H_
 diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
 new file mode 100644
+index 0000000..1ebd7b9
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
 @@ -0,0 +1,761 @@
@@ -2205,3 +1767,462 @@ new file mode 100644
 +}
 +
 +}  // namespace extensions
+diff --git a/ios/chrome/browser/profile/model/BUILD.gn b/ios/chrome/browser/profile/model/BUILD.gn
+index 6501677..252fde4 100644
+--- a/ios/chrome/browser/profile/model/BUILD.gn
++++ b/ios/chrome/browser/profile/model/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/build/chrome_build.gni")
+ 
+ source_set("model") {
+@@ -63,9 +64,13 @@ source_set("model") {
+     "//ios/chrome/browser/supervised_user/model:sync_settings_factory",
+     "//ios/components/cookie_util",
+     "//ios/net",
++    "//extensions/buildflags",
+     "//ios/web/public/thread",
+     "//net",
+   ]
++  if (enable_extensions_core) {
++    deps += [ "//ios/chrome/browser/extensions/model" ]
++  }
+ }
+ 
+ source_set("profile_ios_io_data") {
+diff --git a/ios/chrome/browser/profile/model/profile_ios_impl.mm b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+index e0b78e6..1ee671f 100644
+--- a/ios/chrome/browser/profile/model/profile_ios_impl.mm
++++ b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+@@ -34,7 +34,11 @@
+ #import "components/supervised_user/core/common/features.h"
+ #import "components/sync_preferences/pref_service_syncable.h"
+ #import "components/user_prefs/user_prefs.h"
++#import "extensions/buildflags/buildflags.h"
+ #import "ios/chrome/browser/content_settings/model/host_content_settings_map_factory.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#endif
+ #import "ios/chrome/browser/policy/model/browser_policy_connector_ios.h"
+ #import "ios/chrome/browser/policy/model/profile_policy_connector.h"
+ #import "ios/chrome/browser/policy/model/profile_policy_connector_factory.h"
+@@ -276,6 +280,9 @@ static Result CreateDirectories(const base::FilePath& state_path,
+   RegisterProfilePrefs(pref_registry_.get());
+   ProfileDependencyManagerIOS::GetInstance()->RegisterProfilePrefsForServices(
+       pref_registry_.get());
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  RegisterIOSExtensionPrefs(pref_registry_.get());
++#endif
+ 
+   // Create a SupervisedUserPrefStore and initialize it with empty data.
+   // The pref store will load Family Link Settings Service disk data after
+@@ -323,6 +330,9 @@ static Result CreateDirectories(const base::FilePath& state_path,
+     DestroyOffTheRecordProfile();
+   }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  ShutdownIOSExtensionsForProfile(this);
++#endif
+   ProfileDependencyManagerIOS::GetInstance()->DestroyProfileServices(this);
+   // Warning: the order for shutting down the Profile's objects is important
+   // because of interdependencies. Ideally the order for shutting down the
+@@ -515,6 +525,9 @@ static Result CreateDirectories(const base::FilePath& state_path,
+   // The initialisation of the ProfileIOS is now complete and the services
+   // can be safely created.
+   ProfileDependencyManagerIOS::GetInstance()->CreateProfileServices(this);
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsForProfile(this);
++#endif
+ 
+   if (delegate_) {
+     delegate_->OnProfileCreationFinished(this, init_info.creation_mode,
+diff --git a/ios/chrome/browser/web/model/BUILD.gn b/ios/chrome/browser/web/model/BUILD.gn
+index 945cb8b..8cd6576 100644
+--- a/ios/chrome/browser/web/model/BUILD.gn
++++ b/ios/chrome/browser/web/model/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//base/allocator/allocator.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/web/public/js_messaging/optimize_js.gni")
+ 
+ source_set("model") {
+@@ -269,6 +270,7 @@ source_set("web_internal") {
+     ":model",
+     "//base/allocator:buildflags",
+     "//build:blink_buildflags",
++    "//extensions/buildflags",
+     "//components/application_locale_storage",
+     "//components/autofill/core/common:features",
+     "//components/autofill/ios/browser",
+@@ -420,6 +422,9 @@ source_set("web_internal") {
+     "UIKit.framework",
+     "Foundation.framework",
+   ]
++  if (enable_extensions_core) {
++    deps += [ "//ios/chrome/browser/extensions/model" ]
++  }
+ }
+ 
+ source_set("unit_tests_internal") {
+diff --git a/ios/chrome/browser/web/model/chrome_main_parts.mm b/ios/chrome/browser/web/model/chrome_main_parts.mm
+index aca7554..77e8745 100644
+--- a/ios/chrome/browser/web/model/chrome_main_parts.mm
++++ b/ios/chrome/browser/web/model/chrome_main_parts.mm
+@@ -29,6 +29,10 @@
+ #import "base/time/default_tick_clock.h"
+ #import "base/trace_event/named_trigger.h"
+ #import "build/blink_buildflags.h"
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#endif
+ #import "components/content_settings/core/common/content_settings_pattern.h"
+ #import "components/crash/core/common/crash_key.h"
+ #import "components/crash/core/common/reporter_running_ios.h"
+@@ -330,6 +334,10 @@
+   base::trace_event::EmitNamedTrigger(
+       base::trace_event::kStartupTracingTriggerName);
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  InitializeIOSExtensionsBrowserClient();
++#endif
++
+   // Ensure that the KeyedService factories are registered.
+   EnsureProfileKeyedServiceFactoriesBuilt();
+   ProfileDependencyManagerIOS::GetInstance()
+@@ -382,6 +390,9 @@
+ }
+ 
+ void IOSChromeMainParts::PostMainMessageLoopRun() {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  StartTearDownIOSExtensionsBrowserClient();
++#endif
+   TranslateServiceIOS::Shutdown();
+ 
+   segmentation_platform::UkmDatabaseClientHolder::GetClientInstance(nullptr)
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+index 1b7a662..73fa9f7 100644
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/features.gni")
++import("//extensions/buildflags/buildflags.gni")
+ import("//ios/web/public/js_messaging/optimize_ts.gni")
+ import("//testing/test.gni")
+ 
+@@ -55,6 +56,7 @@ source_set("content") {
+     ":send_webkit_message_js",
+     "//base",
+     "//build:blink_buildflags",
++    "//extensions/buildflags",
+     "//components/download/public/common:public",
+     "//components/embedder_support:user_agent",
+     "//components/embedder_support/ios:web_contents_delegate",
+@@ -88,6 +90,12 @@ source_set("content") {
+     "//third_party/blink/public/common",
+     "//ui/base",
+   ]
++  if (enable_extensions_core) {
++    deps += [
++      "//extensions/browser",
++      "//extensions/common",
++    ]
++  }
+ }
+ 
+ source_set("threads") {
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index f3ef583..45efec8 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -52,6 +52,10 @@ source_set("init") {
+     "//ui/native_theme",
+   ]
+   if (enable_extensions_core) {
+-    deps += [ "extensions:clients" ]
++    deps += [
++      "extensions:clients",
++      "//extensions/browser",
++      "//extensions/common",
++    ]
+   }
+ }
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index 59d4091..fbe7e34 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -4,6 +4,31 @@
+ 
+ #include "ios/web/content/init/ios_content_browser_client.h"
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#include "base/functional/bind.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/security_principal.h"
++#include "content/public/browser/service_worker_version_base_info.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/common/child_process_id.h"
++#include "extensions/browser/api/web_request/extension_web_request_event_router.h"
++#include "extensions/browser/event_router.h"
++#include "extensions/browser/extension_protocols.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_web_contents_observer.h"
++#include "extensions/browser/extensions_browser_client.h"
++#include "extensions/browser/process_map.h"
++#include "extensions/browser/renderer_startup_helper.h"
++#include "extensions/browser/service_worker/service_worker_host.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/mojom/event_router.mojom.h"
++#include "extensions/common/mojom/frame.mojom.h"
++#include "extensions/common/mojom/renderer_host.mojom.h"
++#include "extensions/common/mojom/service_worker_host.mojom.h"
++#include "extensions/common/mojom/web_request_host.mojom.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
++#endif
++
+ #import "base/memory/self_deleting.h"
+ #import "components/embedder_support/user_agent_utils.h"
+ #import "components/performance_manager/embedder/performance_manager_registry.h"
+@@ -120,6 +145,9 @@ bool IOSContentBrowserClient::IsHandledURL(const GURL& url) {
+       content::kChromeUIScheme,
+       content::kChromeUIUntrustedScheme,
+       content::kChromeDevToolsScheme,
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++      extensions::kExtensionScheme,
++#endif
+       url::kDataScheme,
+       url::kFileScheme,
+   };
+@@ -229,15 +257,21 @@ mojo::PendingRemote<network::mojom::URLLoaderFactory>
+ IOSContentBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
+     const std::string& scheme,
+     content::FrameTreeNodeId frame_tree_node_id) {
+-  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
+-  if (scheme != content::kChromeUIScheme) {
+-    return {};
+-  }
+   content::WebContents* web_contents =
+       content::WebContents::FromFrameTreeNodeId(frame_tree_node_id);
+   if (!web_contents) {
+     return {};
+   }
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (scheme == extensions::kExtensionScheme) {
++    return extensions::CreateExtensionNavigationURLLoaderFactory(
++        web_contents->GetBrowserContext(), /*is_web_view_request=*/false);
++  }
++#endif
++  // [ios-blink-sideload] See CreateWebUIURLLoaderFactory().
++  if (scheme != content::kChromeUIScheme) {
++    return {};
++  }
+   return CreateWebUIURLLoaderFactory(web_contents->GetBrowserContext());
+ }
+ 
+@@ -246,6 +280,12 @@ void IOSContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
+     int render_frame_id,
+     const std::optional<url::Origin>& request_initiator_origin,
+     NonNetworkURLLoaderFactoryMap* factories) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  factories->emplace(
++      extensions::kExtensionScheme,
++      extensions::CreateExtensionURLLoaderFactory(
++          content::ChildProcessId(render_process_id), render_frame_id));
++#endif
+   // [ios-blink-sideload] Only chrome:// pages load chrome:// resources, such
+   // as the shared ones under chrome://resources.
+   if (!request_initiator_origin ||
+@@ -262,4 +302,119 @@ void IOSContentBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
+       CreateWebUIURLLoaderFactory(render_frame_host->GetBrowserContext()));
+ }
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++void IOSContentBrowserClient::SiteInstanceGotProcessAndSite(
++    content::SiteInstance* site_instance) {
++  if (!site_instance || !site_instance->HasProcess()) {
++    return;
++  }
++  const content::SecurityPrincipal& principal =
++      site_instance->GetSecurityPrincipal();
++  if (!principal.SchemeIs(extensions::kExtensionScheme) ||
++      principal.IsSandboxed()) {
++    return;
++  }
++  content::BrowserContext* context =
++      site_instance->GetProcess()->GetBrowserContext();
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !client->IsValidContext(context)) {
++    return;
++  }
++  extensions::ExtensionRegistry* registry =
++      extensions::ExtensionRegistry::Get(context);
++  if (!registry) {
++    return;
++  }
++  const extensions::Extension* extension =
++      registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
++  if (!extension) {
++    return;
++  }
++  extensions::ProcessMap::Get(context)->Insert(
++      extension->id(), site_instance->GetProcess()->GetID());
++}
++
++void IOSContentBrowserClient::ExposeInterfacesToRenderer(
++    service_manager::BinderRegistry* registry,
++    blink::AssociatedInterfaceRegistry* associated_registry,
++    content::RenderProcessHost* render_process_host) {
++  associated_registry->AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          render_process_host->GetID()));
++  associated_registry->AddInterface<extensions::mojom::WebRequestHost>(
++      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
++                          render_process_host->GetID()));
++}
++
++void IOSContentBrowserClient::RegisterBrowserInterfaceBindersForFrame(
++    content::RenderFrameHost* render_frame_host,
++    mojo::BinderMapWithContext<content::RenderFrameHost*>* map) {
++  auto* client = extensions::ExtensionsBrowserClient::Get();
++  if (!client || !render_frame_host) {
++    return;
++  }
++  content::BrowserContext* context = render_frame_host->GetBrowserContext();
++  if (!client->IsValidContext(context)) {
++    return;
++  }
++  const extensions::Extension* extension = nullptr;
++  const content::SecurityPrincipal& principal =
++      render_frame_host->GetSiteInstance()->GetSecurityPrincipal();
++  if (principal.SchemeIs(extensions::kExtensionScheme)) {
++    if (auto* registry = extensions::ExtensionRegistry::Get(context)) {
++      extension = registry->enabled_extensions().GetByID(std::string(principal.GetHost()));
++    }
++  }
++  client->RegisterBrowserInterfaceBindersForFrame(map, render_frame_host,
++                                                  extension);
++}
++
++void IOSContentBrowserClient::
++    RegisterAssociatedInterfaceBindersForRenderFrameHost(
++        content::RenderFrameHost& render_frame_host,
++        blink::AssociatedInterfaceRegistry& associated_registry) {
++  ContentBrowserClient::RegisterAssociatedInterfaceBindersForRenderFrameHost(
++      render_frame_host, associated_registry);
++  const content::ChildProcessId process_id =
++      render_frame_host.GetProcess()->GetID();
++  associated_registry.AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          process_id));
++  associated_registry.AddInterface<extensions::mojom::EventRouter>(
++      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
++                          process_id));
++  associated_registry.AddInterface<extensions::mojom::LocalFrameHost>(
++      base::BindRepeating(
++          [](content::RenderFrameHost* frame_host,
++             mojo::PendingAssociatedReceiver<extensions::mojom::LocalFrameHost>
++                 receiver) {
++            extensions::ExtensionWebContentsObserver::BindLocalFrameHost(
++                std::move(receiver), frame_host);
++          },
++          &render_frame_host));
++}
++
++void IOSContentBrowserClient::
++    RegisterAssociatedInterfaceBindersForServiceWorker(
++        const content::ServiceWorkerVersionBaseInfo&
++            service_worker_version_info,
++        blink::AssociatedInterfaceRegistry& associated_registry) {
++  if (!service_worker_version_info.process_id) {
++    return;
++  }
++  associated_registry.AddInterface<extensions::mojom::RendererHost>(
++      base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::ServiceWorkerHost>(
++      base::BindRepeating(&extensions::ServiceWorkerHost::BindReceiver,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::WebRequestHost>(
++      base::BindRepeating(&extensions::WebRequestEventRouter::BindForRenderer,
++                          service_worker_version_info.process_id));
++  associated_registry.AddInterface<extensions::mojom::EventRouter>(
++      base::BindRepeating(&extensions::EventRouter::BindForRenderer,
++                          service_worker_version_info.process_id));
++}
++#endif
++
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index 7151e98..d842679 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -7,6 +7,7 @@
+ 
+ #import "build/blink_buildflags.h"
+ #include "content/public/browser/content_browser_client.h"
++#include "extensions/buildflags/buildflags.h"
+ 
+ #if !BUILDFLAG(USE_BLINK)
+ #error File can only be included when USE_BLINK is true
+@@ -55,6 +56,23 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+       int render_frame_id,
+       const std::optional<url::Origin>& request_initiator_origin,
+       NonNetworkURLLoaderFactoryMap* factories) override;
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  void SiteInstanceGotProcessAndSite(
++      content::SiteInstance* site_instance) override;
++  void ExposeInterfacesToRenderer(
++      service_manager::BinderRegistry* registry,
++      blink::AssociatedInterfaceRegistry* associated_registry,
++      content::RenderProcessHost* render_process_host) override;
++  void RegisterBrowserInterfaceBindersForFrame(
++      content::RenderFrameHost* render_frame_host,
++      mojo::BinderMapWithContext<content::RenderFrameHost*>* map) override;
++  void RegisterAssociatedInterfaceBindersForRenderFrameHost(
++      content::RenderFrameHost& render_frame_host,
++      blink::AssociatedInterfaceRegistry& associated_registry) override;
++  void RegisterAssociatedInterfaceBindersForServiceWorker(
++      const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
++      blink::AssociatedInterfaceRegistry& associated_registry) override;
++#endif
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index 536fe34..71192a1 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -27,6 +27,12 @@
+ #import "content/public/browser/visibility.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/common/url_constants.h"
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "extensions/browser/extensions_browser_client.h"
++#import "extensions/browser/view_type_utils.h"
++#import "extensions/common/mojom/view_type.mojom.h"
++#endif
+ #import "ios/web/content/content_browser_context.h"
+ #import "ios/web/content/navigation/content_navigation_context.h"
+ #import "ios/web/content/web_state/content_web_state_builder.h"
+@@ -189,6 +195,13 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   }
+   web_contents_->SetDelegate(this);
+   WebContentsObserver::Observe(web_contents_.get());
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  if (auto* extensions_client = extensions::ExtensionsBrowserClient::Get()) {
++    extensions::SetViewType(web_contents_.get(),
++                            extensions::mojom::ViewType::kTabContents);
++    extensions_client->CreateExtensionWebContentsObserver(web_contents_.get());
++  }
++#endif
+   certificate_policy_cache_ =
+       std::make_unique<DummySessionCertificatePolicyCache>(
+           params.browser_state);

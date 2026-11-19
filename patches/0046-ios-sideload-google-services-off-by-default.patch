@@ -7,10 +7,10 @@ prompts, price tracking and remote search suggestions are dead ends. Turn
 them off by default; each stays available in Settings > Google services.
 
 diff --git a/components/signin/internal/identity_manager/primary_account_manager.cc b/components/signin/internal/identity_manager/primary_account_manager.cc
-index 5cad965..d369e1f 100644
+index f5c0932..f07be63 100644
 --- a/components/signin/internal/identity_manager/primary_account_manager.cc
 +++ b/components/signin/internal/identity_manager/primary_account_manager.cc
-@@ -332,7 +332,8 @@ void PrimaryAccountManager::RegisterProfilePrefs(PrefRegistrySimple* registry) {
+@@ -329,7 +329,8 @@ void PrimaryAccountManager::RegisterProfilePrefs(PrefRegistrySimple* registry) {
        prefs::kGoogleServicesSyncingUsernameMigratedToSignedIn, std::string());
    registry->RegisterIntegerPref(prefs::kGoogleServicesSyncingUserMigrationType,
                                  /*SyncToSigninMigrationType::kUnknown=*/0);
@@ -19,12 +19,12 @@ index 5cad965..d369e1f 100644
 +  registry->RegisterBooleanPref(prefs::kSigninAllowed, false);
    registry->RegisterBooleanPref(prefs::kSignedInWithCredentialProvider, false);
    registry->RegisterBooleanPref(prefs::kExplicitBrowserSignin, false);
-   registry->RegisterBooleanPref(
+   registry->RegisterBooleanPref(prefs::kPrimaryAccountSetAfterSigninMigration,
 diff --git a/ios/chrome/browser/shared/model/prefs/browser_prefs.mm b/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
-index 84bc771..32a24e8 100644
+index 46c5262..996fe0e 100644
 --- a/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
 +++ b/ios/chrome/browser/shared/model/prefs/browser_prefs.mm
-@@ -339,7 +339,8 @@ void RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
+@@ -346,7 +346,8 @@ void RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
    registry->RegisterListPref(prefs::kRestrictAccountsToPatterns);
    registry->RegisterIntegerPref(prefs::kBrowserSigninPolicy,
                                  static_cast<int>(BrowserSigninMode::kEnabled));
@@ -34,7 +34,7 @@ index 84bc771..32a24e8 100644
    registry->RegisterBooleanPref(prefs::kAppStoreRatingPolicyEnabled, true);
    registry->RegisterBooleanPref(kIosParcelTrackingPolicyEnabled, false);
  
-@@ -585,8 +586,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+@@ -595,8 +596,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
    registry->RegisterBooleanPref(
        translate::prefs::kOfferTranslateEnabled, true,
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
@@ -45,7 +45,7 @@ index 84bc771..32a24e8 100644
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
    registry->RegisterBooleanPref(
        prefs::kNTPContentSuggestionsEnabled, true,
-@@ -602,8 +604,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+@@ -612,8 +614,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
    registry->RegisterStringPref(prefs::kDefaultCharset,
                                 l10n_util::GetStringUTF8(IDS_DEFAULT_ENCODING),
                                 user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
@@ -55,4 +55,4 @@ index 84bc771..32a24e8 100644
 +      prefs::kSearchSuggestEnabled, false,
        user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
    registry->RegisterBooleanPref(prefs::kSavingBrowserHistoryDisabled, false);
- 
+   registry->RegisterBooleanPref(prefs::kAllowDeletingBrowserHistory, true);

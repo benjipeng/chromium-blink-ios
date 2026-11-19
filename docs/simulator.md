@@ -69,6 +69,60 @@ In Chromium on the simulator, open `http://127.0.0.1:8765/` and tap **Run filter
 
 Run the same check after removal and again after reinstalling. Both paths should reach the server while the extension is absent. The EasyList path should stop reaching it after reinstalling, while the control remains reachable. Check on a newly loaded page each time.
 
+## Verify Dark Reader on two sites
+
+[Actions run 44328959472](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44328959472)
+built `1f76114` and produced artifact `14443178991`. On the iOS 27.1 Duo
+simulator, an update retained the installed Dark Reader 4.9.135 and its
+enabled state. Its Options page rendered. After reload in Light appearance,
+the white test page had one dynamic theme stylesheet and a computed
+background of `rgb(24, 26, 27)`. The initially restored tab stayed light
+until reload. Site isolation and uBlock coexistence have not been checked
+on this IPA.
+
+A later check on the same core changed Dark Reader from Auto to On with
+system appearance still Light. Returning to the existing web tab without a
+reload changed its computed background from `rgb(255, 255, 255)` to
+`rgb(24, 26, 27)` and the dynamic stylesheet count from zero to one. The Duo
+outer landscape right gutter stayed `rgb(18, 18, 18)` during that change.
+Reloading brought it to the page color without changing the theme. Check the
+gutter separately from content injection; patch `0037` keeps the page inside
+the safe area and assigns the gutter color in `UpdateBackgroundColor()`.
+
+Serve the white test page locally:
+
+```sh
+python3 -m http.server 8786 --bind 127.0.0.1 --directory tools/simulator/extension-theme-check
+```
+
+On the Duo simulator in Light appearance, install Dark Reader from its
+official listing. Open `http://127.0.0.1:8786/` and the other test origin in
+separate tabs. The page reports its computed background and the extension's
+dynamic and fallback styles. Confirm **Manage → Options** finishes loading
+and the sites darken with dynamic styles present. Once a site-specific control
+is available, disable the theme for one origin; the other must stay dark.
+
+## Preview the UIKit Extensions menu
+
+`tools/simulator/extension-panel-preview.m` is a simulator-only helper for the
+`1f76114` core. It adds **⋯ → Extensions** on ordinary websites and lists the
+enabled extensions. Choose **Open Options** to open an extension's global
+settings in a separate tab; the original page stays open. A row without
+Options is read-only. The preview does not expose page actions or request counts.
+
+From the repository root, using the existing simulator app and its bundle ID:
+
+```sh
+preview=$(mktemp -d "${TMPDIR:-/tmp}/chromium-page-panel.XXXXXX")
+xcrun --sdk iphonesimulator clang -target arm64-apple-ios26.0-simulator \
+  -dynamiclib -fobjc-arc -framework Foundation -framework UIKit \
+  -framework CoreGraphics tools/simulator/extension-panel-preview.m \
+  -o "$preview/PageExtensionsPreview.dylib"
+codesign --force --sign - "$preview/PageExtensionsPreview.dylib"
+SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$preview/PageExtensionsPreview.dylib" \
+  xcrun simctl launch --terminate-running-process "$SIMULATOR_ID" "$BUNDLE_ID"
+```
+
 ## Verify page-specific blocking once the Extensions panel is connected
 
 Run the filter check twice in tab A and confirm the extension's **Requests

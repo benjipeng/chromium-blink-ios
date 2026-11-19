@@ -1,9 +1,9 @@
 # Pinned upstream Chromium revision verified green on chromium/ci/ios-blink-rel-fyi.
 # Advance via: python3 scripts/resolve_pin.py --write
-CHROMIUM_REV=34d81e7bfe669b8eccaaf35c6e14c7bfc0689703
-CHROMIUM_VERSION=159.0.8149.0
-V8_REV=a1175dcfe49146bd7165715a9919eb4e94be0e77
-ANGLE_REV=29d18232e8031430f1257b7509ceca20d195114d
+CHROMIUM_REV=aaaaebc70d8639eef7ec4775983a5e398e7a5ba7
+CHROMIUM_VERSION=160.0.8171.0
+V8_REV=a962f9d9df1164d012b5d5c6d9d96d7597e04fc5
+ANGLE_REV=3a3f2607bf975bfe7834a8bae5482a4334220123
 XCODE_APP=/Applications/Xcode_27.1.app
 XCODE_BUILD=27A9275
 BUNDLE_ID_PREFIX=com.benjipeng.chromiumblink

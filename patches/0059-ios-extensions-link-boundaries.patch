@@ -1,7 +1,8 @@
 diff --git a/extensions/browser/BUILD.gn b/extensions/browser/BUILD.gn
+index 5c60259..5d73ccb 100644
 --- a/extensions/browser/BUILD.gn
 +++ b/extensions/browser/BUILD.gn
-@@ -636,7 +636,6 @@
+@@ -637,7 +637,6 @@ source_set("browser_sources") {
      "//components/keyed_service/content",
      "//components/keyed_service/core",
      "//components/pdf/common:constants",
@@ -9,75 +10,22 @@ diff --git a/extensions/browser/BUILD.gn b/extensions/browser/BUILD.gn
      "//components/pref_registry",
      "//components/prefs",
      "//components/proxy_config",
-@@ -715,6 +714,13 @@
- 
-   if (enable_rlz) {
+@@ -718,6 +717,13 @@ source_set("browser_sources") {
      deps += [ "//rlz:rlz_lib" ]
-+  }
-+
+   }
+ 
 +  if (!is_ios) {
 +    # Full //components/permissions pulls in //components/tabs:impl (whose global
 +    # TabGroup collides with ios/chrome TabGroup); api/content_settings keeps its
 +    # explicit //components/permissions:permissions_common dependency.
 +    deps += [ "//components/permissions" ]
-   }
- 
++  }
++
    public_deps = [
-diff --git a/extensions/browser/script_executor.cc b/extensions/browser/script_executor.cc
---- a/extensions/browser/script_executor.cc
-+++ b/extensions/browser/script_executor.cc
-@@ -19,7 +19,10 @@
- #include "base/pickle.h"
- #include "base/strings/stringprintf.h"
- #include "base/types/pass_key.h"
-+#include "build/build_config.h"
-+#if !BUILDFLAG(IS_IOS)
- #include "components/sessions/content/session_tab_helper.h"
-+#endif  // !BUILDFLAG(IS_IOS)
- #include "content/public/browser/navigation_controller.h"
- #include "content/public/browser/navigation_entry.h"
- #include "content/public/browser/render_frame_host.h"
-@@ -114,9 +117,11 @@
-     }
- 
-     int tab_id = -1;
-+#if !BUILDFLAG(IS_IOS)
-     if (host_id_.type == mojom::HostID::HostType::kExtensions) {
-       tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
-     }
-+#endif  // !BUILDFLAG(IS_IOS)
- 
-     // If we are to include subframes, iterate over all descendants of frames in
-     // `pending_render_frames_` and add them if they are alive (and not already
-diff --git a/extensions/browser/script_injection_tracker.cc b/extensions/browser/script_injection_tracker.cc
---- a/extensions/browser/script_injection_tracker.cc
-+++ b/extensions/browser/script_injection_tracker.cc
-@@ -12,8 +12,11 @@
- #include "base/memory/raw_ref.h"
- #include "base/strings/string_number_conversions.h"
- #include "base/trace_event/typed_macros.h"
-+#include "build/build_config.h"
- #include "components/guest_view/buildflags/buildflags.h"
-+#if !BUILDFLAG(IS_IOS)
- #include "components/sessions/content/session_tab_helper.h"
-+#endif  // !BUILDFLAG(IS_IOS)
- #include "content/public/browser/browser_context.h"
- #include "content/public/browser/browser_thread.h"
- #include "content/public/browser/global_routing_id.h"
-@@ -250,8 +253,12 @@
- 
-   GURL effective_url =
-       GetEffectiveDocumentURL(&frame, url, script.match_origin_as_fallback());
-+#if BUILDFLAG(IS_IOS)
-+  int tab_id = -1;
-+#else
-   auto* web_contents = content::WebContents::FromRenderFrameHost(&frame);
-   int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
-+#endif  // BUILDFLAG(IS_IOS)
- 
-   // The host permission checks below match at origin granularity because the
-   // renderer evaluates injection against the document URL at each run
+     "//base",
+     "//components/safe_browsing/core/browser/db:sb_protocol_config",
 diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/api/runtime/runtime_api.cc
+index 361662a..1bd32f0 100644
 --- a/extensions/browser/api/runtime/runtime_api.cc
 +++ b/extensions/browser/api/runtime/runtime_api.cc
 @@ -25,12 +25,16 @@
@@ -97,7 +45,7 @@ diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/
  #include "extensions/browser/api/runtime/runtime_api_delegate.h"
  #include "extensions/browser/blocklist_extension_prefs.h"
  #include "extensions/browser/event_router.h"
-@@ -1294,7 +1298,11 @@
+@@ -1324,7 +1328,11 @@ int RuntimeGetContextsFunction::GetTabId(content::WebContents& web_contents) {
      return -1;
    }
  
@@ -109,7 +57,7 @@ diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/
  }
  
  int RuntimeGetContextsFunction::GetFrameId(content::RenderFrameHost& host) {
-@@ -1312,8 +1320,12 @@
+@@ -1342,8 +1350,12 @@ int RuntimeGetContextsFunction::GetWindowId(
    mojom::ViewType view_type = extensions::GetViewType(&web_contents);
  
    if (view_type != extensions::mojom::ViewType::kDeveloperTools) {
@@ -122,47 +70,22 @@ diff --git a/extensions/browser/api/runtime/runtime_api.cc b/extensions/browser/
    }
  
    // For developer tools, ask the embedder for the window ID.
-diff --git a/extensions/browser/permissions/site_permissions_helper.cc b/extensions/browser/permissions/site_permissions_helper.cc
---- a/extensions/browser/permissions/site_permissions_helper.cc
-+++ b/extensions/browser/permissions/site_permissions_helper.cc
-@@ -4,7 +4,10 @@
- 
- #include "extensions/browser/permissions/site_permissions_helper.h"
- 
-+#include "build/build_config.h"
-+#if !BUILDFLAG(IS_IOS)
- #include "components/sessions/content/session_tab_helper.h"
-+#endif  // !BUILDFLAG(IS_IOS)
- #include "content/public/browser/navigation_controller.h"
- #include "content/public/browser/navigation_entry.h"
- #include "content/public/browser/web_contents.h"
-@@ -50,7 +53,11 @@
-     return SiteInteraction::kNone;
-   }
- 
-+#if BUILDFLAG(IS_IOS)
-+  const int tab_id = -1;
-+#else
-   const int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
-+#endif  // BUILDFLAG(IS_IOS)
-   const GURL& url = web_contents->GetLastCommittedURL();
-   PermissionsData::PageAccess page_access =
-       extension.permissions_data()->GetPageAccess(url, tab_id,
 diff --git a/extensions/browser/extension_web_contents_observer.cc b/extensions/browser/extension_web_contents_observer.cc
+index 18cbab5..81cb467 100644
 --- a/extensions/browser/extension_web_contents_observer.cc
 +++ b/extensions/browser/extension_web_contents_observer.cc
-@@ -9,7 +9,10 @@
- #include "base/check.h"
+@@ -12,7 +12,10 @@
  #include "base/check_op.h"
  #include "base/feature_list.h"
+ #include "base/strings/strcat.h"
 +#include "build/build_config.h"
 +#if !BUILDFLAG(IS_IOS)
  #include "components/sessions/content/session_tab_helper.h"
 +#endif  // !BUILDFLAG(IS_IOS)
  #include "content/public/browser/browser_context.h"
  #include "content/public/browser/child_process_security_policy.h"
- #include "content/public/browser/navigation_handle.h"
-@@ -82,12 +85,14 @@
+ #include "content/public/browser/document_user_data.h"
+@@ -190,12 +193,14 @@ ExtensionWebContentsObserver::CreateExtensionFrameHost(
  void ExtensionWebContentsObserver::ListenToWindowIdChangesFrom(
      sessions::SessionTabHelper* helper) {
    if (!window_id_subscription_) {
@@ -177,7 +100,7 @@ diff --git a/extensions/browser/extension_web_contents_observer.cc b/extensions/
    }
  }
  
-@@ -119,7 +124,9 @@
+@@ -227,7 +232,9 @@ void ExtensionWebContentsObserver::Initialize() {
    // externally notified when it is created, but it isn't. If that ordering ever
    // changes, this code can be restructured and ListenToWindowIdChangesFrom()
    // can become private.
@@ -187,3 +110,86 @@ diff --git a/extensions/browser/extension_web_contents_observer.cc b/extensions/
  }
  
  ExtensionWebContentsObserver::ExtensionWebContentsObserver(
+diff --git a/extensions/browser/permissions/site_permissions_helper.cc b/extensions/browser/permissions/site_permissions_helper.cc
+index 10eca1e..fc02d7c 100644
+--- a/extensions/browser/permissions/site_permissions_helper.cc
++++ b/extensions/browser/permissions/site_permissions_helper.cc
+@@ -4,7 +4,10 @@
+ 
+ #include "extensions/browser/permissions/site_permissions_helper.h"
+ 
++#include "build/build_config.h"
++#if !BUILDFLAG(IS_IOS)
+ #include "components/sessions/content/session_tab_helper.h"
++#endif  // !BUILDFLAG(IS_IOS)
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+@@ -50,7 +53,11 @@ SitePermissionsHelper::GetSiteInteraction(
+     return SiteInteraction::kNone;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  const int tab_id = -1;
++#else
+   const int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
++#endif  // BUILDFLAG(IS_IOS)
+   const GURL& url = web_contents->GetLastCommittedURL();
+   PermissionsData::PageAccess page_access =
+       extension.permissions_data()->GetPageAccess(url, tab_id,
+diff --git a/extensions/browser/script_executor.cc b/extensions/browser/script_executor.cc
+index 152737c..0e7e6c3 100644
+--- a/extensions/browser/script_executor.cc
++++ b/extensions/browser/script_executor.cc
+@@ -19,7 +19,10 @@
+ #include "base/pickle.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/types/pass_key.h"
++#include "build/build_config.h"
++#if !BUILDFLAG(IS_IOS)
+ #include "components/sessions/content/session_tab_helper.h"
++#endif  // !BUILDFLAG(IS_IOS)
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -117,9 +120,11 @@ class Handler : public content::WebContentsObserver {
+     }
+ 
+     int tab_id = -1;
++#if !BUILDFLAG(IS_IOS)
+     if (host_id_.type == mojom::HostID::HostType::kExtensions) {
+       tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
+     }
++#endif  // !BUILDFLAG(IS_IOS)
+ 
+     // If we are to include subframes, iterate over all descendants of frames in
+     // `pending_render_frames_` and add them if they are alive (and not already
+diff --git a/extensions/browser/script_injection_tracker.cc b/extensions/browser/script_injection_tracker.cc
+index 604cad9..0b54d23 100644
+--- a/extensions/browser/script_injection_tracker.cc
++++ b/extensions/browser/script_injection_tracker.cc
+@@ -15,8 +15,11 @@
+ #include "base/memory/raw_ref.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/trace_event/typed_macros.h"
++#include "build/build_config.h"
+ #include "components/guest_view/buildflags/buildflags.h"
++#if !BUILDFLAG(IS_IOS)
+ #include "components/sessions/content/session_tab_helper.h"
++#endif  // !BUILDFLAG(IS_IOS)
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/global_routing_id.h"
+@@ -319,8 +322,12 @@ bool DoesScriptMatch(const Extension& extension,
+ 
+   GURL effective_url =
+       GetEffectiveDocumentURL(&frame, url, script.match_origin_as_fallback());
++#if BUILDFLAG(IS_IOS)
++  int tab_id = -1;
++#else
+   auto* web_contents = content::WebContents::FromRenderFrameHost(&frame);
+   int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
++#endif  // BUILDFLAG(IS_IOS)
+ 
+   // The host permission checks below match at origin granularity because the
+   // renderer evaluates injection against the document URL at each run

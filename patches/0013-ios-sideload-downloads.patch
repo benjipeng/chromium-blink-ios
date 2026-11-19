@@ -3,7 +3,7 @@ From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS sideload: hand Blink's downloads to Chrome's download UI
 
 diff --git a/ios/chrome/browser/download/coordinator/BUILD.gn b/ios/chrome/browser/download/coordinator/BUILD.gn
-index a7563904bdaa2142fedeb2323cf2969a41c02cf1..af587b377e21f9997477116b1a8dd3fe79a8af2b 100644
+index 22e9450..688680a 100644
 --- a/ios/chrome/browser/download/coordinator/BUILD.gn
 +++ b/ios/chrome/browser/download/coordinator/BUILD.gn
 @@ -34,6 +34,7 @@ source_set("coordinator") {
@@ -11,11 +11,11 @@ index a7563904bdaa2142fedeb2323cf2969a41c02cf1..af587b377e21f9997477116b1a8dd3fe
    deps = [
      "//base",
 +    "//build:blink_buildflags",
-     "//components/strings:components_strings_grit",
-     "//ios/chrome/app/strings:ios_strings_grit",
-     "//ios/chrome/browser/download/coordinator/activities",
+     "//components/history/core/common",
+     "//components/prefs",
+     "//components/prefs/ios",
 diff --git a/ios/chrome/browser/download/coordinator/download_manager_mediator.mm b/ios/chrome/browser/download/coordinator/download_manager_mediator.mm
-index 24ea748a8af7788fe9f22ef1b52ce255687fe1c0..8a504ce1edf7785aeeda958f5ed1a4a59e302546 100644
+index a00db4b..c496af0 100644
 --- a/ios/chrome/browser/download/coordinator/download_manager_mediator.mm
 +++ b/ios/chrome/browser/download/coordinator/download_manager_mediator.mm
 @@ -14,6 +14,7 @@
@@ -26,7 +26,7 @@ index 24ea748a8af7788fe9f22ef1b52ce255687fe1c0..8a504ce1edf7785aeeda958f5ed1a4a5
  #import "ios/chrome/browser/download/model/document_download_tab_helper.h"
  #import "ios/chrome/browser/download/model/download_directory_util.h"
  #import "ios/chrome/browser/download/model/download_manager_tab_helper.h"
-@@ -225,6 +226,12 @@
+@@ -212,6 +213,12 @@
    BOOL can_open_file = !document_download_tab_helper
                              ->IsDownloadTaskCreatedByCurrentTabHelper() &&
                         filename.MatchesExtension(".pdf");
@@ -40,7 +40,7 @@ index 24ea748a8af7788fe9f22ef1b52ce255687fe1c0..8a504ce1edf7785aeeda958f5ed1a4a5
  
    [consumer_ setState:state];
 diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
-index bae30f58e0fbcedf1697012605308c66ceae82e0..ca54cfe5aa639484f85e9108dd7a434720690879 100644
+index bae30f5..ca54cfe 100644
 --- a/ios/web/content/BUILD.gn
 +++ b/ios/web/content/BUILD.gn
 @@ -17,6 +17,10 @@ source_set("content") {
@@ -79,7 +79,7 @@ index bae30f58e0fbcedf1697012605308c66ceae82e0..ca54cfe5aa639484f85e9108dd7a4347
    ]
  }
 diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
-index b6a8846810658d1fe9d8246918bac64c84f5ebdc..62deeb521d826312867d742fc792c81ae65b0c2d 100644
+index b6a8846..62deeb5 100644
 --- a/ios/web/content/DEPS
 +++ b/ios/web/content/DEPS
 @@ -1,6 +1,7 @@
@@ -91,7 +91,7 @@ index b6a8846810658d1fe9d8246918bac64c84f5ebdc..62deeb521d826312867d742fc792c81a
    "+components/js_injection",
    "+content/public/browser",
 diff --git a/ios/web/content/content_browser_context.h b/ios/web/content/content_browser_context.h
-index 902f35e6fbef240687333b51159d22f1625b182c..c0d6fd18a79d6c07918b80a4fec7d144da971bd0 100644
+index fe1ca01..f085d84 100644
 --- a/ios/web/content/content_browser_context.h
 +++ b/ios/web/content/content_browser_context.h
 @@ -5,6 +5,8 @@
@@ -111,7 +111,7 @@ index 902f35e6fbef240687333b51159d22f1625b182c..c0d6fd18a79d6c07918b80a4fec7d144
  
  // Wraps a web::BrowserState. The lifetime of instances is tied to that
  // of the corresponding ContentBrowserContext (via SharedUserData).
-@@ -71,6 +74,8 @@ class ContentBrowserContext : public content::BrowserContext {
+@@ -69,6 +72,8 @@ class ContentBrowserContext : public content::BrowserContext {
    void InitWhileIOAllowed();
    void FinishInitWhileIOAllowed();
    raw_ptr<web::BrowserState> browser_state_ = nullptr;
@@ -121,7 +121,7 @@ index 902f35e6fbef240687333b51159d22f1625b182c..c0d6fd18a79d6c07918b80a4fec7d144
  
  }  // namespace web
 diff --git a/ios/web/content/content_browser_context.mm b/ios/web/content/content_browser_context.mm
-index 5bf95c033a5e049318cbfbe9df4c5eb79b995a9a..06231782a04e0a7d7d7fe06865b968cc1a2f4655 100644
+index e0c58db..59d0098 100644
 --- a/ios/web/content/content_browser_context.mm
 +++ b/ios/web/content/content_browser_context.mm
 @@ -7,6 +7,7 @@
@@ -151,7 +151,7 @@ index 5bf95c033a5e049318cbfbe9df4c5eb79b995a9a..06231782a04e0a7d7d7fe06865b968cc
  content::BrowserPluginGuestManager* ContentBrowserContext::GetGuestManager() {
 diff --git a/ios/web/content/download/content_download_manager_delegate.h b/ios/web/content/download/content_download_manager_delegate.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..fe35d53dd3248b7c8791c796bcc4f0eb902672b1
+index 0000000..fe35d53
 --- /dev/null
 +++ b/ios/web/content/download/content_download_manager_delegate.h
 @@ -0,0 +1,60 @@
@@ -217,7 +217,7 @@ index 0000000000000000000000000000000000000000..fe35d53dd3248b7c8791c796bcc4f0eb
 +#endif  // IOS_WEB_CONTENT_DOWNLOAD_CONTENT_DOWNLOAD_MANAGER_DELEGATE_H_
 diff --git a/ios/web/content/download/content_download_manager_delegate.mm b/ios/web/content/download/content_download_manager_delegate.mm
 new file mode 100644
-index 0000000000000000000000000000000000000000..e58f2838665850577dcda87109e438e5f482eadf
+index 0000000..e58f283
 --- /dev/null
 +++ b/ios/web/content/download/content_download_manager_delegate.mm
 @@ -0,0 +1,85 @@
@@ -308,7 +308,7 @@ index 0000000000000000000000000000000000000000..e58f2838665850577dcda87109e438e5
 +}  // namespace web
 diff --git a/ios/web/content/download/content_download_task.h b/ios/web/content/download/content_download_task.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f8362aa54f1ca9d3269579a3aa75a84296b7747b
+index 0000000..f8362aa
 --- /dev/null
 +++ b/ios/web/content/download/content_download_task.h
 @@ -0,0 +1,66 @@
@@ -380,7 +380,7 @@ index 0000000000000000000000000000000000000000..f8362aa54f1ca9d3269579a3aa75a842
 +#endif  // IOS_WEB_CONTENT_DOWNLOAD_CONTENT_DOWNLOAD_TASK_H_
 diff --git a/ios/web/content/download/content_download_task.mm b/ios/web/content/download/content_download_task.mm
 new file mode 100644
-index 0000000000000000000000000000000000000000..e0a513b5e0ae115656aac56db304bff28379d65f
+index 0000000..e0a513b
 --- /dev/null
 +++ b/ios/web/content/download/content_download_task.mm
 @@ -0,0 +1,152 @@
@@ -537,7 +537,7 @@ index 0000000000000000000000000000000000000000..e0a513b5e0ae115656aac56db304bff2
 +
 +}  // namespace web
 diff --git a/ios/web/download/download_controller_impl.h b/ios/web/download/download_controller_impl.h
-index cfc488b855393a35af8aab166509560d3ad50869..75b6fb8c03445d25660f77c7fb8958ba75ef1ced 100644
+index cfc488b..75b6fb8 100644
 --- a/ios/web/download/download_controller_impl.h
 +++ b/ios/web/download/download_controller_impl.h
 @@ -56,6 +56,10 @@ class DownloadControllerImpl : public DownloadController,
@@ -552,7 +552,7 @@ index cfc488b855393a35af8aab166509560d3ad50869..75b6fb8c03445d25660f77c7fb8958ba
    void OnDownloadDestroyed(DownloadTask* task) override;
  
 diff --git a/ios/web/download/download_controller_impl.mm b/ios/web/download/download_controller_impl.mm
-index 0aa1e7a34206f250a971964eee3786ea8160c941..1e65c9ea90decb0142e201bf29d110c6793e448e 100644
+index 0aa1e7a..1e65c9e 100644
 --- a/ios/web/download/download_controller_impl.mm
 +++ b/ios/web/download/download_controller_impl.mm
 @@ -107,6 +107,11 @@
@@ -567,6 +567,3 @@ index 0aa1e7a34206f250a971964eee3786ea8160c941..1e65c9ea90decb0142e201bf29d110c6
  void DownloadControllerImpl::OnDownloadCreated(
      std::unique_ptr<DownloadTaskImpl> task) {
    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
--- 
-2.54.0 (Apple Git-157)
-

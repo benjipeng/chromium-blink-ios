@@ -1,0 +1,28 @@
+PRODUCT_BUNDLE_IDENTIFIER = com.appautomaton.curium
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1
+
+// Resolve both SDKs from Xcode 27.2; simulator builds override SDKROOT.
+SDKROOT = iphoneos
+IPHONEOS_DEPLOYMENT_TARGET = 26.0
+SWIFT_VERSION = 6.0
+SWIFT_INCLUDE_PATHS = $(inherited) "$(SRCROOT)/EngineContract"
+HEADER_SEARCH_PATHS = $(inherited) "$(SRCROOT)/EngineContract"
+
+// Enable once patch 0088 and its allocator companion are available for the SDK.
+CURIUM_USE_ENGINE_XCFRAMEWORK = NO
+CURIUM_ENGINE_VENDOR = $(SRCROOT)/Vendor/CuriumEngine
+CURIUM_ENGINE_SLICE[sdk=iphoneos*] = ios-arm64
+CURIUM_ENGINE_SLICE[sdk=iphonesimulator*] = ios-arm64-simulator
+CURIUM_ENGINE_FRAMEWORK_DIR = $(CURIUM_ENGINE_VENDOR)/chrome_framework.xcframework/$(CURIUM_ENGINE_SLICE)
+CURIUM_ENGINE_ALLOCATOR_DIR = $(CURIUM_ENGINE_VENDOR)/EarlyMallocZoneRegistration.xcframework/$(CURIUM_ENGINE_SLICE)
+CURIUM_ENGINE_SEARCH_YES = "$(CURIUM_ENGINE_ALLOCATOR_DIR)" "$(CURIUM_ENGINE_FRAMEWORK_DIR)"
+FRAMEWORK_SEARCH_PATHS = $(inherited) $(CURIUM_ENGINE_SEARCH_$(CURIUM_USE_ENGINE_XCFRAMEWORK))
+
+// Preserve the allocator's position as the first strong Mach-O load command.
+CURIUM_ENGINE_LINK_YES = -Wl,-framework,EarlyMallocZoneRegistration -Wl,-framework,chrome_framework
+OTHER_LDFLAGS = $(CURIUM_ENGINE_LINK_$(CURIUM_USE_ENGINE_XCFRAMEWORK)) $(inherited)
+CURIUM_ENGINE_FLAG_YES = CURIUM_LINKED_ENGINE
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) $(CURIUM_ENGINE_FLAG_$(CURIUM_USE_ENGINE_XCFRAMEWORK))
+CURIUM_ENGINE_EXCLUDED_ARCHS_YES = x86_64
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = $(inherited) $(CURIUM_ENGINE_EXCLUDED_ARCHS_$(CURIUM_USE_ENGINE_XCFRAMEWORK))

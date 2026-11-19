@@ -3,6 +3,10 @@
 work/
 out/
 dist/
+/Vendor/CuriumEngine/
+DerivedData/
+build/
+xcuserdata/
 *.ipa
 *.tar.zst
 *.tar.zst.enc

@@ -3,10 +3,10 @@ From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS sideload: chrome:// pages
 
 diff --git a/content/browser/loader/navigation_url_loader_impl.cc b/content/browser/loader/navigation_url_loader_impl.cc
-index b9cc368692d5880104f03642a270356af2decf34..33e7b29144687d326c67d9edd62970aa3e5a4b3b 100644
+index a5b1370..641f75e 100644
 --- a/content/browser/loader/navigation_url_loader_impl.cc
 +++ b/content/browser/loader/navigation_url_loader_impl.cc
-@@ -709,14 +709,25 @@ void NavigationURLLoaderImpl::Start() {
+@@ -708,18 +708,29 @@ void NavigationURLLoaderImpl::Start() {
        CHECK(frame_tree_node);
        CHECK(frame_tree_node->navigation_request());
  
@@ -21,7 +21,11 @@ index b9cc368692d5880104f03642a270356af2decf34..33e7b29144687d326c67d9edd62970aa
 +      if (!webui_factory) {
 +        webui_factory = CreateWebUIURLLoaderFactoryWithoutOriginLock(
 +            WebUIURLLoaderFactoryPasskey::GetPassKey(),
-+            frame_tree_node->current_frame_host(), scheme, {});
++            frame_tree_node->current_frame_host(), scheme, {},
++            base::FeatureList::IsEnabled(
++                features::kPrioritizeWebUINavigationURLLoader)
++                ? GetNavigationNetworkResponseTaskRunner()
++                : nullptr);
 +      }
 +
        CreateThrottlingLoaderAndStart(
@@ -30,20 +34,24 @@ index b9cc368692d5880104f03642a270356af2decf34..33e7b29144687d326c67d9edd62970aa
                url_loader_factory::TerminalParams::ForNonNetwork(
 -                  CreateWebUIURLLoaderFactoryWithoutOriginLock(
 -                      WebUIURLLoaderFactoryPasskey::GetPassKey(),
--                      frame_tree_node->current_frame_host(), scheme, {}),
+-                      frame_tree_node->current_frame_host(), scheme, {},
+-                      base::FeatureList::IsEnabled(
+-                          features::kPrioritizeWebUINavigationURLLoader)
+-                          ? GetNavigationNetworkResponseTaskRunner()
+-                          : nullptr),
 -                  network::mojom::kBrowserProcessId),
 +                  std::move(webui_factory), network::mojom::kBrowserProcessId),
                url_loader_factory::ContentClientParams(
                    browser_context_, frame_tree_node->current_frame_host(),
                    frame_tree_node->current_frame_host()
 diff --git a/content/browser/renderer_host/render_frame_host_impl.cc b/content/browser/renderer_host/render_frame_host_impl.cc
-index e3c58ef8151c2f09f55dd11b0a43d5cffad25162..99f8465cf7727a8637eee59a545ad770acc2e592 100644
+index 29fb697..41d93c8 100644
 --- a/content/browser/renderer_host/render_frame_host_impl.cc
 +++ b/content/browser/renderer_host/render_frame_host_impl.cc
-@@ -13507,8 +13507,16 @@ void RenderFrameHostImpl::CommitNavigation(
-               subresource_loader_factories_config.ukm_source_id()),
-           devtools_instrumentation::WillCreateURLLoaderFactoryParams::ForFrame(
-               this));
+@@ -13457,8 +13457,16 @@ void RenderFrameHostImpl::CommitNavigation(
+                   subresource_loader_factories_config.ukm_source_id()),
+               devtools_instrumentation::WillCreateURLLoaderFactoryParams::
+                   ForFrame(this));
 +#if BUILDFLAG(IS_IOS)
 +      // [ios-blink-sideload] The embedder's factory replaces content's WebUI
 +      // one, the only one already there: Chrome's iOS WebUI isn't content's
@@ -58,7 +66,7 @@ index e3c58ef8151c2f09f55dd11b0a43d5cffad25162..99f8465cf7727a8637eee59a545ad770
  
      subresource_loader_factories->pending_isolated_world_factories() =
 diff --git a/ios/web/content/content_browser_context.h b/ios/web/content/content_browser_context.h
-index f9ad3df60417acf42548d36a4551dfc17cf27762..83f90d9819c8bf86be4d4e6f1f6ae41b8d5588e6 100644
+index 824ce80..615f252 100644
 --- a/ios/web/content/content_browser_context.h
 +++ b/ios/web/content/content_browser_context.h
 @@ -38,6 +38,9 @@ class ContentBrowserContext : public content::BrowserContext {
@@ -72,7 +80,7 @@ index f9ad3df60417acf42548d36a4551dfc17cf27762..83f90d9819c8bf86be4d4e6f1f6ae41b
    base::FilePath GetPath() const override;
    std::unique_ptr<content::ZoomLevelDelegate> CreateZoomLevelDelegate(
 diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
-index 2b9a1dd78bf80500764f0c8e4fb94fb5ece8041b..63ba2a4af6ab656e18083bf07753c29eb0dba510 100644
+index 2b9a1dd..63ba2a4 100644
 --- a/ios/web/content/init/BUILD.gn
 +++ b/ios/web/content/init/BUILD.gn
 @@ -38,11 +38,13 @@ source_set("init") {
@@ -90,7 +98,7 @@ index 2b9a1dd78bf80500764f0c8e4fb94fb5ece8041b..63ba2a4af6ab656e18083bf07753c29e
      "//ui/base",
      "//ui/native_theme",
 diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
-index 6af713abb931a4e7eb381e7bc01dad466d9dd195..59d40919529d9fcd53e04127e85904482fb81081 100644
+index 6af713a..59d4091 100644
 --- a/ios/web/content/init/ios_content_browser_client.cc
 +++ b/ios/web/content/init/ios_content_browser_client.cc
 @@ -4,18 +4,26 @@
@@ -224,7 +232,7 @@ index 6af713abb931a4e7eb381e7bc01dad466d9dd195..59d40919529d9fcd53e04127e8590448
 +
  }  // namespace web
 diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
-index 48875befa85e43bd18357cac86e7752f87a01aaa..7151e98aed94b6f1be2b049d172e6a96a041c7fd 100644
+index 48875be..7151e98 100644
 --- a/ios/web/content/init/ios_content_browser_client.h
 +++ b/ios/web/content/init/ios_content_browser_client.h
 @@ -45,6 +45,16 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
@@ -245,7 +253,7 @@ index 48875befa85e43bd18357cac86e7752f87a01aaa..7151e98aed94b6f1be2b049d172e6a96
  
  }  // namespace web
 diff --git a/ios/web/content/js_messaging/content_web_frames_manager.mm b/ios/web/content/js_messaging/content_web_frames_manager.mm
-index 6883106f53b2c9fab0d9337b598003a006b77045..48d0b21dc58a54afed240911dc59797f747adf99 100644
+index 6883106..48d0b21 100644
 --- a/ios/web/content/js_messaging/content_web_frames_manager.mm
 +++ b/ios/web/content/js_messaging/content_web_frames_manager.mm
 @@ -266,6 +266,15 @@ ScriptMessage message_for_handler(
@@ -265,7 +273,7 @@ index 6883106f53b2c9fab0d9337b598003a006b77045..48d0b21dc58a54afed240911dc59797f
                                               content_web_state_);
  }
 diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
-index 1915a16b24de4671abadee8c1d6d916fb711e801..1a7c06bef6211bb7839a17ce998f9b4f026e93bb 100644
+index 1915a16..1a7c06b 100644
 --- a/ios/web/content/web_state/content_web_state.h
 +++ b/ios/web/content/web_state/content_web_state.h
 @@ -50,6 +50,9 @@ class WebContents;
@@ -325,7 +333,7 @@ index 1915a16b24de4671abadee8c1d6d916fb711e801..1a7c06bef6211bb7839a17ce998f9b4f
    id keyboard_hiding_observer_;
    int keyboard_height_ = 0;
 diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
-index e9c5601cbf1132518381a10e93e5a591a4436c8a..536fe34d5ccc59a0d89d2a30de85844966ab94be 100644
+index e9c5601..536fe34 100644
 --- a/ios/web/content/web_state/content_web_state.mm
 +++ b/ios/web/content/web_state/content_web_state.mm
 @@ -16,12 +16,17 @@
@@ -488,6 +496,3 @@ index e9c5601cbf1132518381a10e93e5a591a4436c8a..536fe34d5ccc59a0d89d2a30de858449
    auto* context =
        ContentNavigationContext::GetOrCreate(navigation_handle, this);
    for (auto& observer : observers_) {
--- 
-2.54.0 (Apple Git-157)
-

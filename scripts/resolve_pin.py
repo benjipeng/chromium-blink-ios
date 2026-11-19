@@ -4,7 +4,7 @@
 Queries Buildbucket's public `chromium/ci/ios-blink-rel-fyi` builder, selects
 the most recent build whose `compile` step succeeded (ignoring unrelated
 simulator unit-test flakes), and resolves matching `chrome/VERSION`, V8, and
-ANGLE revisions from `chromium.googlesource.com`.
+ANGLE revisions from Gitiles or the Chromium GitHub mirror.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import base64
 import json
 import pathlib
 import re
+import socket
 import sys
+import urllib.error
 import urllib.request
 
 BUILDBUCKET_URL = (
@@ -23,12 +25,25 @@ BUILDBUCKET_URL = (
 GITILES_RAW_FMT = (
     "https://chromium.googlesource.com/chromium/src/+/{rev}/{path}?format=TEXT"
 )
+GITHUB_RAW_FMT = "https://raw.githubusercontent.com/chromium/chromium/{rev}/{path}"
 
 
 def fetch_gitiles_text(rev: str, path: str) -> str:
     url = GITILES_RAW_FMT.format(rev=rev, path=path)
-    with urllib.request.urlopen(url, timeout=20) as resp:
-        return base64.b64decode(resp.read()).decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            return base64.b64decode(resp.read()).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 429 and not 500 <= exc.code < 600:
+            raise
+    except urllib.error.URLError as exc:
+        if not isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise
+    except (TimeoutError, socket.timeout):
+        pass
+
+    with urllib.request.urlopen(GITHUB_RAW_FMT.format(rev=rev, path=path), timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def find_latest_compile_green_build(page_size: int = 20) -> dict:

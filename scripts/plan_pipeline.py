@@ -55,8 +55,8 @@ STAGE_FILES = {
 # Never part of a key: transport, reporting, budgets, audits, and the producers
 # of the source/SDK artifacts (which enter keys by digest instead).
 NON_OUTPUT = {
-    "ci/epochs.json",  # read per stage below
     "ci/ccache.env",
+    "ci/epochs.json",  # read per stage below
     "scripts/check_inputs.py",
     "scripts/check_remote_patches.py",
     "scripts/compare_graphs.py",
@@ -69,8 +69,9 @@ NON_OUTPUT = {
     "scripts/resolve_pin.py",
     "scripts/run_with_budget.py",
     "scripts/sparse_checkout.conf",
-    "scripts/stages/sdk.sh",  # the SDK enters keys by digest
     "scripts/stages/probe.sh",  # diagnostic objects are never stage checkpoints
+    "scripts/stages/sdk.sh",  # the SDK enters keys by digest
+    "scripts/sync_curium_engine.py",
     "scripts/sync_pruned_source.sh",
     "scripts/write_job_summary.py",
 }

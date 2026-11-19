@@ -135,12 +135,14 @@ def validate_patched_probe_identity(patched_src: pathlib.Path) -> str:
 
 
 def main() -> int:
-    if os.environ.get("GITHUB_ACTIONS") != "true":
-        sys.exit("Run this source-file preflight on GitHub Actions, not locally.")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--patched-source", type=pathlib.Path,
                         help="check the bundled probe after applying patches to a pinned snapshot")
+    parser.add_argument("--local-excerpts", action="store_true",
+                        help="verify patches against disposable remote single-file excerpts locally")
     args = parser.parse_args()
+    if os.environ.get("GITHUB_ACTIONS") != "true" and not args.local_excerpts:
+        sys.exit("Run this source-file preflight on GitHub Actions or pass --local-excerpts.")
     if args.patched_source is not None:
         probe_id = validate_patched_probe_identity(args.patched_source)
         print(f"Verified bundled probe files and manifest key ID: {probe_id}", flush=True)
@@ -150,27 +152,32 @@ def main() -> int:
     lock = dict(line.split("=", 1) for line in (root / "version.lock").read_text().splitlines()
                 if "=" in line and not line.lstrip().startswith("#"))
     files = collect_upstream_files(root / "patches", root / "patches/series")
-    base = f"https://chromium.googlesource.com/chromium/src/+/{lock['CHROMIUM_REV']}/"
+    rev = lock["CHROMIUM_REV"]
+    gitiles_base = f"https://chromium.googlesource.com/chromium/src/+/{rev}/"
+    github_base = f"https://raw.githubusercontent.com/chromium/chromium/{rev}/"
     with tempfile.TemporaryDirectory(prefix="patch-preflight-") as directory:
-        source = pathlib.Path(directory)
+        source = pathlib.Path(directory).resolve()
 
         def fetch(relative: str) -> int:
-            url = f"{base}{urllib.parse.quote(relative)}?format=TEXT"
-            for attempt in range(3):
-                try:
-                    with urllib.request.urlopen(url, timeout=30) as response:
-                        data = base64.b64decode(response.read(), validate=True)
-                except OSError as error:
-                    if attempt == 2 or (isinstance(error, urllib.error.HTTPError)
-                                        and error.code in (400, 401, 403, 404)):
-                        raise RuntimeError(f"Cannot fetch pinned file {relative}: {error}") from error
-                    time.sleep(attempt + 1)
-                    continue
-                destination = source / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(data)
-                return len(data)
-            raise AssertionError("unreachable")
+            quoted = urllib.parse.quote(relative)
+            data = None
+            try:
+                with urllib.request.urlopen(f"{github_base}{quoted}", timeout=25) as response:
+                    data = response.read()
+            except OSError:
+                for attempt in range(3):
+                    try:
+                        with urllib.request.urlopen(f"{gitiles_base}{quoted}?format=TEXT", timeout=30) as response:
+                            data = base64.b64decode(response.read(), validate=True)
+                            break
+                    except OSError as error:
+                        if attempt == 2:
+                            raise RuntimeError(f"Cannot fetch pinned file {relative}: {error}") from error
+                        time.sleep(attempt + 1)
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             size = sum(pool.map(fetch, sorted(files)))

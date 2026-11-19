@@ -1,0 +1,220 @@
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 7b384b8499726ccdd5fc2de6e16429ad788f386b..6333da5a8625790667adf7699f9720c1a8e94f95 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -66,6 +66,7 @@ source_set("model") {
+     "//net",
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
++    "//skia",
+     "//third_party/blink/public/common",
+     "//third_party/zlib/google:zip",
+     "//ui/base",
+diff --git a/ios/chrome/browser/extensions/model/ios_action_api.cc b/ios/chrome/browser/extensions/model/ios_action_api.cc
+index 5ea23b92b68518e02b1ac72d12a1cd43bcdf61c4..2fa486c6144648d7e8f2b12c41136ac994a55827 100644
+--- a/ios/chrome/browser/extensions/model/ios_action_api.cc
++++ b/ios/chrome/browser/extensions/model/ios_action_api.cc
+@@ -11,6 +11,7 @@
+ #include "base/functional/bind.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/values.h"
++#include "content/public/common/color_parser.h"
+ #include "extensions/browser/extension_action.h"
+ #include "extensions/browser/extension_action_manager.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -19,6 +20,7 @@
+ #include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
+ #include "extensions/common/file_util.h"
++#include "third_party/skia/include/core/SkColor.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/image/image.h"
+ #include "url/gurl.h"
+@@ -60,6 +62,31 @@ bool IsLiveTab(content::BrowserContext* context, int tab_id) {
+              context, tab_id, /*include_incognito=*/false, nullptr);
+ }
+
++ExtensionAction* GetAction(content::BrowserContext* context,
++                           const Extension& extension) {
++  auto* manager = ExtensionActionManager::Get(context);
++  return manager ? manager->GetExtensionAction(extension) : nullptr;
++}
++
++bool ReadBadgeColor(const base::Value& value, SkColor* color) {
++  if (value.is_string()) {
++    return content::ParseCssColorString(value.GetString(), color);
++  }
++  if (!value.is_list() || value.GetList().size() != 4u) {
++    return false;
++  }
++  const auto& components = value.GetList();
++  for (const auto& component : components) {
++    if (!component.is_int() || component.GetInt() < 0 ||
++        component.GetInt() > 255) {
++      return false;
++    }
++  }
++  *color = SkColorSetARGB(components[3].GetInt(), components[0].GetInt(),
++                         components[1].GetInt(), components[2].GetInt());
++  return true;
++}
++
+ }  // namespace
+
+ ExtensionFunction::ResponseAction IOSActionSetIconFunction::Run() {
+@@ -113,8 +140,7 @@ void IOSActionSetIconFunction::SetLoadedIcon(int tab_id, const gfx::Image& image
+     Respond(Error("The extension or tab is no longer available."));
+     return;
+   }
+-  auto* manager = ExtensionActionManager::Get(browser_context());
+-  auto* action = manager ? manager->GetExtensionAction(*extension()) : nullptr;
++  auto* action = GetAction(browser_context(), *extension());
+   if (!action) {
+     Respond(Error("The extension has no action."));
+     return;
+@@ -123,4 +149,49 @@ void IOSActionSetIconFunction::SetLoadedIcon(int tab_id, const gfx::Image& image
+   Respond(NoArguments());
+ }
+
++ExtensionFunction::ResponseAction IOSActionSetBadgeTextFunction::Run() {
++  EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_dict());
++  const auto& details = args()[0].GetDict();
++  const int tab_id =
++      details.FindInt("tabId").value_or(ExtensionAction::kDefaultTabId);
++  if (!extension() || !IsLiveTab(browser_context(), tab_id)) {
++    return RespondNow(Error("The extension or tab is unavailable."));
++  }
++  auto* action = GetAction(browser_context(), *extension());
++  if (!action) {
++    return RespondNow(Error("The extension has no action."));
++  }
++  if (const auto* text = details.FindString("text")) {
++    if (text->size() > 100u) {
++      return RespondNow(Error("Badge text cannot exceed 100 bytes."));
++    }
++    action->SetBadgeText(tab_id, *text);
++  } else {
++    action->ClearBadgeText(tab_id);
++  }
++  return RespondNow(NoArguments());
++}
++
++ExtensionFunction::ResponseAction
++IOSActionSetBadgeBackgroundColorFunction::Run() {
++  EXTENSION_FUNCTION_VALIDATE(args().size() == 1u && args()[0].is_dict());
++  const auto& details = args()[0].GetDict();
++  const auto* value = details.Find("color");
++  SkColor color = SK_ColorTRANSPARENT;
++  if (!value || !ReadBadgeColor(*value, &color)) {
++    return RespondNow(Error("The badge color is invalid."));
++  }
++  const int tab_id =
++      details.FindInt("tabId").value_or(ExtensionAction::kDefaultTabId);
++  if (!extension() || !IsLiveTab(browser_context(), tab_id)) {
++    return RespondNow(Error("The extension or tab is unavailable."));
++  }
++  auto* action = GetAction(browser_context(), *extension());
++  if (!action) {
++    return RespondNow(Error("The extension has no action."));
++  }
++  action->SetBadgeBackgroundColor(tab_id, color);
++  return RespondNow(NoArguments());
++}
++
+ }  // namespace extensions
+diff --git a/ios/chrome/browser/extensions/model/ios_action_api.h b/ios/chrome/browser/extensions/model/ios_action_api.h
+index ada12200b4e2e16874d9dfce3c132c877c0c1665..acf6b9d380ae2b3105e9e8dbbc608f67568cd406 100644
+--- a/ios/chrome/browser/extensions/model/ios_action_api.h
++++ b/ios/chrome/browser/extensions/model/ios_action_api.h
+@@ -23,6 +23,25 @@ class IOSActionSetIconFunction final : public ExtensionFunction {
+   void SetLoadedIcon(int tab_id, const gfx::Image& image);
+ };
+
++class IOSActionSetBadgeTextFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("action.setBadgeText", ACTION_SETBADGETEXT)
++
++ private:
++  ~IOSActionSetBadgeTextFunction() override = default;
++  ResponseAction Run() override;
++};
++
++class IOSActionSetBadgeBackgroundColorFunction final : public ExtensionFunction {
++ public:
++  DECLARE_EXTENSION_FUNCTION("action.setBadgeBackgroundColor",
++                             ACTION_SETBADGEBACKGROUNDCOLOR)
++
++ private:
++  ~IOSActionSetBadgeBackgroundColorFunction() override = default;
++  ResponseAction Run() override;
++};
++
+ }  // namespace extensions
+
+ #endif  // IOS_CHROME_BROWSER_EXTENSIONS_MODEL_IOS_ACTION_API_H_
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+index 864397233627dceb2be2f8d39e45f9b5e954e438..488803fd1a710696edf6322de46c75a1880b8a8f 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_api_provider.cc
+@@ -17,6 +17,8 @@ IOSExtensionsBrowserAPIProvider::~IOSExtensionsBrowserAPIProvider() = default;
+ void IOSExtensionsBrowserAPIProvider::RegisterExtensionFunctions(
+     ExtensionFunctionRegistry* registry) {
+   registry->RegisterFunction<IOSActionSetIconFunction>();
++  registry->RegisterFunction<IOSActionSetBadgeTextFunction>();
++  registry->RegisterFunction<IOSActionSetBadgeBackgroundColorFunction>();
+   registry->RegisterFunction<CommandsGetAllFunction>();
+   registry->RegisterFunction<IOSTabsQueryFunction>();
+   registry->RegisterFunction<IOSTabsGetFunction>();
+diff --git a/ios/web/content/init/extensions/action.json b/ios/web/content/init/extensions/action.json
+index 1408490db0bd00946520c7dd90d811fd8eb88def..57f56fdd287a925ccc633b68d23d5cb2786b59a2 100644
+--- a/ios/web/content/init/extensions/action.json
++++ b/ios/web/content/init/extensions/action.json
+@@ -3,6 +3,48 @@
+     "namespace": "action",
+     "description": "Controls the extension's browser action.",
+     "functions": [
++      {
++        "name": "setBadgeText",
++        "type": "function",
++        "description": "Sets or clears the browser action badge text.",
++        "parameters": [
++          {
++            "name": "details",
++            "type": "object",
++            "properties": {
++              "text": {"type": "string", "optional": true},
++              "tabId": {"type": "integer", "optional": true, "minimum": 0}
++            }
++          }
++        ],
++        "returns_async": {"name": "callback", "parameters": [], "optional": true}
++      },
++      {
++        "name": "setBadgeBackgroundColor",
++        "type": "function",
++        "description": "Sets the browser action badge background color.",
++        "parameters": [
++          {
++            "name": "details",
++            "type": "object",
++            "properties": {
++              "color": {
++                "choices": [
++                  {"type": "string"},
++                  {
++                    "type": "array",
++                    "items": {"type": "integer", "minimum": 0, "maximum": 255},
++                    "minItems": 4,
++                    "maxItems": 4
++                  }
++                ]
++              },
++              "tabId": {"type": "integer", "optional": true, "minimum": 0}
++            }
++          }
++        ],
++        "returns_async": {"name": "callback", "parameters": [], "optional": true}
++      },
+       {
+         "name": "setIcon",
+         "type": "function",

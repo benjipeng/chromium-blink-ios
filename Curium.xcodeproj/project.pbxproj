@@ -1,0 +1,168 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXFileReference section */
+		C09600010000000000000001 /* Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Version.xcconfig; sourceTree = "<group>"; };
+		C09600010000000000000002 /* Curium.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Curium.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		C09600010000000000000003 /* Target membership exceptions */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (Engine/embed-frameworks.sh, README.md);
+			target = C09600010000000000000009 /* Curium */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		C09600010000000000000004 /* Curium */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (C09600010000000000000003);
+			path = Curium;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C09600010000000000000005 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		C09600010000000000000006 = {
+			isa = PBXGroup;
+			children = (C09600010000000000000001, C09600010000000000000017, C09600010000000000000004, C09600010000000000000007);
+			sourceTree = "<group>";
+		};
+		C09600010000000000000007 /* Products */ = {
+			isa = PBXGroup;
+			children = (C09600010000000000000002);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C09600010000000000000008 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXNativeTarget section */
+		C09600010000000000000009 /* Curium */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C0960001000000000000000E;
+			buildPhases = (C09600010000000000000008, C09600010000000000000005, C0960001000000000000000A, C09600010000000000000010);
+			buildRules = ();
+			dependencies = ();
+			fileSystemSynchronizedGroups = (C09600010000000000000004);
+			name = Curium;
+			productName = Curium;
+			productReference = C09600010000000000000002;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C0960001000000000000000A /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXProject section */
+		C0960001000000000000000B /* Project object */ = {
+			isa = PBXProject;
+			attributes = { LastUpgradeCheck = 2720; TargetAttributes = { C09600010000000000000009 = { CreatedOnToolsVersion = 27.2; }; }; };
+			buildConfigurationList = C0960001000000000000000F;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base);
+			mainGroup = C09600010000000000000006;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = C09600010000000000000007;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (C09600010000000000000009);
+		};
+/* End PBXProject section */
+
+/* Begin XCBuildConfiguration section */
+		C0960001000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C09600010000000000000001;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		C0960001000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C09600010000000000000001;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		C09600010000000000000011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C09600010000000000000017;
+			buildSettings = {};
+			name = Debug;
+		};
+		C09600010000000000000012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C09600010000000000000017;
+			buildSettings = {};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		C0960001000000000000000E = {
+			isa = XCConfigurationList;
+			buildConfigurations = (C09600010000000000000011, C09600010000000000000012);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C0960001000000000000000F = {
+			isa = XCConfigurationList;
+			buildConfigurations = (C0960001000000000000000C, C0960001000000000000000D);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		C09600010000000000000010 /* Embed Curium Engine */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ("$(SRCROOT)/Curium/Engine/embed-frameworks.sh");
+			name = "Embed Curium Engine";
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"$SCRIPT_INPUT_FILE_0\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+		C09600010000000000000017 /* Curium.xcconfig */ = {
+			isa = PBXFileReference;
+			lastKnownFileType = text.xcconfig;
+			path = Curium.xcodeproj/Curium.xcconfig;
+			sourceTree = SOURCE_ROOT;
+		};
+	};
+	rootObject = C0960001000000000000000B;
+}

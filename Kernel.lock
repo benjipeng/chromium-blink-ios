@@ -1,0 +1,14 @@
+# Verified Actions artifact for local Curium engine assembly.
+KERNEL_REPO=benjipeng/chromium-blink-ios
+KERNEL_BRANCH=probe/extensions-gn
+KERNEL_COMMIT=1f76114fbc0d5ca7f2b748a4f19fedc4d39edd79
+KERNEL_RUN_ID=44328959472
+KERNEL_ARTIFACT_ID=14443178991
+KERNEL_ARTIFACT_NAME=Chromium-Blink-159.0.8149.0-arm64
+# The supplied digest is for the artifact ZIP; see README for the IPA digest.
+KERNEL_ARTIFACT_ZIP_SHA256=9b24c5ded7e55c996c52512703962cd93c8cf58839bc80cdb9281b7f732f004d
+KERNEL_IPA_SHA256=b34c8abc851a36e05f9a171c2bf73469f168d4b2eb1cdcc8ff3761f8e5973c88
+KERNEL_CHROMIUM_VERSION=159.0.8149.0
+KERNEL_CHROMIUM_REV=34d81e7bfe669b8eccaaf35c6e14c7bfc0689703
+
+# Next staged upstream pin (batch with headless CrIOSBrowserHostV1 patch 0088 to avoid wasted CI runs): CHROMIUM_VERSION=160.0.8171.0 CHROMIUM_REV=952223dc1f0d38fbe36f24ba06f416a4977ed43c

@@ -1,0 +1,191 @@
+import SwiftUI
+
+struct CuriumTabsSheet: View {
+    let store: CuriumBrowserStore
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.layoutDirection) private var layoutDirection
+
+    var body: some View {
+        VStack(spacing: 0) {
+            CuriumSheetHeader(title: "Tabs")
+            GeometryReader { proxy in
+                let width = proxy.size.width
+                let count = width < 680 ? 2 : 4
+                let division = activeDivision(in: proxy)
+                let vertical = division.flatMap { $0.height > $0.width ? $0 : nil }
+                let horizontal = division.flatMap { $0.width > $0.height ? $0 : nil }
+                let above = horizontal.map { max(0, min(proxy.size.height, $0.minY - 8)) }
+                let below = horizontal.map { max(0, proxy.size.height - $0.maxY - 8) }
+                let contentHeight = max(above ?? proxy.size.height, below ?? 0)
+                let top = (below ?? 0) > (above ?? proxy.size.height) ? proxy.size.height - contentHeight : 0
+
+                ScrollView {
+                    let rows = stride(from: 0, to: store.tabs.count, by: count)
+                    LazyVStack(spacing: 14) {
+                        ForEach(Array(rows), id: \.self) { index in
+                            let tabs = Array(store.tabs.dropFirst(index).prefix(count))
+                            tabRow(tabs, count: count, width: width, fold: vertical)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+                .frame(height: contentHeight)
+                .offset(y: top)
+                .scrollBounceBehavior(.basedOnSize)
+            }
+            HStack {
+                Text("\(store.tabs.count) \(store.tabs.count == 1 ? "tab" : "tabs")")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    if store.newTab() { dismiss() }
+                } label: {
+                    Label("New Tab", systemImage: "plus")
+                        .font(.callout.weight(.semibold))
+                        .padding(.horizontal, 18)
+                        .frame(minHeight: CuriumSpace.tapTarget)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .presentationDetents([.large])
+    }
+
+    private func activeDivision(in proxy: GeometryProxy) -> CGRect? {
+        guard #available(iOS 27.1, *) else { return nil }
+        let canvas = CGRect(origin: .zero, size: proxy.size)
+        return proxy.reservedRegions(kind: .division)
+            .first { $0.isActive && $0.frame.intersects(canvas) }?.frame.intersection(canvas)
+    }
+
+    private func tabRow(_ tabs: [CuriumTabModel], count: Int, width: CGFloat, fold: CGRect?) -> some View {
+        let half = count / 2
+        let layout = columnLayout(width: width, columnsPerSide: half, fold: fold)
+        let leftToRight = layoutDirection == .leftToRight
+
+        return HStack(spacing: 0) {
+            cards(Array(tabs.prefix(half)), columns: half)
+                .frame(width: leftToRight ? layout.leftWidth : layout.rightWidth)
+            Spacer(minLength: 0)
+            cards(Array(tabs.dropFirst(half)), columns: half)
+                .frame(width: leftToRight ? layout.rightWidth : layout.leftWidth)
+        }
+        .padding(.leading, leftToRight ? layout.leftInset : layout.rightInset)
+        .padding(.trailing, leftToRight ? layout.rightInset : layout.leftInset)
+    }
+
+    private func columnLayout(width: CGFloat, columnsPerSide: Int, fold: CGRect?)
+        -> (leftWidth: CGFloat, rightWidth: CGFloat, leftInset: CGFloat, rightInset: CGFloat) {
+        var leftInset: CGFloat = 16
+        var rightInset: CGFloat = 16
+        if let fold {
+            let left = max(0, fold.minX - leftInset - 8)
+            let right = max(0, width - rightInset - fold.maxX - 8)
+            let minimumGroup = CGFloat(columnsPerSide) * 96 + CGFloat(columnsPerSide - 1) * 14
+            if min(left, right) >= minimumGroup {
+                return (left, right, leftInset, rightInset)
+            }
+
+            // A sheet can move to one panel and still overlap the hinge at its edge.
+            // In that posture the narrow side is clearance, not a place for cards.
+            if left >= right {
+                rightInset = max(rightInset, width - fold.minX + 8)
+            } else {
+                leftInset = max(leftInset, fold.maxX + 8)
+            }
+        }
+        let group = max(0, (width - leftInset - rightInset - 14) / 2)
+        return (group, group, leftInset, rightInset)
+    }
+
+    private func cards(_ tabs: [CuriumTabModel], columns: Int) -> some View {
+        HStack(spacing: 14) {
+            ForEach(tabs) { tab in
+                CuriumTabCard(tab: tab, selected: store.activeTab?.id == tab.id) {
+                    store.select(tab)
+                    dismiss()
+                } onClose: {
+                    store.close(tab)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            ForEach(0..<max(0, columns - tabs.count), id: \.self) { _ in
+                Color.clear.frame(maxWidth: .infinity)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(height: 162)
+    }
+}
+
+private struct CuriumTabCard: View {
+    let tab: CuriumTabModel
+    let selected: Bool
+    let onOpen: () -> Void
+    let onClose: () -> Void
+    @Environment(\.curiumPalette) private var palette
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 0) {
+                GeometryReader { proxy in
+                    if let snapshot = tab.snapshot {
+                        Image(uiImage: snapshot)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                            .clipped()
+                    } else {
+                        ZStack {
+                            palette.tile
+                            if tab.url == nil {
+                                Text("Cm").font(.system(.title, design: .serif).weight(.medium))
+                            } else {
+                                Image(systemName: "globe")
+                                    .font(.title2.weight(.light))
+                            }
+                        }
+                        .foregroundStyle(palette.tint)
+                    }
+                }
+                HStack(spacing: 5) {
+                    if selected {
+                        Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(palette.tint)
+                    }
+                    Text(tab.title).lineLimit(1).font(.subheadline.weight(.medium))
+                }
+                .padding(10)
+            }
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(.rect(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(selected ? palette.tint : Color(uiColor: .separator), lineWidth: selected ? 2 : 0.5)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tab.title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .overlay(alignment: .topTrailing) {
+            Button(action: onClose) {
+                Label("Close Tab", systemImage: "xmark")
+                    .labelStyle(.iconOnly)
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 28, height: 28)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: Circle())
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close \(tab.title)")
+        }
+    }
+}
