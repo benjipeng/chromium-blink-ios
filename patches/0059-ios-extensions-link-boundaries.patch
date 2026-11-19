@@ -165,7 +165,7 @@ index 152737c..0e7e6c3 100644
      // If we are to include subframes, iterate over all descendants of frames in
      // `pending_render_frames_` and add them if they are alive (and not already
 diff --git a/extensions/browser/script_injection_tracker.cc b/extensions/browser/script_injection_tracker.cc
-index 604cad9..0b54d23 100644
+index 604cad9..57f1e70 100644
 --- a/extensions/browser/script_injection_tracker.cc
 +++ b/extensions/browser/script_injection_tracker.cc
 @@ -15,8 +15,11 @@
@@ -193,3 +193,16 @@ index 604cad9..0b54d23 100644
  
    // The host permission checks below match at origin granularity because the
    // renderer evaluates injection against the document URL at each run
+@@ -554,8 +561,12 @@ void AddMatchingScriptsToProcess(base::PassKey<ScriptInjectionTracker> pass_key,
+       return;
+     }
+ 
++#if BUILDFLAG(IS_IOS)
++    int tab_id = -1;
++#else
+     auto* web_contents = content::WebContents::FromRenderFrameHost(frame);
+     int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
++#endif  // BUILDFLAG(IS_IOS)
+     GURL effective_url = GetEffectiveDocumentURL(
+         frame, url, mojom::MatchOriginAsFallbackBehavior::kAlways);
+     if (extension.permissions_data()->GetPageAccessForSecurityOrigin(

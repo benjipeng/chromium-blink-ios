@@ -91,6 +91,7 @@ obj/ios/chrome/browser/extensions/model/model/ios_store_crx_download.o
 obj/ios/chrome/browser/curium/bootstrap/cr_ios_engine_bootstrap.o
 obj/ios/chrome/browser/curium/curium/curium_browser_host.o
 obj/ios/chrome/browser/curium/curium/curium_browser_provider.o
+obj/ios/chrome/browser/curium/download_router/curium_download_router.o
 obj/ios/chrome/browser/curium/curium/curium_download_task.o
 obj/ios/chrome/browser/curium/curium/curium_tab_host.o
 obj/ios/chrome/browser/curium/curium/curium_web_state_delegate.o

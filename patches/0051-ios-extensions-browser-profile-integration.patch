@@ -1005,7 +1005,7 @@ new file mode 100644
 index 0000000..1ebd7b9
 --- /dev/null
 +++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
-@@ -0,0 +1,761 @@
+@@ -0,0 +1,762 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1597,7 +1597,8 @@ index 0000000..1ebd7b9
 +std::string IOSExtensionsBrowserClient::GetApplicationLocale() {
 +  ApplicationContext* app_context = GetApplicationContext();
 +  if (app_context && app_context->GetApplicationLocaleStorage()) {
-+    return app_context->GetApplicationLocaleStorage()->Get();
++    return std::string(
++        app_context->GetApplicationLocaleStorage()->GetTag().tag_string());
 +  }
 +  return "en-US";
 +}
