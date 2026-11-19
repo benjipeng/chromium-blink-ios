@@ -41,6 +41,15 @@ PY
 remove_framework() {
     /usr/bin/python3 -c 'from pathlib import Path; import shutil, sys; p = Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$destination/$1.framework"
 }
+# Compile the minimal window scene storyboard when engine-linked.
+scene_sb_src="${SRCROOT}/Curium/App/CuriumScene.storyboard"
+scene_sb_out="${assets}/CuriumScene.storyboardc"
+if [ "$CURIUM_USE_ENGINE_XCFRAMEWORK" = YES ] && [ -f "$scene_sb_src" ]; then
+    /usr/bin/ibtool --minimum-deployment-target 26.0 --target-device iphone --target-device ipad --compile "$scene_sb_out" "$scene_sb_src"
+else
+    /usr/bin/python3 -c 'from pathlib import Path; import shutil, sys; p = Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$scene_sb_out"
+fi
+
 if [ "$CURIUM_USE_ENGINE_XCFRAMEWORK" != YES ]; then
     for name in EarlyMallocZoneRegistration chrome_framework Lottie; do
         remove_framework "$name"

@@ -2,8 +2,9 @@ From: Curium <curium@appautomaton.dev>
 Subject: [PATCH] ios: headless Curium Blink shell, extension V2 bridge, and download routing
 
 Routes SceneController into a pure headless Browser + CuriumBrowserHost when
-CrIOSEngineBootstrap has a registered Swift shell delegate, skips Chrome's
-First Run / Search Engine Choice UI and BrowserKit multi-process appex targets,
+CrIOSEngineBootstrap has a registered Swift shell delegate, skips Chrome UI
+BrowserAgents / ProfileAgents / BrowserKit multi-process appex targets, lazily
+initializes SceneDelegate window when launched without a Chrome storyboard,
 isolates downloads per-WebState via CuriumDownloadRouter, hardens
 popup/file-chooser/cookie-clear paths, and exports CrIOSExtensionManagerV1 V2
 toolbar/popup/DNR/command APIs.
@@ -218,10 +219,18 @@ index 558f360..b00dd8e 100644
  
    if (appState.initStage < AppInitStage::kFinal) {
 diff --git a/ios/chrome/app/profile/BUILD.gn b/ios/chrome/app/profile/BUILD.gn
-index 28e3f17..2d297a0 100644
+index 28e3f17..b7d7bc4 100644
 --- a/ios/chrome/app/profile/BUILD.gn
 +++ b/ios/chrome/app/profile/BUILD.gn
-@@ -211,6 +211,7 @@ source_set("first_run_profile_agent") {
+@@ -67,6 +67,7 @@ source_set("profile_controller") {
+     "//ios/chrome/browser/backend_promo/model:backend_promo_profile_agent",
+     "//ios/chrome/browser/collaboration/model:features",
+     "//ios/chrome/browser/content_settings/model",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/browser/credential_provider/model:buildflags",
+     "//ios/chrome/browser/cross_platform_promos/model",
+     "//ios/chrome/browser/enterprise/model/idle",
+@@ -211,6 +212,7 @@ source_set("first_run_profile_agent") {
      "//ios/chrome/app/application_delegate:app_state",
      "//ios/chrome/app/application_delegate:startup_information",
      "//ios/chrome/app/profile",
@@ -229,7 +238,7 @@ index 28e3f17..2d297a0 100644
      "//ios/chrome/browser/authentication/ui_bundled/signin:signin_headers",
      "//ios/chrome/browser/device_orientation/ui_bundled",
      "//ios/chrome/browser/feature_engagement/model",
-@@ -244,6 +245,7 @@ source_set("search_engine_choice_profile_agent") {
+@@ -244,6 +246,7 @@ source_set("search_engine_choice_profile_agent") {
      "//components/strings",
      "//ios/chrome/app/application_delegate:app_state",
      "//ios/chrome/app/profile",
@@ -280,6 +289,29 @@ index 2cb43ce..43bf0ae 100644
      _postActionsCompleted = YES;
      [self releaseUILocks];
      [self.profileState queueTransitionToNextInitStage];
+diff --git a/ios/chrome/app/profile/profile_controller.mm b/ios/chrome/app/profile/profile_controller.mm
+index 6b0d8d5..6acbc30 100644
+--- a/ios/chrome/app/profile/profile_controller.mm
++++ b/ios/chrome/app/profile/profile_controller.mm
+@@ -50,6 +50,7 @@
+ #import "ios/chrome/app/profile/otr_profile_destroyer_profile_agent.h"
+ #import "ios/chrome/app/profile/post_restore_profile_agent.h"
+ #import "ios/chrome/app/profile/profile_state.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/app/profile/profile_state_observer.h"
+ #import "ios/chrome/app/profile/search_engine_choice_profile_agent.h"
+ #import "ios/chrome/app/profile/session_metrics_profile_agent.h"
+@@ -608,6 +609,10 @@ - (void)attachProfileAgents {
+   [_state addAgent:[[OTRPRofileDestroyerProfileAgent alloc] init]];
+   [_state addAgent:[[CertificatePolicyProfileAgent alloc] init]];
+   [_state addAgent:[[FirstRunProfileAgent alloc] init]];
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    [_state addAgent:[[SearchEngineChoiceProfileAgent alloc] init]];
++    return;
++  }
+   [_state addAgent:[[MultiProfileForcedMigrationProfileAgent alloc] init]];
+   [_state addAgent:[[IdentityConfirmationProfileAgent alloc] init]];
+   [_state addAgent:[[ProfileActivityProfileAgent alloc] init]];
 diff --git a/ios/chrome/app/profile/search_engine_choice_profile_agent.mm b/ios/chrome/app/profile/search_engine_choice_profile_agent.mm
 index 5b172af..1fc8a74 100644
 --- a/ios/chrome/app/profile/search_engine_choice_profile_agent.mm
@@ -3253,6 +3285,55 @@ index 3270af3..168b71b 100644
 +}
 +
 +@end
+diff --git a/ios/chrome/browser/main/model/BUILD.gn b/ios/chrome/browser/main/model/BUILD.gn
+index cbac7e9..b73aaac 100644
+--- a/ios/chrome/browser/main/model/BUILD.gn
++++ b/ios/chrome/browser/main/model/BUILD.gn
+@@ -26,6 +26,7 @@ source_set("model") {
+     "//ios/chrome/browser/cobrowse/model",
+     "//ios/chrome/browser/collaboration/model",
+     "//ios/chrome/browser/crash_report/model/breadcrumbs",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/browser/credential_provider/model:buildflags",
+     "//ios/chrome/browser/device_sharing/model",
+     "//ios/chrome/browser/discover_feed/model:discover_feed_visibility_browser_agent",
+diff --git a/ios/chrome/browser/main/model/DEPS b/ios/chrome/browser/main/model/DEPS
+index 7916781..a4203a8 100644
+--- a/ios/chrome/browser/main/model/DEPS
++++ b/ios/chrome/browser/main/model/DEPS
+@@ -13,6 +13,7 @@ specific_include_rules = {
+   "^browser_agent_util.mm": [
+     # go/keep-sorted start
+     "+components/data_sharing/public/features.h",
++    "+ios/chrome/browser/curium/cr_ios_engine_bootstrap.h",
+     "+ios/chrome/browser/app_launcher/model/app_launcher_browser_agent.h",
+     "+ios/chrome/browser/autocomplete/model/autocomplete_browser_agent.h",
+     "+ios/chrome/browser/browser_view/model/browser_view_visibility_notifier_browser_agent.h",
+diff --git a/ios/chrome/browser/main/model/browser_agent_util.mm b/ios/chrome/browser/main/model/browser_agent_util.mm
+index 355566a..0fb7a94 100644
+--- a/ios/chrome/browser/main/model/browser_agent_util.mm
++++ b/ios/chrome/browser/main/model/browser_agent_util.mm
+@@ -17,6 +17,7 @@
+ #import "ios/chrome/browser/collaboration/model/collaboration_service_factory.h"
+ #import "ios/chrome/browser/collaboration/model/data_sharing_browser_agent.h"
+ #import "ios/chrome/browser/crash_report/model/breadcrumbs/breadcrumb_manager_browser_agent.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/credential_provider/model/credential_provider_buildflags.h"
+ #import "ios/chrome/browser/device_sharing/model/device_sharing_browser_agent.h"
+ #import "ios/chrome/browser/device_sharing/model/device_sharing_manager_factory.h"
+@@ -283,6 +284,12 @@ void AttachBrowserAgentsForActiveBrowser(Browser* browser) {
+ }  // anonymous namespace
+ 
+ void AttachBrowserAgents(Browser* browser) {
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    TabsDependencyInstallerManager::CreateForBrowser(browser);
++    WebUsageEnablerBrowserAgent::CreateForBrowser(browser);
++    return;
++  }
++
+   // If the feature is not enabled, treat all Browser identically.
+   if (!base::FeatureList::IsEnabled(kLimitBrowserAgentsForInactiveBrowser)) {
+     AttachBrowserAgentsForInactiveBrowser(browser);
 diff --git a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn b/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
 index 9fa5535..1725644 100644
 --- a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
@@ -3551,6 +3632,29 @@ index 8472351..fb64c65 100644
    if (!_browserLifecycleManager) {
      // Nothing to do if the UI has not yet been created.
      return;
+diff --git a/ios/chrome/browser/shared/coordinator/scene/scene_delegate.mm b/ios/chrome/browser/shared/coordinator/scene/scene_delegate.mm
+index 15d8b52..e4af389 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/scene_delegate.mm
++++ b/ios/chrome/browser/shared/coordinator/scene/scene_delegate.mm
+@@ -19,6 +19,7 @@
+ #import "ios/chrome/app/task_request.h"
+ #import "ios/chrome/app/tests_hook.h"
+ #import "ios/chrome/browser/appearance/ui_bundled/appearance_customization.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/shared/coordinator/scene/chrome_connection_options.h"
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+ #import "ios/chrome/browser/shared/public/features/features.h"
+@@ -107,6 +108,10 @@ - (void)scene:(UIScene*)scene
+ - (void)scene:(UIScene*)scene
+     willConnectToSession:(UISceneSession*)session
+            chromeOptions:(ChromeConnectionOptions*)options {
++  if (!_window && [CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    UIWindow* window = self.window;
++    window.windowScene = base::apple::ObjCCastStrict<UIWindowScene>(scene);
++  }
+   CHECK(_window);
+   CHECK(!_sceneState);
+   MainApplicationDelegate* appDelegate =
 diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
 index 1093d58..7722339 100644
 --- a/ios/web/content/web_state/content_web_state.mm
