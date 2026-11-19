@@ -88,6 +88,12 @@ obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_api_provide
 obj/ios/chrome/browser/extensions/model/model/ios_tabs_api.o
 obj/ios/chrome/browser/extensions/model/model/ios_signed_extension_package.o
 obj/ios/chrome/browser/extensions/model/model/ios_store_crx_download.o
+obj/ios/chrome/browser/curium/bootstrap/cr_ios_engine_bootstrap.o
+obj/ios/chrome/browser/curium/curium/curium_browser_host.o
+obj/ios/chrome/browser/curium/curium/curium_browser_provider.o
+obj/ios/chrome/browser/curium/curium/curium_download_task.o
+obj/ios/chrome/browser/curium/curium/curium_tab_host.o
+obj/ios/chrome/browser/curium/curium/curium_web_state_delegate.o
 EOF
   python3 - <<'PY'
 import os

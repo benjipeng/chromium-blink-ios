@@ -80,3 +80,4 @@
 0085-ios-route-extension-tab-messages.patch
 0086-ios-bind-extension-script-execution-to-real-tabs.patch
 0087-ios-support-extension-action-badges.patch
+0088-ios-curium-headless-shell-and-extension-bridge.patch

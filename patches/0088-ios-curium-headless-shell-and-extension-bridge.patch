@@ -1,0 +1,3132 @@
+From: Curium <curium@appautomaton.com>
+Subject: [PATCH] Add Curium headless shell bridge, extension V2 selectors, and prune unused BrowserKit appexes
+
+Implements CrIOSEngineBootstrap and CrIOSBrowserHostV1/CrIOSTabHostingV1/CrIOSDownloadTaskV1
+under //ios/chrome/browser/curium, intercepts SceneController when a shell bootstrap delegate
+is registered, exports CrIOSEngineBootstrap and CrIOSExtensionManagerV1 with default visibility,
+completes CrIOSExtensionManagingV1 V2 selectors (action presentation, observer, DNR counts,
+popup host, commands), and prunes the three unused multi-process BrowserKit .appex targets.
+
+diff --git a/ios/chrome/app/BUILD.gn b/ios/chrome/app/BUILD.gn
+index 6fabc86..a253989 100644
+--- a/ios/chrome/app/BUILD.gn
++++ b/ios/chrome/app/BUILD.gn
+@@ -327,6 +327,7 @@ source_set("unit_tests") {
+     "//ios/chrome/browser/search_engines/model:template_url_service_factory",
+     "//ios/chrome/browser/sessions/model",
+     "//ios/chrome/browser/sessions/model:fake",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/browser/shared/coordinator/scene",
+     "//ios/chrome/browser/shared/coordinator/scene:scene_state_header",
+     "//ios/chrome/browser/shared/coordinator/scene:scene_testing",
+@@ -868,6 +869,7 @@ source_set("main") {
+     "//ios/chrome/app/startup:ios_enable_sandbox_dump_buildflags",
+     "//ios/chrome/app/startup:startup_basic",
+     "//ios/chrome/browser/crash_report/model",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/browser/shared/model/paths",
+     "//ios/chrome/common",
+     "//ios/public/provider/chrome/browser/primes:primes_api",
+diff --git a/ios/chrome/app/chrome_app.gni b/ios/chrome/app/chrome_app.gni
+index 7e4ffb5..f8cced6 100644
+--- a/ios/chrome/app/chrome_app.gni
++++ b/ios/chrome/app/chrome_app.gni
+@@ -65,86 +65,9 @@ template("chrome_app") {
+   }
+ 
+   if (use_blink) {
+-    template("browserkit_extension") {
+-      _process_target = target_name
+-      _outer_target = _target_name
+-
+-      tweak_info_plist("tweak_${_outer_target}_${_process_target}_plist") {
+-        info_plist = "//content/app/ios/appex/${_process_target}.plist"
+-      }
+-
+-      extension_bundle_data("${_outer_target}_${_process_target}_bundle") {
+-        forward_variables_from(invoker, TESTONLY_AND_VISIBILITY)
+-        extension_dir = "Extensions"
+-        extension_name = "${_outer_target}_${_process_target}.appex"
+-        extension_target = ":${_outer_target}_${_process_target}"
+-      }
+-
+-      compile_entitlements("${_outer_target}_${_process_target}_entitlements") {
+-        substitutions = [ "IOS_BUNDLE_ID_PREFIX=$ios_app_bundle_id_prefix" ]
+-        output_name = "$target_gen_dir/${target_name}.appex.entitlements"
+-        entitlements_templates =
+-            [ "//content/app/ios/appex/${_process_target}.appex.entitlements" ]
+-      }
+-
+-      # We don't use ios_appex_bundle here because we don't want to mess with
+-      # multiple toolkits as the core framework is built with the default
+-      # toolkit.
+-      ios_app_bundle("${_outer_target}_${_process_target}") {
+-        forward_variables_from(invoker,
+-                               "*",
+-                               [
+-                                 "defines",
+-                                 "deps",
+-                                 "framework_dirs",
+-                                 "frameworks",
+-                                 "public_deps",
+-                                 "sources",
+-                                 "target_name",
+-                               ])
+-
+-        output_name = target_name
+-        transparent = true
+-
+-        deps = [
+-          ":${_outer_target}_framework+link",
+-          "//content/app/ios/appex:${_process_target}",
+-        ]
+-
+-        if (!defined(ldflags)) {
+-          ldflags = []
+-        }
+-
+-        ldflags += [
+-          "-Wl,-no_application_extension",
+-          "-Wl,-rpath,@executable_path/../../Frameworks",
+-        ]
+-
+-        product_type = "com.apple.product-type.app-extension"
+-        entitlements_target = ":${target_name}_entitlements"
+-        info_plist_target = ":tweak_${target_name}_plist"
+-      }
+-    }
+-
+-    set_defaults("browserkit_extension") {
+-      configs = [ "//build/config/ios:ios_extension_executable_flags" ]
+-    }
+-
+-    browserkit_extension("gpu_process") {
+-      forward_variables_from(invoker, TESTONLY_AND_VISIBILITY)
+-      bundle_identifier = "$ios_chromium_bundle_id.GPUProcessExtension"
+-    }
+-
+-    browserkit_extension("network_process") {
+-      forward_variables_from(invoker, TESTONLY_AND_VISIBILITY)
+-      bundle_identifier = "$ios_chromium_bundle_id.NetworkProcessExtension"
+-    }
+-
+-    browserkit_extension("content_process") {
+-      forward_variables_from(invoker, TESTONLY_AND_VISIBILITY)
+-      bundle_identifier = "$ios_chromium_bundle_id.ContentProcessExtension"
+-    }
+-
++    # [curium-headless] Single-process Blink sideload runs GPU, Network, and
++    # Content in-process, so skip building the three unused BrowserKit .appex
++    # extension binaries and their plist/entitlement actions.
+     ios_app_bundle(_target_name) {
+       forward_variables_from(invoker,
+                              "*",
+@@ -162,9 +85,6 @@ template("chrome_app") {
+ 
+       deps = [
+         ":${_target_name}_framework+link",
+-        ":${target_name}_content_process_bundle",
+-        ":${target_name}_gpu_process_bundle",
+-        ":${target_name}_network_process_bundle",
+         "//ios/chrome/app:app_trampoline",
+         "//ios/chrome/app:early_partition_alloc_framework+bundle",
+         "//ios/chrome/app:early_partition_alloc_framework+link",
+diff --git a/ios/chrome/app/chrome_main.mm b/ios/chrome/app/chrome_main.mm
+index 561825f..c34d294 100644
+--- a/ios/chrome/app/chrome_main.mm
++++ b/ios/chrome/app/chrome_main.mm
+@@ -21,6 +21,7 @@
+ #import "ios/chrome/app/startup/ios_enable_sandbox_dump_buildflags.h"
+ #import "ios/chrome/app/tests_hook.h"
+ #import "ios/chrome/browser/crash_report/model/crash_helper.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+ #import "ios/public/provider/chrome/browser/primes/primes_api.h"
+ 
+@@ -69,6 +70,9 @@ int RunUIApplicationMain(int argc, char* argv[]) {
+     // Info.plist under the "UIApplicationDelegate" key.
+     NSString* delegate_class_name = [[NSBundle mainBundle]
+         objectForInfoDictionaryKey:kUIApplicationDelegateInfoKey];
++    if (!delegate_class_name && [CrIOSEngineBootstrap shellBootstrapDelegate]) {
++      delegate_class_name = @"MainApplicationDelegate";
++    }
+     CHECK(delegate_class_name);
+ 
+     return UIApplicationMain(argc, argv, nil, delegate_class_name);
+diff --git a/ios/chrome/app/main_application_delegate.mm b/ios/chrome/app/main_application_delegate.mm
+index f58c5fa..9b3c1db 100644
+--- a/ios/chrome/app/main_application_delegate.mm
++++ b/ios/chrome/app/main_application_delegate.mm
+@@ -28,6 +28,7 @@
+ #import "ios/chrome/browser/commerce/model/push_notification/push_notification_feature.h"
+ #import "ios/chrome/browser/content_notification/model/content_notification_util.h"
+ #import "ios/chrome/browser/crash_report/model/crash_keys_helper.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/download/model/background_service/background_download_service_factory.h"
+ #import "ios/chrome/browser/keyboard/ui_bundled/menu_builder.h"
+ #import "ios/chrome/browser/push_notification/model/push_notification_delegate.h"
+@@ -138,6 +139,20 @@ - (BOOL)application:(UIApplication*)application
+   return YES;
+ }
+ 
++- (UISceneConfiguration*)application:(UIApplication*)application
++    configurationForConnectingSceneSession:
++        (UISceneSession*)connectingSceneSession
++                                   options:(UISceneConnectionOptions*)options {
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    UISceneConfiguration* config = [[UISceneConfiguration alloc]
++        initWithName:@"Default Configuration"
++         sessionRole:connectingSceneSession.role];
++    config.delegateClass = [SceneDelegate class];
++    return config;
++  }
++  return [connectingSceneSession.configuration copy];
++}
++
+ - (void)applicationWillTerminate:(UIApplication*)application {
+   // Any report captured from this point on should be noted as after terminate.
+   crash_keys::SetCrashedAfterAppWillTerminate();
+diff --git a/ios/chrome/app/main_controller.mm b/ios/chrome/app/main_controller.mm
+index 558f360..b00dd8e 100644
+--- a/ios/chrome/app/main_controller.mm
++++ b/ios/chrome/app/main_controller.mm
+@@ -91,6 +91,7 @@
+ #import "ios/chrome/browser/banner_promo/model/default_browser_banner_promo_app_agent.h"
+ #import "ios/chrome/browser/content_settings/model/host_content_settings_map_factory.h"
+ #import "ios/chrome/browser/crash_report/model/crash_helper.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ #import "ios/chrome/browser/crash_report/model/crash_keys_helper.h"
+ #import "ios/chrome/browser/crash_report/model/crash_loop_detection_util.h"
+ #import "ios/chrome/browser/crash_report/model/crash_report_helper.h"
+@@ -996,7 +997,13 @@ - (void)appState:(AppState*)appState sceneConnected:(SceneState*)sceneState {
+   // initialisation (e.g. fetching variation seeds, load profiles' preferences,
+   // migrating session storage, ...).
+   UIWindow* window = sceneState.window;
+-  window.rootViewController = [[LaunchScreenViewController alloc] init];
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    UIViewController* placeholder = [[UIViewController alloc] init];
++    placeholder.view.backgroundColor = [UIColor systemBackgroundColor];
++    window.rootViewController = placeholder;
++  } else {
++    window.rootViewController = [[LaunchScreenViewController alloc] init];
++  }
+   window.hidden = NO;
+ 
+   if (appState.initStage < AppInitStage::kFinal) {
+diff --git a/ios/chrome/browser/curium/BUILD.gn b/ios/chrome/browser/curium/BUILD.gn
+new file mode 100644
+index 0000000..3cb45e1
+--- /dev/null
++++ b/ios/chrome/browser/curium/BUILD.gn
+@@ -0,0 +1,63 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++source_set("contract_headers") {
++  sources = [ "curium_engine_contract_internal.h" ]
++  frameworks = [ "UIKit.framework" ]
++}
++
++source_set("bootstrap") {
++  sources = [
++    "cr_ios_engine_bootstrap.h",
++    "cr_ios_engine_bootstrap.mm",
++  ]
++  public_deps = [ ":contract_headers" ]
++  deps = [ "//base" ]
++  frameworks = [ "UIKit.framework" ]
++}
++
++source_set("curium") {
++  sources = [
++    "curium_browser_host.h",
++    "curium_browser_host.mm",
++    "curium_browser_provider.h",
++    "curium_browser_provider.mm",
++    "curium_download_task.h",
++    "curium_download_task.mm",
++    "curium_tab_host.h",
++    "curium_tab_host.mm",
++    "curium_web_state_delegate.h",
++    "curium_web_state_delegate.mm",
++  ]
++  public_deps = [
++    ":bootstrap",
++    ":contract_headers",
++    "//ios/chrome/browser/shared/model/browser",
++  ]
++  deps = [
++    "//base",
++    "//build:blink_buildflags",
++    "//content/public/browser",
++    "//ios/chrome/browser/shared/model/profile",
++    "//ios/chrome/browser/shared/model/web_state_list",
++    "//ios/chrome/browser/shared/public/commands",
++    "//ios/chrome/browser/web/model/choose_file",
++    "//ios/web/common:user_agent",
++    "//ios/web/content",
++    "//ios/web/public",
++    "//ios/web/public/download",
++    "//ios/web/public/find_in_page",
++    "//ios/web/public/navigation",
++    "//ios/web/public/permissions",
++    "//ios/web/public/ui",
++    "//net",
++    "//services/network/public/mojom",
++    "//third_party/blink/public/common",
++    "//third_party/blink/public/mojom:mojom_platform",
++    "//ui/base",
++    "//ui/base/mojom",
++    "//url",
++  ]
++  frameworks = [ "UIKit.framework" ]
++}
+diff --git a/ios/chrome/browser/curium/DEPS b/ios/chrome/browser/curium/DEPS
+new file mode 100644
+index 0000000..d0e2cce
+--- /dev/null
++++ b/ios/chrome/browser/curium/DEPS
+@@ -0,0 +1,18 @@
++include_rules = [
++  "+content/public/browser",
++  "+extensions/buildflags",
++  "+ios/chrome/browser/curium",
++  "+ios/chrome/browser/shared/model/browser",
++  "+ios/chrome/browser/shared/model/profile",
++  "+ios/chrome/browser/shared/model/web_state_list",
++  "+ios/chrome/browser/shared/public/commands",
++  "+ios/chrome/browser/web/model/choose_file",
++  "+ios/web/common",
++  "+ios/web/content",
++  "+ios/web/public",
++  "+net",
++  "+services/network/public/mojom",
++  "+third_party/blink/public/common",
++  "+third_party/blink/public/mojom",
++  "+ui/base",
++]
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h
+new file mode 100644
+index 0000000..6f98ff6
+--- /dev/null
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h
+@@ -0,0 +1,10 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CR_IOS_ENGINE_BOOTSTRAP_H_
++#define IOS_CHROME_BROWSER_CURIUM_CR_IOS_ENGINE_BOOTSTRAP_H_
++
++#import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CR_IOS_ENGINE_BOOTSTRAP_H_
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+new file mode 100644
+index 0000000..94b20cb
+--- /dev/null
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
++
++#import "base/check.h"
++
++namespace {
++id<CrIOSShellBootstrapDelegate> g_shell_bootstrap_delegate = nil;
++}  // namespace
++
++@implementation CrIOSEngineBootstrap
++
+++ (void)registerShellBootstrapDelegate:
++    (nullable id<CrIOSShellBootstrapDelegate>)delegate {
++  CHECK([NSThread isMainThread]);
++  g_shell_bootstrap_delegate = delegate;
++}
++
+++ (nullable id<CrIOSShellBootstrapDelegate>)shellBootstrapDelegate {
++  CHECK([NSThread isMainThread]);
++  return g_shell_bootstrap_delegate;
++}
++
++@end
+diff --git a/ios/chrome/browser/curium/curium_browser_host.h b/ios/chrome/browser/curium/curium_browser_host.h
+new file mode 100644
+index 0000000..76d2e99
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_browser_host.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_HOST_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_HOST_H_
++
++#import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
++
++class Browser;
++@class SceneState;
++
++@interface CuriumBrowserHost : NSObject <CrIOSBrowserHostV1>
++
++- (instancetype)initWithBrowser:(Browser*)browser
++                     sceneState:(SceneState*)sceneState
++    NS_DESIGNATED_INITIALIZER;
++- (instancetype)init NS_UNAVAILABLE;
++
++- (void)shutdown;
++
++@end
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_HOST_H_
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+new file mode 100644
+index 0000000..c88735f
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -0,0 +1,592 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_browser_host.h"
++
++#import <map>
++#import <memory>
++#import <utility>
++#import <vector>
++
++#import "base/barrier_closure.h"
++#import "base/check.h"
++#import "base/functional/bind.h"
++#import "base/functional/callback_helpers.h"
++#import "base/memory/raw_ptr.h"
++#import "base/scoped_observation.h"
++#import "base/strings/sys_string_conversions.h"
++#import "base/time/time.h"
++#import "content/public/browser/browser_context.h"
++#import "content/public/browser/download_manager.h"
++#import "content/public/browser/storage_partition.h"
++#import "content/public/browser/web_contents.h"
++#import "ios/chrome/browser/curium/curium_download_task.h"
++#import "ios/chrome/browser/curium/curium_tab_host.h"
++#import "ios/chrome/browser/curium/curium_web_state_delegate.h"
++#import "ios/chrome/browser/shared/model/browser/browser.h"
++#import "ios/chrome/browser/shared/model/profile/profile_ios.h"
++#import "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
++#import "ios/chrome/browser/shared/model/web_state_list/web_state_list_observer.h"
++#import "ios/chrome/browser/web/model/choose_file/choose_file_event.h"
++#import "ios/web/content/content_browser_context.h"
++#import "ios/web/content/web_state/content_web_state.h"
++#import "ios/web/public/download/download_controller.h"
++#import "ios/web/public/download/download_controller_delegate.h"
++#import "ios/web/public/download/download_task.h"
++#import "ios/web/public/navigation/navigation_manager.h"
++#import "ios/web/public/web_state.h"
++#import "net/base/apple/url_conversions.h"
++#import "net/base/schemeful_site.h"
++#import "net/cookies/canonical_cookie.h"
++#import "net/cookies/cookie_options.h"
++#import "net/cookies/cookie_partition_key_collection.h"
++#import "services/network/public/mojom/cookie_manager.mojom.h"
++#import "services/network/public/mojom/network_context.mojom.h"
++#import "third_party/blink/public/common/storage_key/storage_key.h"
++#import "ui/base/page_transition_types.h"
++
++@interface CuriumBrowserHost ()
++- (void)handleWebStateInserted:(web::WebState*)webState;
++- (void)handleWebStateDetached:(web::WebState*)webState;
++- (void)handleActiveWebStateChanged:(web::WebState*)oldActive
++                          newActive:(web::WebState*)newActive;
++- (void)handleDownloadCreated:(std::unique_ptr<web::DownloadTask>)task
++                     webState:(web::WebState*)webState;
++- (void)handleDownloadControllerDestroyed:(web::DownloadController*)controller;
++@end
++
++namespace {
++
++class CuriumWebStateListObserver final : public WebStateListObserver {
++ public:
++  explicit CuriumWebStateListObserver(CuriumBrowserHost* owner)
++      : owner_(owner) {}
++
++  void WebStateListDidChange(WebStateList* web_state_list,
++                             const WebStateListChange& change,
++                             const WebStateListStatus& status) override {
++    switch (change.type()) {
++      case WebStateListChange::Type::kInsert:
++        [owner_
++            handleWebStateInserted:change.As<WebStateListChangeInsert>()
++                                       .inserted_web_state()];
++        break;
++      case WebStateListChange::Type::kDetach:
++        [owner_
++            handleWebStateDetached:change.As<WebStateListChangeDetach>()
++                                       .detached_web_state()];
++        break;
++      case WebStateListChange::Type::kReplace: {
++        const auto& replace = change.As<WebStateListChangeReplace>();
++        [owner_ handleWebStateDetached:replace.replaced_web_state()];
++        [owner_ handleWebStateInserted:replace.inserted_web_state()];
++        break;
++      }
++      case WebStateListChange::Type::kMove:
++      case WebStateListChange::Type::kStatusOnly:
++      case WebStateListChange::Type::kGroupCreate:
++      case WebStateListChange::Type::kGroupVisualDataUpdate:
++      case WebStateListChange::Type::kGroupMove:
++      case WebStateListChange::Type::kGroupDelete:
++        break;
++    }
++    if (status.active_web_state_change()) {
++      [owner_ handleActiveWebStateChanged:status.old_active_web_state
++                                newActive:status.new_active_web_state];
++    }
++    if (change.type() != WebStateListChange::Type::kStatusOnly ||
++        status.active_web_state_change()) {
++      [owner_.delegate browserHostDidUpdateTabs:owner_];
++    }
++  }
++
++ private:
++  __weak CuriumBrowserHost* owner_;
++};
++
++class CuriumDownloadControllerBridge final
++    : public web::DownloadControllerDelegate {
++ public:
++  explicit CuriumDownloadControllerBridge(CuriumBrowserHost* owner)
++      : owner_(owner) {}
++
++  void OnDownloadCreated(web::DownloadController*,
++                         web::WebState* web_state,
++                         std::unique_ptr<web::DownloadTask> task) override {
++    [owner_ handleDownloadCreated:std::move(task) webState:web_state];
++  }
++
++  void OnDownloadControllerDestroyed(
++      web::DownloadController* controller) override {
++    [owner_ handleDownloadControllerDestroyed:controller];
++  }
++
++ private:
++  __weak CuriumBrowserHost* owner_;
++};
++
++void OnCookieListFetched(
++    void (^completion)(NSString* _Nullable),
++    const net::CookieAccessResultList& cookies,
++    const net::CookieAccessResultList& excluded_cookies) {
++  if (cookies.empty()) {
++    completion(nil);
++    return;
++  }
++  const std::string line = net::CanonicalCookie::BuildCookieLine(cookies);
++  completion(line.empty() ? nil : base::SysUTF8ToNSString(line));
++}
++
++}  // namespace
++
++@implementation CuriumBrowserHost {
++  raw_ptr<Browser> _browser;
++  std::unique_ptr<CuriumWebStateDelegate> _webStateDelegate;
++  std::unique_ptr<CuriumWebStateListObserver> _listObserver;
++  std::unique_ptr<CuriumDownloadControllerBridge> _downloadBridge;
++  base::ScopedObservation<WebStateList, WebStateListObserver>
++      _listObservation;
++  raw_ptr<web::DownloadController> _downloadController;
++  std::map<web::WebState*, __strong CuriumTabHost*> _tabHosts;
++  NSMutableArray<CuriumDownloadTask*>* _downloads;
++  BOOL _isShutdown;
++}
++
++@synthesize delegate = _delegate;
++
++- (instancetype)initWithBrowser:(Browser*)browser
++                     sceneState:(SceneState*)sceneState {
++  self = [super init];
++  if (self) {
++    CHECK(browser);
++    _browser = browser;
++    _downloads = [[NSMutableArray alloc] init];
++    _webStateDelegate = std::make_unique<CuriumWebStateDelegate>(browser, self);
++    _listObserver = std::make_unique<CuriumWebStateListObserver>(self);
++    _listObservation.Observe(browser->GetWebStateList());
++
++    WebStateList* list = browser->GetWebStateList();
++    for (int i = 0; i < list->count(); ++i) {
++      [self handleWebStateInserted:list->GetWebStateAt(i)];
++    }
++
++    _downloadBridge = std::make_unique<CuriumDownloadControllerBridge>(self);
++    _downloadController =
++        web::DownloadController::FromBrowserState(browser->GetProfile());
++    if (_downloadController) {
++      _downloadController->SetDelegate(_downloadBridge.get());
++    }
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [self shutdown];
++}
++
++- (void)shutdown {
++  if (_isShutdown) {
++    return;
++  }
++  _isShutdown = YES;
++  if (_downloadController &&
++      _downloadController->GetDelegate() == _downloadBridge.get()) {
++    _downloadController->SetDelegate(nullptr);
++  }
++  _downloadController = nullptr;
++  _downloadBridge.reset();
++
++  for (CuriumDownloadTask* task in _downloads) {
++    [task invalidate];
++  }
++  [_downloads removeAllObjects];
++
++  _listObservation.Reset();
++  _listObserver.reset();
++
++  for (auto& [ws, tabHost] : _tabHosts) {
++    if (ws && ws->GetDelegate() == _webStateDelegate.get()) {
++      ws->SetDelegate(nullptr);
++    }
++    [tabHost detach];
++  }
++  _tabHosts.clear();
++  _webStateDelegate.reset();
++  _browser = nullptr;
++}
++
++#pragma mark - CrIOSBrowserHostV1
++
++- (NSArray<id<CrIOSTabHostingV1>>*)tabs {
++  if (_isShutdown || !_browser) {
++    return @[];
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  NSMutableArray<id<CrIOSTabHostingV1>>* result =
++      [NSMutableArray arrayWithCapacity:list->count()];
++  for (int i = 0; i < list->count(); ++i) {
++    if (CuriumTabHost* tab = [self tabHostForWebState:list->GetWebStateAt(i)]) {
++      [result addObject:tab];
++    }
++  }
++  return [result copy];
++}
++
++- (nullable id<CrIOSTabHostingV1>)activeTab {
++  if (_isShutdown || !_browser) {
++    return nil;
++  }
++  return [self
++      tabHostForWebState:_browser->GetWebStateList()->GetActiveWebState()];
++}
++
++- (nullable id<CrIOSTabHostingV1>)createTabWithURL:(nullable NSURL*)url
++                                          activate:(BOOL)activate {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser) {
++    return nil;
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  if (list->IsMutating()) {
++    return nil;
++  }
++  web::WebState::CreateParams create_params(_browser->GetProfile());
++  std::unique_ptr<web::WebState> web_state =
++      web::WebState::Create(create_params);
++  if (!web_state) {
++    return nil;
++  }
++  web::WebState* raw_ws = web_state.get();
++  if (url) {
++    const GURL gurl = net::GURLWithNSURL(url);
++    if (gurl.is_valid()) {
++      web::NavigationManager::WebLoadParams load_params(gurl);
++      load_params.transition_type = ui::PAGE_TRANSITION_TYPED;
++      raw_ws->GetNavigationManager()->LoadURLWithParams(load_params);
++    }
++  }
++  list->InsertWebState(std::move(web_state),
++                       WebStateList::InsertionParams::AtIndex(list->count())
++                           .Activate(activate || list->empty()));
++  return [self tabHostForWebState:raw_ws];
++}
++
++- (BOOL)activateTabWithID:(NSString*)tabID {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || tabID.length == 0) {
++    return NO;
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  for (int i = 0; i < list->count(); ++i) {
++    if (CuriumTabHost* tab = [self tabHostForWebState:list->GetWebStateAt(i)]) {
++      if ([tab.tabID isEqualToString:tabID]) {
++        list->ActivateWebStateAt(i);
++        return YES;
++      }
++    }
++  }
++  return NO;
++}
++
++- (BOOL)closeTabWithID:(NSString*)tabID {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || tabID.length == 0) {
++    return NO;
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  for (int i = 0; i < list->count(); ++i) {
++    if (CuriumTabHost* tab = [self tabHostForWebState:list->GetWebStateAt(i)]) {
++      if ([tab.tabID isEqualToString:tabID]) {
++        list->CloseWebStateAt(i, WebStateList::ClosingReason::kUserAction);
++        return YES;
++      }
++    }
++  }
++  return NO;
++}
++
++- (void)clearBrowsingDataOfTypes:(CrIOSBrowsingDataTypes)types
++                   modifiedSince:(NSDate*)date
++                      completion:(void (^)(NSError* _Nullable))completion {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || types == 0) {
++    completion(nil);
++    return;
++  }
++  content::BrowserContext* context =
++      web::ContentBrowserContext::FromBrowserState(_browser->GetProfile());
++  content::StoragePartition* partition =
++      context ? context->GetDefaultStoragePartition() : nullptr;
++  if (!partition) {
++    completion(nil);
++    return;
++  }
++
++  const base::Time begin = date ? base::Time::FromNSDate(date) : base::Time();
++  const base::Time end = base::Time::Max();
++
++  uint32_t partition_mask = 0;
++  if (types & CrIOSBrowsingDataTypesCookies) {
++    partition_mask |= content::StoragePartition::REMOVE_DATA_MASK_COOKIES;
++  }
++  if (types & CrIOSBrowsingDataTypesSiteStorage) {
++    partition_mask |=
++        content::StoragePartition::REMOVE_DATA_MASK_FILE_SYSTEMS |
++        content::StoragePartition::REMOVE_DATA_MASK_INDEXEDDB |
++        content::StoragePartition::REMOVE_DATA_MASK_LOCAL_STORAGE |
++        content::StoragePartition::REMOVE_DATA_MASK_WEBSQL_DEPRECATED |
++        content::StoragePartition::REMOVE_DATA_MASK_SERVICE_WORKERS |
++        content::StoragePartition::REMOVE_DATA_MASK_CACHE_STORAGE |
++        content::StoragePartition::REMOVE_DATA_MASK_MEDIA_LICENSES |
++        content::StoragePartition::REMOVE_DATA_MASK_BACKGROUND_FETCH |
++        content::StoragePartition::REMOVE_DATA_MASK_DEVICE_BOUND_SESSIONS;
++  }
++  if (types & CrIOSBrowsingDataTypesCache) {
++    partition_mask |= content::StoragePartition::REMOVE_DATA_MASK_SHADER_CACHE;
++  }
++
++  const bool clear_cache = (types & CrIOSBrowsingDataTypesCache) != 0;
++  const bool clear_downloads =
++      (types & CrIOSBrowsingDataTypesDownloads) != 0 &&
++      context->GetDownloadManager() != nullptr;
++
++  int pending_ops = (partition_mask != 0 ? 1 : 0) + (clear_cache ? 2 : 0) +
++                    (clear_downloads ? 1 : 0);
++  if (pending_ops == 0) {
++    completion(nil);
++    return;
++  }
++
++  void (^copiedCompletion)(NSError* _Nullable) = [completion copy];
++  base::RepeatingClosure barrier = base::BarrierClosure(
++      pending_ops, base::BindOnce(^(void) {
++        copiedCompletion(nil);
++      }));
++
++  if (partition_mask != 0) {
++    partition->ClearData(
++        partition_mask, /*filter_builder=*/nullptr,
++        content::StoragePartition::StorageKeyPolicyMatcherFunction(),
++        /*cookie_deletion_filter=*/nullptr,
++        /*perform_storage_cleanup=*/false, begin, end, barrier);
++  }
++  if (clear_cache) {
++    partition->GetNetworkContext()->ClearHttpCache(begin, end, nullptr,
++                                                   barrier);
++    partition->ClearCodeCaches(begin, end,
++                               base::RepeatingCallback<bool(const GURL&)>(),
++                               barrier);
++  }
++  if (clear_downloads) {
++    context->GetDownloadManager()->RemoveDownloadsByURLAndTime(
++        base::BindRepeating([](const GURL&) { return true; }), begin, end,
++        barrier);
++  }
++}
++
++- (void)cookieHeaderForURL:(NSURL*)url
++               inTabWithID:(NSString*)tabID
++                completion:(void (^)(NSString* _Nullable))completion {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || !url) {
++    completion(nil);
++    return;
++  }
++  const GURL gurl = net::GURLWithNSURL(url);
++  if (!gurl.is_valid()) {
++    completion(nil);
++    return;
++  }
++
++  CuriumTabHost* tab = [self tabHostForTabID:tabID];
++  web::WebState* ws = tab ? tab.webState : nullptr;
++  content::BrowserContext* context =
++      web::ContentBrowserContext::FromBrowserState(_browser->GetProfile());
++  content::StoragePartition* partition = nullptr;
++  net::CookiePartitionKeyCollection key_collection;
++
++  if (ws) {
++    auto* cws = static_cast<web::ContentWebState*>(ws);
++    if (content::WebContents* wc = cws->GetWebContents()) {
++      partition = wc->GetBrowserContext()->GetStoragePartition(
++          wc->GetSiteInstance());
++      const GURL& top_url = ws->GetLastCommittedURL();
++      if (top_url.is_valid() && !net::SchemefulSite(top_url).opaque()) {
++        key_collection = net::CookiePartitionKeyCollection::MatchesSite(
++            net::SchemefulSite(top_url));
++      }
++    }
++  }
++  if (!partition && context) {
++    partition = context->GetDefaultStoragePartition();
++  }
++  if (!partition || !partition->GetCookieManagerForBrowserProcess()) {
++    completion(nil);
++    return;
++  }
++
++  void (^copiedCompletion)(NSString* _Nullable) = [completion copy];
++  partition->GetCookieManagerForBrowserProcess()->GetCookieList(
++      gurl, net::CookieOptions::MakeAllInclusive(), key_collection,
++      base::BindOnce(&OnCookieListFetched, copiedCompletion));
++}
++
++#pragma mark - Internal / Observer routing
++
++- (nullable CuriumTabHost*)tabHostForWebState:(web::WebState*)webState {
++  if (!webState) {
++    return nil;
++  }
++  auto it = _tabHosts.find(webState);
++  return it != _tabHosts.end() ? it->second : nil;
++}
++
++- (nullable CuriumTabHost*)tabHostForTabID:(NSString*)tabID {
++  if (tabID.length == 0) {
++    return nil;
++  }
++  for (const auto& [ws, tabHost] : _tabHosts) {
++    if ([tabHost.tabID isEqualToString:tabID]) {
++      return tabHost;
++    }
++  }
++  return nil;
++}
++
++- (void)handleWebStateInserted:(web::WebState*)webState {
++  if (!webState || _isShutdown) {
++    return;
++  }
++  webState->ForceRealized();
++  webState->SetDelegate(_webStateDelegate.get());
++  if (!_tabHosts.contains(webState)) {
++    _tabHosts.emplace(
++        webState, [[CuriumTabHost alloc] initWithWebState:webState
++                                              browserHost:self]);
++  }
++}
++
++- (void)handleWebStateDetached:(web::WebState*)webState {
++  if (!webState) {
++    return;
++  }
++  if (webState->GetDelegate() == _webStateDelegate.get()) {
++    webState->SetDelegate(nullptr);
++  }
++  auto it = _tabHosts.find(webState);
++  if (it != _tabHosts.end()) {
++    [it->second detach];
++    _tabHosts.erase(it);
++  }
++}
++
++- (void)handleActiveWebStateChanged:(web::WebState*)oldActive
++                          newActive:(web::WebState*)newActive {
++  if (oldActive && oldActive->IsRealized()) {
++    oldActive->WasHidden();
++  }
++  if (newActive) {
++    newActive->WasShown();
++  }
++}
++
++- (void)tabHostDidUpdate:(CuriumTabHost*)tabHost {
++  if (!_isShutdown) {
++    [_delegate browserHost:self didUpdateTab:tabHost];
++  }
++}
++
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didLoadResourceURL:(NSURL*)url
++              mimeType:(nullable NSString*)mimeType
++        httpStatusCode:(NSInteger)httpStatusCode
++         contentLength:(int64_t)contentLength {
++  if (_isShutdown) {
++    return;
++  }
++  if ([_delegate respondsToSelector:@selector
++                 (browserHost:tab:didLoadResourceURL:mimeType:httpStatusCode:contentLength:)]) {
++    [_delegate browserHost:self
++                       tab:tabHost
++        didLoadResourceURL:url
++                  mimeType:mimeType
++            httpStatusCode:httpStatusCode
++             contentLength:contentLength];
++  }
++}
++
++- (void)tabHost:(CuriumTabHost*)tabHost
++    runFileChooserWithEvent:(const ChooseFileEvent&)event
++                 completion:(void (^)(NSArray<NSURL*>* _Nullable))completion {
++  if (_isShutdown ||
++      ![_delegate respondsToSelector:@selector
++                  (browserHost:runFileChooserForTab:acceptTypes:allowsMultipleSelection:captureHint:completion:)]) {
++    completion(nil);
++    return;
++  }
++
++  NSMutableArray<NSString*>* acceptTypes = [NSMutableArray array];
++  for (const std::string& mime : event.accept_mime_types) {
++    if (NSString* s = base::SysUTF8ToNSString(mime)) {
++      [acceptTypes addObject:s];
++    }
++  }
++  for (const std::string& ext : event.accept_file_extensions) {
++    if (NSString* s = base::SysUTF8ToNSString(ext)) {
++      [acceptTypes addObject:s];
++    }
++  }
++  NSString* captureHint = nil;
++  switch (event.capture) {
++    case ChooseFileCaptureType::kUser:
++      captureHint = @"user";
++      break;
++    case ChooseFileCaptureType::kEnvironment:
++      captureHint = @"environment";
++      break;
++    case ChooseFileCaptureType::kNone:
++      captureHint = nil;
++      break;
++  }
++
++  __block BOOL completed = NO;
++  [_delegate browserHost:self
++         runFileChooserForTab:tabHost
++                  acceptTypes:[acceptTypes copy]
++      allowsMultipleSelection:event.allow_multiple_files
++                  captureHint:captureHint
++                   completion:^(NSArray<NSURL*>* _Nullable fileURLs) {
++                     if (completed) {
++                       return;
++                     }
++                     completed = YES;
++                     completion(fileURLs);
++                   }];
++}
++
++- (void)handleDownloadCreated:(std::unique_ptr<web::DownloadTask>)task
++                     webState:(web::WebState*)webState {
++  if (_isShutdown || !task) {
++    return;
++  }
++  CuriumTabHost* sourceTab = [self tabHostForWebState:webState];
++  if (![_delegate respondsToSelector:@selector(browserHost:didCreateDownload:)]) {
++    task->Cancel();
++    return;
++  }
++  CuriumDownloadTask* wrapper =
++      [[CuriumDownloadTask alloc] initWithDownloadTask:std::move(task)
++                                           sourceTabID:sourceTab.tabID];
++  [_downloads addObject:wrapper];
++  [_delegate browserHost:self didCreateDownload:wrapper];
++}
++
++- (void)handleDownloadControllerDestroyed:(web::DownloadController*)controller {
++  if (controller == _downloadController) {
++    controller->SetDelegate(nullptr);
++    _downloadController = nullptr;
++  }
++}
++
++@end
+diff --git a/ios/chrome/browser/curium/curium_browser_provider.h b/ios/chrome/browser/curium/curium_browser_provider.h
+new file mode 100644
+index 0000000..8e25b64
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_browser_provider.h
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
++
++#import "ios/chrome/browser/shared/model/browser/browser_provider_interface.h"
++
++class Browser;
++
++@interface CuriumBrowserProvider : NSObject <BrowserProviderInterface>
++- (instancetype)initWithBrowser:(Browser*)browser NS_DESIGNATED_INITIALIZER;
++- (instancetype)init NS_UNAVAILABLE;
++@end
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
+diff --git a/ios/chrome/browser/curium/curium_browser_provider.mm b/ios/chrome/browser/curium/curium_browser_provider.mm
+new file mode 100644
+index 0000000..ad5cda3
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_browser_provider.mm
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_browser_provider.h"
++
++#import "base/memory/weak_ptr.h"
++#import "ios/chrome/browser/shared/model/browser/browser.h"
++
++@implementation CuriumBrowserProvider {
++  base::WeakPtr<Browser> _browser;
++}
++
++- (instancetype)initWithBrowser:(Browser*)browser {
++  self = [super init];
++  if (self) {
++    _browser = browser ? browser->AsWeakPtr() : nullptr;
++  }
++  return self;
++}
++
++- (Browser*)currentBrowser {
++  return _browser.get();
++}
++
++- (Browser*)mainBrowser {
++  return _browser.get();
++}
++
++- (Browser*)incognitoBrowser {
++  return nullptr;
++}
++
++- (BOOL)hasIncognitoBrowser {
++  return NO;
++}
++
++@end
+diff --git a/ios/chrome/browser/curium/curium_download_task.h b/ios/chrome/browser/curium/curium_download_task.h
+new file mode 100644
+index 0000000..109ae03
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_download_task.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_DOWNLOAD_TASK_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_DOWNLOAD_TASK_H_
++
++#import <memory>
++
++#import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
++
++namespace web {
++class DownloadTask;
++}  // namespace web
++
++@interface CuriumDownloadTask : NSObject <CrIOSDownloadTaskV1>
++- (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
++                         sourceTabID:(nullable NSString*)sourceTabID
++    NS_DESIGNATED_INITIALIZER;
++- (instancetype)init NS_UNAVAILABLE;
++- (void)invalidate;
++@end
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_DOWNLOAD_TASK_H_
+diff --git a/ios/chrome/browser/curium/curium_download_task.mm b/ios/chrome/browser/curium/curium_download_task.mm
+new file mode 100644
+index 0000000..fcf3115
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_download_task.mm
+@@ -0,0 +1,232 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_download_task.h"
++
++#import <utility>
++
++#import "base/apple/foundation_util.h"
++#import "base/check.h"
++#import "base/files/file_path.h"
++#import "base/strings/sys_string_conversions.h"
++#import "ios/web/public/download/download_task.h"
++#import "ios/web/public/download/download_task_observer.h"
++#import "net/base/apple/url_conversions.h"
++
++namespace {
++
++NSString* const kCuriumDownloadErrorDomain = @"CuriumDownloadErrorDomain";
++
++CrIOSDownloadState MapDownloadState(web::DownloadTask::State state) {
++  switch (state) {
++    case web::DownloadTask::State::kNotStarted:
++      return CrIOSDownloadStatePending;
++    case web::DownloadTask::State::kInProgress:
++      return CrIOSDownloadStateInProgress;
++    case web::DownloadTask::State::kComplete:
++      return CrIOSDownloadStateCompleted;
++    case web::DownloadTask::State::kCancelled:
++      return CrIOSDownloadStateCancelled;
++    case web::DownloadTask::State::kFailed:
++    case web::DownloadTask::State::kFailedNotResumable:
++      return CrIOSDownloadStateFailed;
++  }
++}
++
++class DownloadTaskObserverAdapter final : public web::DownloadTaskObserver {
++ public:
++  explicit DownloadTaskObserverAdapter(CuriumDownloadTask* owner)
++      : owner_(owner) {}
++
++  void OnDownloadUpdated(web::DownloadTask* task) override;
++  void OnDownloadDestroyed(web::DownloadTask* task) override;
++
++ private:
++  __weak CuriumDownloadTask* owner_;
++};
++
++}  // namespace
++
++@implementation CuriumDownloadTask {
++  std::unique_ptr<web::DownloadTask> _task;
++  std::unique_ptr<DownloadTaskObserverAdapter> _observer;
++  NSString* _downloadID;
++  NSString* _sourceTabID;
++  NSURL* _originalURL;
++  NSString* _suggestedFilename;
++  NSString* _mimeType;
++  void (^_completion)(NSURL* _Nullable, NSError* _Nullable);
++}
++
++- (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
++                         sourceTabID:(nullable NSString*)sourceTabID {
++  self = [super init];
++  if (self) {
++    _task = std::move(task);
++    _downloadID = [_task->GetIdentifier() copy] ?: [[NSUUID UUID] UUIDString];
++    _sourceTabID = [sourceTabID copy];
++    _originalURL = net::NSURLWithGURL(_task->GetOriginalUrl());
++    base::FilePath generated = _task->GenerateFileName();
++    _suggestedFilename =
++        base::SysUTF8ToNSString(generated.value()) ?: @"Download";
++    const std::string mime = _task->GetMimeType();
++    _mimeType = mime.empty() ? nil : base::SysUTF8ToNSString(mime);
++    _observer = std::make_unique<DownloadTaskObserverAdapter>(self);
++    _task->AddObserver(_observer.get());
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [self invalidate];
++}
++
++- (void)invalidate {
++  if (_task && _observer) {
++    _task->RemoveObserver(_observer.get());
++  }
++  _observer.reset();
++  _task.reset();
++  [self finishWithURL:nil
++                error:[NSError errorWithDomain:kCuriumDownloadErrorDomain
++                                          code:-1
++                                      userInfo:@{
++                                        NSLocalizedDescriptionKey :
++                                            @"Download task was invalidated."
++                                      }]];
++}
++
++- (NSString*)downloadID {
++  return _downloadID;
++}
++
++- (nullable NSString*)sourceTabID {
++  return _sourceTabID;
++}
++
++- (nullable NSURL*)originalURL {
++  return _originalURL;
++}
++
++- (NSString*)suggestedFilename {
++  return _suggestedFilename;
++}
++
++- (nullable NSString*)mimeType {
++  return _mimeType;
++}
++
++- (int64_t)totalBytes {
++  return _task ? _task->GetTotalBytes() : -1;
++}
++
++- (int64_t)receivedBytes {
++  return _task ? _task->GetReceivedBytes() : 0;
++}
++
++- (CrIOSDownloadState)state {
++  return _task ? MapDownloadState(_task->GetState())
++               : CrIOSDownloadStateCancelled;
++}
++
++- (void)startWithDestinationURL:(NSURL*)destinationURL
++                     completion:(void (^)(NSURL* _Nullable,
++                                          NSError* _Nullable))completion {
++  CHECK([NSThread isMainThread]);
++  if (!_task || _task->GetState() != web::DownloadTask::State::kNotStarted ||
++      !destinationURL.fileURL) {
++    NSError* err = [NSError
++        errorWithDomain:kCuriumDownloadErrorDomain
++                   code:-2
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"Download task cannot start at destination URL."
++               }];
++    completion(nil, err);
++    return;
++  }
++  _completion = [completion copy];
++  _task->Start(base::apple::NSURLToFilePath(destinationURL));
++}
++
++- (void)cancel {
++  CHECK([NSThread isMainThread]);
++  if (_task) {
++    _task->Cancel();
++  }
++}
++
++- (void)handleTaskUpdated {
++  if (!_task || !_task->IsDone()) {
++    return;
++  }
++  switch (_task->GetState()) {
++    case web::DownloadTask::State::kComplete: {
++      NSURL* savedURL = base::apple::FilePathToNSURL(_task->GetResponsePath());
++      [self finishWithURL:savedURL error:nil];
++      break;
++    }
++    case web::DownloadTask::State::kCancelled: {
++      NSError* err =
++          [NSError errorWithDomain:NSCocoaErrorDomain
++                              code:NSUserCancelledError
++                          userInfo:@{
++                            NSLocalizedDescriptionKey : @"Download cancelled."
++                          }];
++      [self finishWithURL:nil error:err];
++      break;
++    }
++    case web::DownloadTask::State::kFailed:
++    case web::DownloadTask::State::kFailedNotResumable: {
++      NSError* err = [NSError
++          errorWithDomain:kCuriumDownloadErrorDomain
++                     code:_task->GetErrorCode()
++                 userInfo:@{
++                   NSLocalizedDescriptionKey : [NSString
++                       stringWithFormat:@"Download failed (net error %d).",
++                                        _task->GetErrorCode()]
++                 }];
++      [self finishWithURL:nil error:err];
++      break;
++    }
++    case web::DownloadTask::State::kNotStarted:
++    case web::DownloadTask::State::kInProgress:
++      break;
++  }
++}
++
++- (void)handleTaskDestroyed {
++  _task.release();
++  NSError* err =
++      [NSError errorWithDomain:kCuriumDownloadErrorDomain
++                          code:-3
++                      userInfo:@{
++                        NSLocalizedDescriptionKey : @"Download destroyed."
++                      }];
++  [self finishWithURL:nil error:err];
++}
++
++- (void)finishWithURL:(nullable NSURL*)url error:(nullable NSError*)error {
++  if (!_completion) {
++    return;
++  }
++  void (^block)(NSURL* _Nullable, NSError* _Nullable) = _completion;
++  _completion = nil;
++  block(url, error);
++}
++
++@end
++
++namespace {
++
++void DownloadTaskObserverAdapter::OnDownloadUpdated(web::DownloadTask* task) {
++  [owner_ handleTaskUpdated];
++}
++
++void DownloadTaskObserverAdapter::OnDownloadDestroyed(web::DownloadTask* task) {
++  task->RemoveObserver(this);
++  [owner_ handleTaskDestroyed];
++}
++
++}  // namespace
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+new file mode 100644
+index 0000000..273106a
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -0,0 +1,148 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_ENGINE_CONTRACT_INTERNAL_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_ENGINE_CONTRACT_INTERNAL_H_
++
++#import <UIKit/UIKit.h>
++
++NS_ASSUME_NONNULL_BEGIN
++
++typedef NS_OPTIONS(NSUInteger, CrIOSBrowsingDataTypes) {
++  CrIOSBrowsingDataTypesCookies = 1UL << 0,
++  CrIOSBrowsingDataTypesCache = 1UL << 1,
++  CrIOSBrowsingDataTypesSiteStorage = 1UL << 2,
++  CrIOSBrowsingDataTypesDownloads = 1UL << 3,
++  CrIOSBrowsingDataTypesAll = CrIOSBrowsingDataTypesCookies |
++                              CrIOSBrowsingDataTypesCache |
++                              CrIOSBrowsingDataTypesSiteStorage |
++                              CrIOSBrowsingDataTypesDownloads,
++};
++
++typedef NS_OPTIONS(NSUInteger, CrIOSMediaPermissionTypes) {
++  CrIOSMediaPermissionTypesCamera = 1UL << 0,
++  CrIOSMediaPermissionTypesMicrophone = 1UL << 1,
++};
++
++typedef NS_ENUM(NSInteger, CrIOSDownloadState) {
++  CrIOSDownloadStatePending = 0,
++  CrIOSDownloadStateInProgress = 1,
++  CrIOSDownloadStateCompleted = 2,
++  CrIOSDownloadStateCancelled = 3,
++  CrIOSDownloadStateFailed = 4,
++};
++
++@protocol CrIOSBrowserHostV1;
++@protocol CrIOSExtensionManagingV1;
++
++@protocol CrIOSShellBootstrapDelegate <NSObject>
++- (UIViewController*)makeRootViewControllerForScene:(UIWindowScene*)windowScene
++                                        browserHost:
++                                            (id<CrIOSBrowserHostV1>)browserHost
++                                   extensionManager:
++                                       (nullable id<CrIOSExtensionManagingV1>)
++                                           extensionManager;
++@end
++
++__attribute__((visibility("default")))
++@interface CrIOSEngineBootstrap : NSObject
+++ (void)registerShellBootstrapDelegate:
++    (nullable id<CrIOSShellBootstrapDelegate>)delegate;
+++ (nullable id<CrIOSShellBootstrapDelegate>)shellBootstrapDelegate;
++@end
++
++@protocol CrIOSTabHostingV1 <NSObject>
++@property(nonatomic, copy, readonly) NSString* tabID;
++@property(nonatomic, readonly) int32_t extensionTabID;
++@property(nonatomic, strong, readonly) UIView* webView;
++@property(nonatomic, strong, readonly, nullable) UIScrollView* scrollView;
++@property(nonatomic, copy, readonly, nullable) NSURL* currentURL;
++@property(nonatomic, copy, readonly) NSString* title;
++@property(nonatomic, readonly) BOOL isLoading;
++@property(nonatomic, readonly) double estimatedProgress;
++@property(nonatomic, readonly) BOOL canGoBack;
++@property(nonatomic, readonly) BOOL canGoForward;
++@property(nonatomic, readonly) BOOL usesDesktopUserAgent;
++@property(nonatomic, strong, readonly, nullable) UIColor* pageCanvasColor;
++@property(nonatomic, readonly) BOOL isWebFullscreen;
++
++- (void)loadURL:(NSURL*)url;
++- (void)goBack;
++- (void)goForward;
++- (void)reload;
++- (void)stopLoading;
++- (void)setUsesDesktopUserAgent:(BOOL)desktop;
++- (void)presentFindInPage;
++- (void)setPageZoomScale:(CGFloat)scale;
++- (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable image))completion;
++@end
++
++@protocol CrIOSDownloadTaskV1 <NSObject>
++@property(nonatomic, copy, readonly) NSString* downloadID;
++@property(nonatomic, copy, readonly, nullable) NSString* sourceTabID;
++@property(nonatomic, copy, readonly, nullable) NSURL* originalURL;
++@property(nonatomic, copy, readonly) NSString* suggestedFilename;
++@property(nonatomic, copy, readonly, nullable) NSString* mimeType;
++@property(nonatomic, readonly) int64_t totalBytes;
++@property(nonatomic, readonly) int64_t receivedBytes;
++@property(nonatomic, readonly) CrIOSDownloadState state;
++
++- (void)startWithDestinationURL:(NSURL*)destinationURL
++                     completion:(void (^)(NSURL* _Nullable savedFileURL,
++                                          NSError* _Nullable error))completion;
++- (void)cancel;
++@end
++
++@protocol CrIOSBrowserHostDelegateV1 <NSObject>
++- (void)browserHostDidUpdateTabs:(id<CrIOSBrowserHostV1>)host;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++       didUpdateTab:(id<CrIOSTabHostingV1>)tab;
++@optional
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++    contextMenuConfigurationForTab:(id<CrIOSTabHostingV1>)tab
++                           linkURL:(nullable NSURL*)linkURL
++                          imageURL:(nullable NSURL*)imageURL
++                       sourcePoint:(CGPoint)sourcePoint
++                        completion:(void (^)(UIContextMenuConfiguration* _Nullable))completion;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++       runFileChooserForTab:(id<CrIOSTabHostingV1>)tab
++                acceptTypes:(NSArray<NSString*>*)acceptTypes
++    allowsMultipleSelection:(BOOL)allowsMultipleSelection
++                captureHint:(nullable NSString*)captureHint
++                 completion:(void (^)(NSArray<NSURL*>* _Nullable fileURLs))completion;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++    requestMediaPermissions:(CrIOSMediaPermissionTypes)permissions
++                     origin:(NSURL*)origin
++                     forTab:(id<CrIOSTabHostingV1>)tab
++                 completion:(void (^)(CrIOSMediaPermissionTypes granted))completion;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++    didCreateDownload:(id<CrIOSDownloadTaskV1>)download;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++                   tab:(id<CrIOSTabHostingV1>)tab
++    didLoadResourceURL:(NSURL*)url
++              mimeType:(nullable NSString*)mimeType
++        httpStatusCode:(NSInteger)httpStatusCode
++         contentLength:(int64_t)contentLength;
++@end
++
++@protocol CrIOSBrowserHostV1 <NSObject>
++@property(nonatomic, weak, nullable) id<CrIOSBrowserHostDelegateV1> delegate;
++@property(nonatomic, copy, readonly) NSArray<id<CrIOSTabHostingV1>>* tabs;
++@property(nonatomic, strong, readonly, nullable) id<CrIOSTabHostingV1> activeTab;
++
++- (nullable id<CrIOSTabHostingV1>)createTabWithURL:(nullable NSURL*)url
++                                          activate:(BOOL)activate;
++- (BOOL)activateTabWithID:(NSString*)tabID;
++- (BOOL)closeTabWithID:(NSString*)tabID;
++- (void)clearBrowsingDataOfTypes:(CrIOSBrowsingDataTypes)types
++                   modifiedSince:(NSDate*)date
++                      completion:(void (^)(NSError* _Nullable error))completion;
++- (void)cookieHeaderForURL:(NSURL*)url
++               inTabWithID:(NSString*)tabID
++                completion:(void (^)(NSString* _Nullable cookieHeader))completion;
++@end
++
++NS_ASSUME_NONNULL_END
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_ENGINE_CONTRACT_INTERNAL_H_
+diff --git a/ios/chrome/browser/curium/curium_tab_host.h b/ios/chrome/browser/curium/curium_tab_host.h
+new file mode 100644
+index 0000000..7d2e9c1
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_tab_host.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_TAB_HOST_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_TAB_HOST_H_
++
++#import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
++
++@class CuriumBrowserHost;
++namespace web {
++class WebState;
++}  // namespace web
++
++@interface CuriumTabHost : NSObject <CrIOSTabHostingV1>
++
++- (instancetype)initWithWebState:(web::WebState*)webState
++                     browserHost:(CuriumBrowserHost*)browserHost
++    NS_DESIGNATED_INITIALIZER;
++- (instancetype)init NS_UNAVAILABLE;
++
++@property(nonatomic, readonly, nullable) web::WebState* webState;
++
++- (void)detach;
++
++@end
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_TAB_HOST_H_
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+new file mode 100644
+index 0000000..dae1fd0
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -0,0 +1,456 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_tab_host.h"
++
++#import <cmath>
++#import <memory>
++#import <optional>
++#import <string>
++
++#import "base/apple/foundation_util.h"
++#import "base/check.h"
++#import "base/memory/raw_ptr.h"
++#import "base/scoped_observation.h"
++#import "base/strings/sys_string_conversions.h"
++#import "content/public/browser/host_zoom_map.h"
++#import "content/public/browser/navigation_controller.h"
++#import "content/public/browser/render_frame_host.h"
++#import "content/public/browser/web_contents.h"
++#import "content/public/browser/web_contents_observer.h"
++#import "ios/chrome/browser/curium/curium_browser_host.h"
++#import "ios/chrome/browser/shared/public/commands/file_upload_panel_commands.h"
++#import "ios/chrome/browser/web/model/choose_file/choose_file_event.h"
++#import "ios/chrome/browser/web/model/choose_file/choose_file_tab_helper.h"
++#import "ios/web/content/navigation/content_navigation_manager.h"
++#import "ios/web/content/web_state/content_web_state.h"
++#import "ios/web/public/find_in_page/crw_find_interaction.h"
++#import "ios/web/public/navigation/navigation_item.h"
++#import "ios/web/public/navigation/navigation_manager.h"
++#import "ios/web/public/navigation/reload_type.h"
++#import "ios/web/public/web_state.h"
++#import "ios/web/public/web_state_observer.h"
++#import "net/base/apple/url_conversions.h"
++#import "third_party/blink/public/common/page/page_zoom.h"
++#import "third_party/blink/public/mojom/loader/resource_load_info.mojom.h"
++#import "ui/base/page_transition_types.h"
++
++@interface CuriumBrowserHost (TabNotifications)
++- (void)tabHostDidUpdate:(CuriumTabHost*)tabHost;
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didLoadResourceURL:(NSURL*)url
++              mimeType:(nullable NSString*)mimeType
++        httpStatusCode:(NSInteger)httpStatusCode
++         contentLength:(int64_t)contentLength;
++- (void)tabHost:(CuriumTabHost*)tabHost
++    runFileChooserWithEvent:(const ChooseFileEvent&)event
++                 completion:
++                     (void (^)(NSArray<NSURL*>* _Nullable fileURLs))completion;
++@end
++
++@interface CuriumTabHost () <FileUploadPanelCommands>
++- (void)notifyUpdated;
++- (void)handleNavigationCommitted;
++- (void)handleWebStateDestroyed;
++- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info;
++@end
++
++namespace {
++
++class CuriumTabObserver final : public web::WebStateObserver,
++                                public content::WebContentsObserver {
++ public:
++  CuriumTabObserver(CuriumTabHost* owner, web::WebState* web_state)
++      : owner_(owner) {
++    web_state_observation_.Observe(web_state);
++    auto* content_web_state = static_cast<web::ContentWebState*>(web_state);
++    if (content::WebContents* wc = content_web_state->GetWebContents()) {
++      content::WebContentsObserver::Observe(wc);
++    }
++  }
++
++  ~CuriumTabObserver() override = default;
++
++  // web::WebStateObserver:
++  void DidStartNavigation(web::WebState*, web::NavigationContext*) override {
++    [owner_ notifyUpdated];
++  }
++  void DidFinishNavigation(web::WebState*, web::NavigationContext*) override {
++    [owner_ handleNavigationCommitted];
++    [owner_ notifyUpdated];
++  }
++  void DidStartLoading(web::WebState*) override { [owner_ notifyUpdated]; }
++  void DidStopLoading(web::WebState*) override { [owner_ notifyUpdated]; }
++  void LoadProgressChanged(web::WebState*, double) override {
++    [owner_ notifyUpdated];
++  }
++  void DidChangeBackForwardState(web::WebState*) override {
++    [owner_ notifyUpdated];
++  }
++  void TitleWasSet(web::WebState*) override { [owner_ notifyUpdated]; }
++  void WebStateRealized(web::WebState*) override { [owner_ notifyUpdated]; }
++  void WebStateDestroyed(web::WebState* web_state) override {
++    web_state_observation_.Reset();
++    content::WebContentsObserver::Observe(nullptr);
++    [owner_ handleWebStateDestroyed];
++  }
++
++  // content::WebContentsObserver:
++  void DidToggleFullscreenModeForTab(bool, bool) override {
++    [owner_ notifyUpdated];
++  }
++  void DidChangeThemeColor() override { [owner_ notifyUpdated]; }
++  void OnBackgroundColorChanged() override { [owner_ notifyUpdated]; }
++  void ResourceLoadComplete(
++      content::RenderFrameHost* render_frame_host,
++      const content::GlobalRequestID& request_id,
++      const GURL& original_url,
++      const blink::mojom::ResourceLoadInfo& resource_load_info) override {
++    [owner_ handleResourceLoad:resource_load_info];
++  }
++
++ private:
++  __weak CuriumTabHost* owner_;
++  base::ScopedObservation<web::WebState, web::WebStateObserver>
++      web_state_observation_{this};
++};
++
++}  // namespace
++
++@implementation CuriumTabHost {
++  raw_ptr<web::WebState> _webState;
++  __weak CuriumBrowserHost* _browserHost;
++  std::unique_ptr<CuriumTabObserver> _observer;
++  NSString* _tabID;
++  BOOL _prefersDesktopUserAgent;
++  std::optional<double> _zoomScale;
++}
++
++- (instancetype)initWithWebState:(web::WebState*)webState
++                     browserHost:(CuriumBrowserHost*)browserHost {
++  self = [super init];
++  if (self) {
++    CHECK(webState);
++    _webState = webState;
++    _browserHost = browserHost;
++    _tabID = [NSString
++        stringWithFormat:@"%d", webState->GetUniqueIdentifier().identifier()];
++    _observer = std::make_unique<CuriumTabObserver>(self, webState);
++    if (ChooseFileTabHelper* chooseFile =
++            ChooseFileTabHelper::FromWebState(webState)) {
++      chooseFile->SetFileUploadPanelHandler(self);
++    }
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [self detach];
++}
++
++- (void)detach {
++  if (_webState) {
++    if (ChooseFileTabHelper* chooseFile =
++            ChooseFileTabHelper::FromWebState(_webState)) {
++      chooseFile->SetFileUploadPanelHandler(nil);
++    }
++  }
++  _observer.reset();
++  _webState = nullptr;
++}
++
++- (nullable web::WebState*)webState {
++  return _webState;
++}
++
++#pragma mark - CrIOSTabHostingV1
++
++- (NSString*)tabID {
++  return _tabID;
++}
++
++- (int32_t)extensionTabID {
++  if (!_webState) {
++    return -1;
++  }
++  const web::WebStateID ident = _webState->GetUniqueIdentifier();
++  return ident.valid() ? ident.identifier() : -1;
++}
++
++- (UIView*)webView {
++  return _webState ? _webState->GetView() : [[UIView alloc] init];
++}
++
++- (nullable UIScrollView*)scrollView {
++  if (!_webState) {
++    return nil;
++  }
++  auto* content_ws = static_cast<web::ContentWebState*>(_webState);
++  if (content::WebContents* wc = content_ws->GetWebContents()) {
++    if (UIScrollView* sv =
++            base::apple::ObjCCast<UIScrollView>(wc->GetNativeView().Get())) {
++      return sv;
++    }
++  }
++  return base::apple::ObjCCast<UIScrollView>(
++      _webState->GetView().subviews.firstObject);
++}
++
++- (nullable NSURL*)currentURL {
++  if (!_webState) {
++    return nil;
++  }
++  const GURL& visible = _webState->GetVisibleURL();
++  return visible.is_valid() ? net::NSURLWithGURL(visible) : nil;
++}
++
++- (NSString*)title {
++  if (!_webState) {
++    return @"";
++  }
++  return base::SysUTF16ToNSString(_webState->GetTitle()) ?: @"";
++}
++
++- (BOOL)isLoading {
++  return _webState ? _webState->IsLoading() : NO;
++}
++
++- (double)estimatedProgress {
++  return _webState ? _webState->GetLoadingProgress() : 0.0;
++}
++
++- (BOOL)canGoBack {
++  return _webState && _webState->GetNavigationManager()->CanGoBack();
++}
++
++- (BOOL)canGoForward {
++  return _webState && _webState->GetNavigationManager()->CanGoForward();
++}
++
++- (BOOL)usesDesktopUserAgent {
++  if (!_webState) {
++    return _prefersDesktopUserAgent;
++  }
++  if (web::NavigationItem* item =
++          _webState->GetNavigationManager()->GetVisibleItem()) {
++    return item->GetUserAgentType() == web::UserAgentType::DESKTOP;
++  }
++  return _prefersDesktopUserAgent;
++}
++
++- (nullable UIColor*)pageCanvasColor {
++  if (!_webState) {
++    return nil;
++  }
++  return _webState->GetThemeColor() ?: _webState->GetUnderPageBackgroundColor();
++}
++
++- (BOOL)isWebFullscreen {
++  return _webState ? _webState->IsWebPageInFullscreenMode() : NO;
++}
++
++- (void)loadURL:(NSURL*)url {
++  if (!_webState || !url) {
++    return;
++  }
++  const GURL gurl = net::GURLWithNSURL(url);
++  if (!gurl.is_valid()) {
++    return;
++  }
++  if (_prefersDesktopUserAgent) {
++    content::WebContents* wc =
++        static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++    if (wc) {
++      web::SetDesktopUserAgentOverride(wc);
++      content::NavigationController::LoadURLParams params(gurl);
++      params.transition_type = ui::PAGE_TRANSITION_TYPED;
++      params.override_user_agent =
++          content::NavigationController::UA_OVERRIDE_TRUE;
++      wc->GetController().LoadURLWithParams(params);
++      return;
++    }
++  }
++  web::NavigationManager::WebLoadParams params(gurl);
++  params.transition_type = ui::PAGE_TRANSITION_TYPED;
++  _webState->GetNavigationManager()->LoadURLWithParams(params);
++}
++
++- (void)goBack {
++  if (_webState && _webState->GetNavigationManager()->CanGoBack()) {
++    _webState->GetNavigationManager()->GoBack();
++  }
++}
++
++- (void)goForward {
++  if (_webState && _webState->GetNavigationManager()->CanGoForward()) {
++    _webState->GetNavigationManager()->GoForward();
++  }
++}
++
++- (void)reload {
++  if (_webState) {
++    _webState->GetNavigationManager()->Reload(web::ReloadType::NORMAL,
++                                              /*check_for_repost=*/true);
++  }
++}
++
++- (void)stopLoading {
++  if (_webState) {
++    _webState->Stop();
++  }
++}
++
++- (void)setUsesDesktopUserAgent:(BOOL)desktop {
++  _prefersDesktopUserAgent = desktop;
++  if (!_webState) {
++    return;
++  }
++  web::NavigationManager* nav = _webState->GetNavigationManager();
++  if (nav->GetLastCommittedItem()) {
++    nav->ReloadWithUserAgentType(desktop ? web::UserAgentType::DESKTOP
++                                         : web::UserAgentType::MOBILE);
++  }
++  [self notifyUpdated];
++}
++
++- (void)presentFindInPage {
++  if (!_webState || !_webState->IsFindInteractionSupported()) {
++    return;
++  }
++  if (!_webState->IsFindInteractionEnabled()) {
++    _webState->SetFindInteractionEnabled(true);
++  }
++  id<CRWFindInteraction> find = _webState->GetFindInteraction();
++  if (find && _webState->GetView().window) {
++    [find presentFindNavigatorShowingReplace:NO];
++  }
++}
++
++- (void)setPageZoomScale:(CGFloat)scale {
++  if (!_webState || scale <= 0.0 || !std::isfinite(scale)) {
++    return;
++  }
++  _zoomScale = static_cast<double>(scale);
++  [self applyZoomIfNeeded];
++}
++
++- (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable))completion {
++  CHECK([NSThread isMainThread]);
++  if (!_webState) {
++    completion(nil);
++    return;
++  }
++  UIView* view = _webState->GetView();
++  if (!view || CGRectIsEmpty(view.bounds)) {
++    completion(nil);
++    return;
++  }
++  UIGraphicsImageRendererFormat* format =
++      [UIGraphicsImageRendererFormat preferredFormat];
++  format.opaque = YES;
++  UIGraphicsImageRenderer* renderer =
++      [[UIGraphicsImageRenderer alloc] initWithBounds:view.bounds
++                                               format:format];
++  UIImage* image = [renderer
++      imageWithActions:^(UIGraphicsImageRendererContext* context) {
++        if (view.window) {
++          [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:NO];
++        } else {
++          [view.layer renderInContext:context.CGContext];
++        }
++      }];
++  completion(image);
++}
++
++#pragma mark - FileUploadPanelCommands
++
++- (void)showFileUploadPanel {
++  if (!_webState) {
++    return;
++  }
++  ChooseFileTabHelper* helper = ChooseFileTabHelper::FromWebState(_webState);
++  if (!helper || !helper->IsChoosingFiles()) {
++    return;
++  }
++  helper->SetIsPresentingFilePicker(true);
++  const ChooseFileEvent event = helper->GetChooseFileEvent();
++  __weak CuriumTabHost* weakSelf = self;
++  [_browserHost tabHost:self
++      runFileChooserWithEvent:event
++                   completion:^(NSArray<NSURL*>* _Nullable fileURLs) {
++                     CuriumTabHost* strongSelf = weakSelf;
++                     if (!strongSelf || !strongSelf->_webState) {
++                       return;
++                     }
++                     ChooseFileTabHelper* currentHelper =
++                         ChooseFileTabHelper::FromWebState(
++                             strongSelf->_webState);
++                     if (currentHelper && currentHelper->IsChoosingFiles()) {
++                       currentHelper->StopChoosingFiles(fileURLs ?: @[], nil,
++                                                        nil);
++                     }
++                   }];
++}
++
++- (void)hideFileUploadPanel {
++  if (!_webState) {
++    return;
++  }
++  ChooseFileTabHelper* helper = ChooseFileTabHelper::FromWebState(_webState);
++  if (helper && helper->IsChoosingFiles()) {
++    helper->StopChoosingFiles(@[], nil, nil);
++  }
++}
++
++#pragma mark - Private
++
++- (void)applyZoomIfNeeded {
++  if (!_webState || !_zoomScale.has_value()) {
++    return;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  if (!wc || !wc->GetPrimaryMainFrame()) {
++    return;
++  }
++  content::HostZoomMap* zoom_map = content::HostZoomMap::GetForWebContents(wc);
++  if (!zoom_map) {
++    return;
++  }
++  zoom_map->SetTemporaryZoomLevel(wc->GetPrimaryMainFrame()->GetGlobalId(),
++                                  blink::ZoomFactorToZoomLevel(*_zoomScale));
++}
++
++- (void)notifyUpdated {
++  [_browserHost tabHostDidUpdate:self];
++}
++
++- (void)handleNavigationCommitted {
++  [self applyZoomIfNeeded];
++}
++
++- (void)handleWebStateDestroyed {
++  [self detach];
++}
++
++- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
++  NSURL* ns_url = net::NSURLWithGURL(info.final_url.is_valid()
++                                         ? info.final_url
++                                         : info.original_url);
++  if (!ns_url) {
++    return;
++  }
++  NSString* mime_type =
++      info.mime_type.empty() ? nil : base::SysUTF8ToNSString(info.mime_type);
++  const NSInteger status =
++      info.http_status_code > 0 ? info.http_status_code : 0;
++  const int64_t raw_bytes = static_cast<int64_t>(info.raw_body_bytes.InBytes());
++  [_browserHost tabHost:self
++      didLoadResourceURL:ns_url
++                mimeType:mime_type
++          httpStatusCode:status
++           contentLength:(raw_bytes > 0 ? raw_bytes : -1)];
++}
++
++@end
+diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.h b/ios/chrome/browser/curium/curium_web_state_delegate.h
+new file mode 100644
+index 0000000..13f2bcc
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_web_state_delegate.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_WEB_STATE_DELEGATE_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_WEB_STATE_DELEGATE_H_
++
++#import "base/memory/raw_ptr.h"
++#import "ios/web/public/web_state_delegate.h"
++
++class Browser;
++@class CuriumBrowserHost;
++
++class CuriumWebStateDelegate final : public web::WebStateDelegate {
++ public:
++  CuriumWebStateDelegate(Browser* browser, CuriumBrowserHost* host);
++  CuriumWebStateDelegate(const CuriumWebStateDelegate&) = delete;
++  CuriumWebStateDelegate& operator=(const CuriumWebStateDelegate&) = delete;
++  ~CuriumWebStateDelegate() override;
++
++  // web::WebStateDelegate:
++  web::WebState* CreateNewWebState(web::WebState* source,
++                                   const GURL& url,
++                                   const GURL& opener_url,
++                                   bool initiated_by_user) override;
++  void CloseWebState(web::WebState* source) override;
++  web::WebState* OpenURLFromWebState(
++      web::WebState* source,
++      const web::WebState::OpenURLParams& params) override;
++  void ShowRepostFormWarningDialog(
++      web::WebState* source,
++      web::FormWarningType warning_type,
++      base::OnceCallback<void(bool)> callback) override;
++  web::JavaScriptDialogPresenter* GetJavaScriptDialogPresenter(
++      web::WebState* source) override;
++  void HandlePermissionsDecisionRequest(
++      web::WebState* source,
++      NSArray<NSNumber*>* permissions,
++      web::WebStatePermissionDecisionHandler handler) override;
++  void OnAuthRequired(web::WebState* source,
++                      NSURLProtectionSpace* protection_space,
++                      NSURLCredential* proposed_credential,
++                      HTTPAuthCallback callback) override;
++  void OnAuthRequired(web::WebState* source,
++                      NSURLProtectionSpace* protection_space,
++                      ClientCertAuthCallback callback) override;
++  UIView* GetWebViewContainer(web::WebState* source) override;
++  void ContextMenuConfiguration(
++      web::WebState* source,
++      const web::ContextMenuParams& params,
++      void (^completion_handler)(UIContextMenuConfiguration*)) override;
++  void OnNewWebViewCreated(web::WebState* source) override;
++
++ private:
++  raw_ptr<Browser> browser_;
++  __weak CuriumBrowserHost* host_;
++};
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_WEB_STATE_DELEGATE_H_
+diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.mm b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+new file mode 100644
+index 0000000..1856ac9
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+@@ -0,0 +1,278 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_web_state_delegate.h"
++
++#import <memory>
++#import <utility>
++
++#import "base/functional/callback_helpers.h"
++#import "build/blink_buildflags.h"
++#import "ios/chrome/browser/curium/curium_browser_host.h"
++#import "ios/chrome/browser/curium/curium_tab_host.h"
++#import "ios/chrome/browser/shared/model/browser/browser.h"
++#import "ios/chrome/browser/shared/model/profile/profile_ios.h"
++#import "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
++#import "ios/chrome/browser/shared/model/web_state_list/web_state_opener.h"
++#import "ios/web/public/navigation/navigation_manager.h"
++#import "ios/web/public/permissions/permissions.h"
++#import "ios/web/public/ui/context_menu_params.h"
++#import "ios/web/public/ui/crw_web_view_proxy.h"
++#import "ios/web/public/web_state.h"
++#import "net/base/apple/url_conversions.h"
++#import "ui/base/mojom/window_open_disposition.mojom-shared.h"
++
++@interface CuriumBrowserHost (DelegateRouting)
++- (nullable CuriumTabHost*)tabHostForWebState:(web::WebState*)webState;
++@end
++
++namespace {
++
++UIViewController* TopPresenterForWebState(web::WebState* web_state) {
++  UIViewController* vc =
++      web_state ? web_state->GetView().window.rootViewController : nil;
++  while (vc.presentedViewController &&
++         !vc.presentedViewController.beingDismissed) {
++    vc = vc.presentedViewController;
++  }
++  return vc;
++}
++
++}  // namespace
++
++CuriumWebStateDelegate::CuriumWebStateDelegate(Browser* browser,
++                                               CuriumBrowserHost* host)
++    : browser_(browser), host_(host) {}
++
++CuriumWebStateDelegate::~CuriumWebStateDelegate() = default;
++
++web::WebState* CuriumWebStateDelegate::CreateNewWebState(
++    web::WebState* source,
++    const GURL& url,
++    const GURL& opener_url,
++    bool initiated_by_user) {
++  WebStateList* list = browser_->GetWebStateList();
++  web::WebState::CreateParams params(browser_->GetProfile());
++  params.created_with_opener = true;
++#if BUILDFLAG(USE_BLINK)
++  params.opener_web_state = source;
++#endif
++  std::unique_ptr<web::WebState> child = web::WebState::Create(params);
++  if (list->IsMutating() ||
++      list->GetIndexOfWebState(source) == WebStateList::kInvalidIndex) {
++    return nullptr;
++  }
++  web::WebState* raw_child = child.get();
++  list->InsertWebState(
++      std::move(child),
++      WebStateList::InsertionParams::AtIndex(list->count())
++          .Activate(initiated_by_user)
++          .WithOpener(WebStateOpener(source)));
++  return raw_child;
++}
++
++void CuriumWebStateDelegate::CloseWebState(web::WebState* source) {
++  WebStateList* list = browser_->GetWebStateList();
++  const int index = list->GetIndexOfWebState(source);
++  if (index != WebStateList::kInvalidIndex) {
++    list->CloseWebStateAt(index, WebStateList::ClosingReason::kUserAction);
++  }
++}
++
++web::WebState* CuriumWebStateDelegate::OpenURLFromWebState(
++    web::WebState* source,
++    const web::WebState::OpenURLParams& params) {
++  web::NavigationManager::WebLoadParams load_params(params.url);
++  load_params.referrer = params.referrer;
++  load_params.transition_type = params.transition;
++  load_params.is_renderer_initiated = params.is_renderer_initiated;
++  load_params.virtual_url = params.virtual_url;
++  load_params.internal_scroll_to_text_fragment =
++      params.internal_scroll_to_text_fragment;
++
++  switch (params.disposition) {
++    case ui::mojom::WindowOpenDisposition::kCurrentTab:
++      source->GetNavigationManager()->LoadURLWithParams(load_params);
++      return source;
++    case ui::mojom::WindowOpenDisposition::kNewForegroundTab:
++    case ui::mojom::WindowOpenDisposition::kNewBackgroundTab:
++    case ui::mojom::WindowOpenDisposition::kNewPopup: {
++      WebStateList* list = browser_->GetWebStateList();
++      if (list->IsMutating() ||
++          list->GetIndexOfWebState(source) == WebStateList::kInvalidIndex) {
++        return nullptr;
++      }
++      web::WebState::CreateParams create_params(browser_->GetProfile());
++      create_params.created_with_opener =
++          params.disposition == ui::mojom::WindowOpenDisposition::kNewPopup;
++      std::unique_ptr<web::WebState> child =
++          web::WebState::Create(create_params);
++      web::WebState* raw_child = child.get();
++      raw_child->GetNavigationManager()->LoadURLWithParams(load_params);
++      const bool activate =
++          params.disposition !=
++          ui::mojom::WindowOpenDisposition::kNewBackgroundTab;
++      list->InsertWebState(
++          std::move(child),
++          WebStateList::InsertionParams::AtIndex(list->count())
++              .Activate(activate)
++              .WithOpener(WebStateOpener(source)));
++      return raw_child;
++    }
++    default:
++      return nullptr;
++  }
++}
++
++void CuriumWebStateDelegate::ShowRepostFormWarningDialog(
++    web::WebState* source,
++    web::FormWarningType warning_type,
++    base::OnceCallback<void(bool)> callback) {
++  UIViewController* presenter = TopPresenterForWebState(source);
++  if (!presenter) {
++    std::move(callback).Run(false);
++    return;
++  }
++  __block base::OnceCallback<void(bool)> shared_cb = std::move(callback);
++  UIAlertController* alert = [UIAlertController
++      alertControllerWithTitle:@"Confirm Form Resubmission"
++                       message:@"The page you are trying to view contains data "
++                               @"that you already submitted."
++                preferredStyle:UIAlertControllerStyleAlert];
++  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
++                                            style:UIAlertActionStyleCancel
++                                          handler:^(UIAlertAction*) {
++                                            if (shared_cb) {
++                                              std::move(shared_cb).Run(false);
++                                            }
++                                          }]];
++  [alert addAction:[UIAlertAction actionWithTitle:@"Continue"
++                                            style:UIAlertActionStyleDefault
++                                          handler:^(UIAlertAction*) {
++                                            if (shared_cb) {
++                                              std::move(shared_cb).Run(true);
++                                            }
++                                          }]];
++  [presenter presentViewController:alert animated:YES completion:nil];
++}
++
++web::JavaScriptDialogPresenter*
++CuriumWebStateDelegate::GetJavaScriptDialogPresenter(web::WebState* source) {
++  return nullptr;
++}
++
++void CuriumWebStateDelegate::HandlePermissionsDecisionRequest(
++    web::WebState* source,
++    NSArray<NSNumber*>* permissions,
++    web::WebStatePermissionDecisionHandler handler) {
++  id<CrIOSBrowserHostDelegateV1> delegate = host_.delegate;
++  CuriumTabHost* tab = [host_ tabHostForWebState:source];
++  if (!tab ||
++      ![delegate respondsToSelector:@selector
++                 (browserHost:requestMediaPermissions:origin:forTab:completion:)]) {
++    handler(web::PermissionDecisionDeny);
++    return;
++  }
++
++  CrIOSMediaPermissionTypes requested = 0;
++  for (NSNumber* num in permissions) {
++    switch (static_cast<web::Permission>(num.unsignedIntegerValue)) {
++      case web::PermissionCamera:
++        requested |= CrIOSMediaPermissionTypesCamera;
++        break;
++      case web::PermissionMicrophone:
++        requested |= CrIOSMediaPermissionTypesMicrophone;
++        break;
++      default:
++        break;
++    }
++  }
++  if (requested == 0) {
++    handler(web::PermissionDecisionDeny);
++    return;
++  }
++
++  NSURL* origin = net::NSURLWithGURL(
++      source->GetLastCommittedURL().DeprecatedGetOriginAsURL());
++  if (!origin) {
++    handler(web::PermissionDecisionDeny);
++    return;
++  }
++
++  __block BOOL completed = NO;
++  [delegate browserHost:host_
++      requestMediaPermissions:requested
++                       origin:origin
++                       forTab:tab
++                   completion:^(CrIOSMediaPermissionTypes granted) {
++                     if (completed) {
++                       return;
++                     }
++                     completed = YES;
++                     const BOOL allow = (granted & requested) == requested;
++                     handler(allow ? web::PermissionDecisionGrant
++                                   : web::PermissionDecisionDeny);
++                   }];
++}
++
++void CuriumWebStateDelegate::OnAuthRequired(
++    web::WebState* source,
++    NSURLProtectionSpace* protection_space,
++    NSURLCredential* proposed_credential,
++    HTTPAuthCallback callback) {
++  std::move(callback).Run(nil, nil);
++}
++
++void CuriumWebStateDelegate::OnAuthRequired(
++    web::WebState* source,
++    NSURLProtectionSpace* protection_space,
++    ClientCertAuthCallback callback) {
++  std::move(callback).Run(nullptr);
++}
++
++UIView* CuriumWebStateDelegate::GetWebViewContainer(web::WebState* source) {
++  return source ? source->GetView() : nil;
++}
++
++void CuriumWebStateDelegate::ContextMenuConfiguration(
++    web::WebState* source,
++    const web::ContextMenuParams& params,
++    void (^completion_handler)(UIContextMenuConfiguration*)) {
++  id<CrIOSBrowserHostDelegateV1> delegate = host_.delegate;
++  CuriumTabHost* tab = [host_ tabHostForWebState:source];
++  if (!tab || !source ||
++      ![delegate respondsToSelector:@selector
++                 (browserHost:contextMenuConfigurationForTab:linkURL:imageURL:sourcePoint:completion:)]) {
++    completion_handler(nil);
++    return;
++  }
++
++  NSURL* linkURL =
++      params.link_url.is_valid() ? net::NSURLWithGURL(params.link_url) : nil;
++  NSURL* imageURL =
++      params.src_url.is_valid() ? net::NSURLWithGURL(params.src_url) : nil;
++  UIView* tabView = source->GetView();
++  CGPoint point = params.view
++                      ? [params.view convertPoint:params.location toView:tabView]
++                      : params.location;
++
++  __block UIContextMenuConfiguration* syncConfig = nil;
++  __block BOOL invoked = NO;
++  [delegate browserHost:host_
++      contextMenuConfigurationForTab:tab
++                             linkURL:linkURL
++                            imageURL:imageURL
++                         sourcePoint:point
++                          completion:^(UIContextMenuConfiguration* config) {
++                            if (!invoked) {
++                              invoked = YES;
++                              syncConfig = config;
++                            }
++                          }];
++  completion_handler(syncConfig);
++}
++
++void CuriumWebStateDelegate::OnNewWebViewCreated(web::WebState* source) {
++  [source->GetWebViewProxy() becomeFirstResponder];
++}
+diff --git a/ios/chrome/browser/extensions/model/BUILD.gn b/ios/chrome/browser/extensions/model/BUILD.gn
+index 6333da5..b2db6af 100644
+--- a/ios/chrome/browser/extensions/model/BUILD.gn
++++ b/ios/chrome/browser/extensions/model/BUILD.gn
+@@ -63,6 +63,7 @@ source_set("model") {
+     "//ios/chrome/common",
+     "//ios/web/content",
+     "//ios/web/public",
++    "//ios/web/public/navigation",
+     "//net",
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+@@ -75,4 +76,6 @@ source_set("model") {
+     "//ui/gfx/geometry",
+     "//url",
+   ]
++
++  frameworks = [ "UIKit.framework" ]
+ }
+diff --git a/ios/chrome/browser/extensions/model/ios_action_api.cc b/ios/chrome/browser/extensions/model/ios_action_api.cc
+index 2fa486c..b207c38 100644
+--- a/ios/chrome/browser/extensions/model/ios_action_api.cc
++++ b/ios/chrome/browser/extensions/model/ios_action_api.cc
+@@ -20,6 +20,7 @@
+ #include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
+ #include "extensions/common/file_util.h"
++#include "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/image/image.h"
+@@ -146,6 +147,7 @@ void IOSActionSetIconFunction::SetLoadedIcon(int tab_id, const gfx::Image& image
+     return;
+   }
+   action->SetIcon(tab_id, image);
++  NotifyIOSExtensionActionPresentationChanged(extension()->id());
+   Respond(NoArguments());
+ }
+ 
+@@ -169,6 +171,7 @@ ExtensionFunction::ResponseAction IOSActionSetBadgeTextFunction::Run() {
+   } else {
+     action->ClearBadgeText(tab_id);
+   }
++  NotifyIOSExtensionActionPresentationChanged(extension()->id());
+   return RespondNow(NoArguments());
+ }
+ 
+@@ -191,6 +194,7 @@ IOSActionSetBadgeBackgroundColorFunction::Run() {
+     return RespondNow(Error("The extension has no action."));
+   }
+   action->SetBadgeBackgroundColor(tab_id, color);
++  NotifyIOSExtensionActionPresentationChanged(extension()->id());
+   return RespondNow(NoArguments());
+ }
+ 
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 5f53e66..99915d8 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -58,6 +58,12 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile);
+ // from which the initial bundled unpacked content-script fixture is loaded.
+ base::FilePath GetIOSBundledExtensionDirectory();
+ 
++// Notifies registered UI observers that an extension's toolbar presentation
++// (icon, badge, enabled state, or installed set) changed. An empty ID requests
++// a full refresh of all extensions.
++void NotifyIOSExtensionActionPresentationChanged(
++    const std::string& extension_id);
++
+ namespace extensions {
+ 
+ inline constexpr char kIOSBundledExtensionId[] =
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index e48a7af..7fd871e 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -5,6 +5,7 @@
+ #import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
+ 
+ #import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
+ 
+ #include <map>
+ #include <memory>
+@@ -49,6 +50,8 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "extensions/browser/api/core_extensions_browser_api_provider.h"
++#include "extensions/browser/api/declarative_net_request/action_tracker.h"
++#include "extensions/browser/api/declarative_net_request/rules_monitor_service.h"
+ #include "extensions/browser/api/extensions_api_client.h"
+ #include "extensions/browser/api/messaging/messaging_delegate.h"
+ #include "extensions/browser/api/runtime/runtime_api.h"
+@@ -57,6 +60,8 @@
+ #include "extensions/browser/browser_context_keyed_service_factories.h"
+ #include "extensions/browser/event_router.h"
+ #include "extensions/browser/disable_reason.h"
++#include "extensions/browser/extension_action.h"
++#include "extensions/browser/extension_action_manager.h"
+ #include "extensions/browser/extension_host_delegate.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registrar.h"
+@@ -72,6 +77,8 @@
+ #include "extensions/browser/service_worker/service_worker_task_queue.h"
+ #include "extensions/browser/unpacked_installer.h"
+ #include "extensions/browser/url_request_util.h"
++#include "extensions/common/api/commands/commands_handler.h"
++#include "extensions/common/command.h"
+ #include "extensions/common/constants.h"
+ #include "extensions/common/extension.h"
+ #include "extensions/common/extension_l10n_util.h"
+@@ -101,9 +108,25 @@
+ #include "ios/chrome/common/channel_info.h"
+ #include "ios/web/content/content_browser_context.h"
+ #include "ios/web/content/web_state/content_web_state.h"
++#include "ios/web/public/navigation/navigation_manager.h"
++#include "ios/web/public/web_state.h"
++#include "ios/web/public/web_state_delegate.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/accelerators/command.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/gfx/image/image.h"
+ #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+ #include "url/gurl.h"
+ 
++@protocol CrIOSExtensionPopupHostingV1 <NSObject>
++@property(nonatomic, copy, readonly) NSString* extensionID;
++@property(nonatomic, readonly) int32_t tabID;
++@property(nonatomic, strong, readonly) UIView* view;
++@property(nonatomic, readonly) CGSize preferredContentSize;
++@property(nonatomic, copy, nullable) void (^onRequestClose)(void);
++- (void)close;
++@end
++
+ // Required V1 selectors remain stable; the UI probes optional capabilities.
+ @protocol CrIOSExtensionManagingV1 <NSObject>
+ - (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
+@@ -135,8 +158,28 @@ - (void)confirmPreparedExtensionWithToken:(NSString*)token
+                                                     NSError*))completion;
+ - (BOOL)cancelPreparedExtensionWithToken:(NSString*)token
+                                    error:(NSError* __autoreleasing*)error;
++- (NSDictionary<NSString*, id>*)actionPresentationForExtensionWithID:
++                                    (NSString*)extensionID
++                                                               tabID:
++                                                                   (int32_t)tabID
++                                                               error:
++                                                                   (NSError* __autoreleasing*)
++                                                                       error;
++- (id<NSObject>)observeActionPresentationChangesWithHandler:
++    (void (^)(NSString* extensionID))handler;
++- (NSNumber*)blockedRequestCountForExtensionWithID:(NSString*)extensionID
++                                             tabID:(int32_t)tabID
++                                             error:(NSError* __autoreleasing*)error;
++- (id<CrIOSExtensionPopupHostingV1>)
++    popupForExtensionWithID:(NSString*)extensionID
++                      tabID:(int32_t)tabID
++                      error:(NSError* __autoreleasing*)error;
++- (NSArray<NSDictionary<NSString*, NSString*>*>*)
++    commandsForExtensionWithID:(NSString*)extensionID
++                         error:(NSError* __autoreleasing*)error;
+ @end
+ 
++__attribute__((visibility("default")))
+ @interface CrIOSExtensionManagerV1 : NSObject <CrIOSExtensionManagingV1>
+ + (instancetype)sharedManager;
+ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+@@ -1729,6 +1772,7 @@ - (BOOL)setExtensionWithID:(NSString*)extensionId
+                            : @"Extension could not be disabled.");
+     return NO;
+   }
++  NotifyIOSExtensionActionPresentationChanged(ext_id);
+   return YES;
+ }
+ 
+@@ -2270,3 +2314,420 @@ - (BOOL)dispatchCommandNamed:(NSString*)commandName
+ }
+ 
+ @end
++
++@interface CrIOSActionPresentationObserverToken : NSObject
++- (instancetype)initWithHandler:(void (^)(NSString*))handler;
++- (void)notifyExtensionID:(NSString*)extensionID;
++@end
++
++namespace {
++
++NSHashTable<CrIOSActionPresentationObserverToken*>*
++GetActionPresentationObservers() {
++  static NSHashTable<CrIOSActionPresentationObserverToken*>* observers = nil;
++  if (!observers) {
++    observers = [NSHashTable weakObjectsHashTable];
++  }
++  return observers;
++}
++
++class CrIOSExtensionPopupWebStateDelegate final : public web::WebStateDelegate {
++ public:
++  explicit CrIOSExtensionPopupWebStateDelegate(void (^on_close)(void))
++      : on_close_([on_close copy]) {}
++  ~CrIOSExtensionPopupWebStateDelegate() override = default;
++
++  void CloseWebState(web::WebState* source) override {
++    if (on_close_) {
++      on_close_();
++    }
++  }
++
++ private:
++  void (^on_close_)(void);
++};
++
++}  // namespace
++
++@implementation CrIOSActionPresentationObserverToken {
++  void (^_handler)(NSString*);
++}
++
++- (instancetype)initWithHandler:(void (^)(NSString*))handler {
++  self = [super init];
++  if (self) {
++    _handler = [handler copy];
++    [GetActionPresentationObservers() addObject:self];
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [GetActionPresentationObservers() removeObject:self];
++}
++
++- (void)notifyExtensionID:(NSString*)extensionID {
++  if (_handler) {
++    _handler(extensionID);
++  }
++}
++
++@end
++
++void NotifyIOSExtensionActionPresentationChanged(
++    const std::string& extension_id) {
++  if (![NSThread isMainThread]) {
++    std::string copy = extension_id;
++    dispatch_async(dispatch_get_main_queue(), ^{
++      NotifyIOSExtensionActionPresentationChanged(copy);
++    });
++    return;
++  }
++  NSString* ns_id =
++      extension_id.empty() ? nil : base::SysUTF8ToNSString(extension_id);
++  NSArray<CrIOSActionPresentationObserverToken*>* snapshot =
++      [GetActionPresentationObservers() allObjects];
++  for (CrIOSActionPresentationObserverToken* token in snapshot) {
++    [token notifyExtensionID:ns_id];
++  }
++}
++
++@interface CrIOSExtensionPopupHost : NSObject <CrIOSExtensionPopupHostingV1>
++- (instancetype)initWithExtensionID:(NSString*)extensionID
++                              tabID:(int32_t)tabID
++                           webState:(std::unique_ptr<web::WebState>)webState;
++@end
++
++@implementation CrIOSExtensionPopupHost {
++  NSString* _extensionID;
++  int32_t _tabID;
++  std::unique_ptr<web::WebState> _webState;
++  std::unique_ptr<CrIOSExtensionPopupWebStateDelegate> _delegate;
++  UIView* _fallbackView;
++  BOOL _closed;
++}
++
++@synthesize onRequestClose = _onRequestClose;
++
++- (instancetype)initWithExtensionID:(NSString*)extensionID
++                              tabID:(int32_t)tabID
++                           webState:(std::unique_ptr<web::WebState>)webState {
++  self = [super init];
++  if (self) {
++    _extensionID = [extensionID copy];
++    _tabID = tabID;
++    _webState = std::move(webState);
++    __weak CrIOSExtensionPopupHost* weakSelf = self;
++    _delegate = std::make_unique<CrIOSExtensionPopupWebStateDelegate>(^{
++      CrIOSExtensionPopupHost* strongSelf = weakSelf;
++      if (!strongSelf || strongSelf->_closed) {
++        return;
++      }
++      void (^handler)(void) = strongSelf.onRequestClose;
++      if (handler) {
++        handler();
++      }
++    });
++    _webState->SetDelegate(_delegate.get());
++  }
++  return self;
++}
++
++- (void)dealloc {
++  [self close];
++}
++
++- (NSString*)extensionID {
++  return _extensionID;
++}
++
++- (int32_t)tabID {
++  return _tabID;
++}
++
++- (UIView*)view {
++  if (_webState) {
++    return _webState->GetView();
++  }
++  if (!_fallbackView) {
++    _fallbackView = [[UIView alloc] init];
++  }
++  return _fallbackView;
++}
++
++- (CGSize)preferredContentSize {
++  return CGSizeMake(360.0, 480.0);
++}
++
++- (void)close {
++  if (_closed) {
++    return;
++  }
++  _closed = YES;
++  _onRequestClose = nil;
++  if (_webState) {
++    _webState->SetDelegate(nullptr);
++    _webState->WasHidden();
++    _webState.reset();
++  }
++  _delegate.reset();
++}
++
++@end
++
++@implementation CrIOSExtensionManagerV1 (CuriumV2)
++
++- (NSDictionary<NSString*, id>*)actionPresentationForExtensionWithID:
++                                    (NSString*)extensionID
++                                                               tabID:
++                                                                   (int32_t)tabID
++                                                               error:
++                                                                   (NSError* __autoreleasing*)
++                                                                       error {
++  if (![extensionID isKindOfClass:[NSString class]] ||
++      extensionID.length == 0) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorInvalidArgument,
++                   @"Extension ID must be a non-empty string.");
++    return nil;
++  }
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++  const std::string ext_id = base::SysNSStringToUTF8(extensionID);
++  const extensions::Extension* ext = registry->GetInstalledExtension(ext_id);
++  if (!ext) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension is not installed in the active context.");
++    return nil;
++  }
++  auto* action_manager = extensions::ExtensionActionManager::Get(context);
++  extensions::ExtensionAction* action =
++      action_manager ? action_manager->GetExtensionAction(*ext) : nullptr;
++  const int effective_tab = tabID >= 0
++                                ? static_cast<int>(tabID)
++                                : extensions::ExtensionAction::kDefaultTabId;
++
++  const bool is_enabled = registrar->IsExtensionEnabled(ext_id) && action &&
++                          action->GetIsVisible(effective_tab);
++  const GURL popup_url = action ? action->GetPopupUrl(effective_tab) : GURL();
++  const bool has_popup =
++      popup_url.is_valid() &&
++      popup_url.SchemeIs(extensions::kExtensionScheme) &&
++      popup_url.host() == ext_id;
++
++  NSMutableDictionary<NSString*, id>* snapshot =
++      [NSMutableDictionary dictionaryWithDictionary:@{
++        @"isEnabled" : @(is_enabled),
++        @"hasPopup" : @(has_popup),
++      }];
++
++  std::string title = action ? action->GetTitle(effective_tab) : std::string();
++  if (title.empty()) {
++    title = ext->name();
++  }
++  if (!title.empty()) {
++    snapshot[@"title"] = base::SysUTF8ToNSString(title);
++  }
++
++  if (action) {
++    const std::string badge = action->GetDisplayBadgeText(effective_tab);
++    if (!badge.empty()) {
++      snapshot[@"badgeText"] = base::SysUTF8ToNSString(badge);
++    }
++    const SkColor bg = action->GetBadgeBackgroundColor(effective_tab);
++    if (SkColorGetA(bg) != 0) {
++      snapshot[@"badgeBackgroundColor"] =
++          [UIColor colorWithRed:SkColorGetR(bg) / 255.0
++                          green:SkColorGetG(bg) / 255.0
++                           blue:SkColorGetB(bg) / 255.0
++                          alpha:SkColorGetA(bg) / 255.0];
++    }
++    const gfx::Image icon = action->GetExplicitlySetIcon(effective_tab);
++    if (!icon.IsEmpty()) {
++      if (UIImage* ui_icon = icon.ToUIImage()) {
++        snapshot[@"icon"] = ui_icon;
++      }
++    }
++  }
++  return [snapshot copy];
++}
++
++- (id<NSObject>)observeActionPresentationChangesWithHandler:
++    (void (^)(NSString* extensionID))handler {
++  if (!handler) {
++    return nil;
++  }
++  return [[CrIOSActionPresentationObserverToken alloc] initWithHandler:handler];
++}
++
++- (NSNumber*)blockedRequestCountForExtensionWithID:(NSString*)extensionID
++                                             tabID:(int32_t)tabID
++                                             error:(NSError* __autoreleasing*)error {
++  if (![extensionID isKindOfClass:[NSString class]] ||
++      extensionID.length == 0) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorInvalidArgument,
++                   @"Extension ID must be a non-empty string.");
++    return nil;
++  }
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++  const std::string ext_id = base::SysNSStringToUTF8(extensionID);
++  if (!registry->GetInstalledExtension(ext_id)) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension is not installed in the active context.");
++    return nil;
++  }
++  if (tabID < 0) {
++    return @(0);
++  }
++  auto* rules_monitor =
++      extensions::declarative_net_request::RulesMonitorService::Get(context);
++  const size_t count =
++      rules_monitor
++          ? rules_monitor->action_tracker().GetBlockedRequestCountForTab(
++                ext_id, static_cast<int>(tabID))
++          : 0u;
++  return @(static_cast<NSUInteger>(count));
++}
++
++- (id<CrIOSExtensionPopupHostingV1>)
++    popupForExtensionWithID:(NSString*)extensionID
++                      tabID:(int32_t)tabID
++                      error:(NSError* __autoreleasing*)error {
++  if (![extensionID isKindOfClass:[NSString class]] ||
++      extensionID.length == 0) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorInvalidArgument,
++                   @"Extension ID must be a non-empty string.");
++    return nil;
++  }
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++  const std::string ext_id = base::SysNSStringToUTF8(extensionID);
++  const extensions::Extension* ext = registry->GetInstalledExtension(ext_id);
++  if (!ext) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension is not installed in the active context.");
++    return nil;
++  }
++  if (!registrar->IsExtensionEnabled(ext_id)) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorStateChangeFailed,
++                   @"Extension must be enabled to open a popup.");
++    return nil;
++  }
++  auto* action_manager = extensions::ExtensionActionManager::Get(context);
++  extensions::ExtensionAction* action =
++      action_manager ? action_manager->GetExtensionAction(*ext) : nullptr;
++  const int effective_tab = tabID >= 0
++                                ? static_cast<int>(tabID)
++                                : extensions::ExtensionAction::kDefaultTabId;
++  const GURL popup_url = action ? action->GetPopupUrl(effective_tab) : GURL();
++  if (!popup_url.is_valid() ||
++      !popup_url.SchemeIs(extensions::kExtensionScheme) ||
++      popup_url.host() != ext_id) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension does not declare a popup for this tab.");
++    return nil;
++  }
++
++  auto* content_context = static_cast<web::ContentBrowserContext*>(context);
++  web::BrowserState* browser_state =
++      content_context ? content_context->GetBrowserState() : nullptr;
++  if (!browser_state) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"Browser state is unavailable for extension popup.");
++    return nil;
++  }
++
++  web::WebState::CreateParams params(browser_state);
++  std::unique_ptr<web::WebState> popup_web_state =
++      web::WebState::Create(params);
++  if (!popup_web_state) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorSystemNotReady,
++                   @"Failed to create popup WebState.");
++    return nil;
++  }
++  popup_web_state->ForceRealized();
++  popup_web_state->WasShown();
++  web::NavigationManager::WebLoadParams load_params(popup_url);
++  load_params.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
++  popup_web_state->GetNavigationManager()->LoadURLWithParams(load_params);
++
++  return [[CrIOSExtensionPopupHost alloc]
++      initWithExtensionID:extensionID
++                    tabID:tabID
++                 webState:std::move(popup_web_state)];
++}
++
++- (NSArray<NSDictionary<NSString*, NSString*>*>*)
++    commandsForExtensionWithID:(NSString*)extensionID
++                         error:(NSError* __autoreleasing*)error {
++  if (![extensionID isKindOfClass:[NSString class]] ||
++      extensionID.length == 0) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorInvalidArgument,
++                   @"Extension ID must be a non-empty string.");
++    return nil;
++  }
++  content::BrowserContext* context = nullptr;
++  extensions::ExtensionSystem* system = nullptr;
++  extensions::ExtensionRegistry* registry = nullptr;
++  extensions::ExtensionRegistrar* registrar = nullptr;
++  if (!ResolveExtensionServices(&context, &system, &registry, &registrar,
++                                error)) {
++    return nil;
++  }
++  const std::string ext_id = base::SysNSStringToUTF8(extensionID);
++  const extensions::Extension* ext = registry->GetInstalledExtension(ext_id);
++  if (!ext) {
++    SetBridgeError(error, kCrIOSExtensionManagerErrorNotFound,
++                   @"Extension is not installed in the active context.");
++    return nil;
++  }
++
++  NSMutableArray<NSDictionary<NSString*, NSString*>*>* result =
++      [NSMutableArray array];
++  auto append_command = ^(const ui::Command& command) {
++    [result addObject:@{
++      @"name" : base::SysUTF8ToNSString(command.command_name()) ?: @"",
++      @"description" : base::SysUTF16ToNSString(command.description()) ?: @"",
++      @"shortcut" : @"",
++    }];
++  };
++  if (const extensions::Command* browser_action =
++          extensions::CommandsInfo::GetBrowserActionCommand(ext)) {
++    append_command(*browser_action);
++  }
++  if (const extensions::Command* action =
++          extensions::CommandsInfo::GetActionCommand(ext)) {
++    append_command(*action);
++  }
++  if (const extensions::Command* page_action =
++          extensions::CommandsInfo::GetPageActionCommand(ext)) {
++    append_command(*page_action);
++  }
++  if (const ui::CommandMap* named =
++          extensions::CommandsInfo::GetNamedCommands(ext)) {
++    for (const auto& [_, command] : *named) {
++      append_command(command);
++    }
++  }
++  return [result copy];
++}
++
++@end
+diff --git a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn b/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
+index 9fa5535..2b16255 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
++++ b/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
+@@ -119,7 +119,10 @@ source_set("scene") {
+     "//components/url_formatter",
+     "//components/version_info",
+     "//components/web_resource",
++    "//extensions/buildflags",
+     "//ios/chrome/app",
++    "//ios/chrome/browser/curium",
++    "//ios/chrome/browser/curium:bootstrap",
+     "//ios/chrome/app:actor_request",
+     "//ios/chrome/app:blocking_scene_commands",
+     "//ios/chrome/app:change_profile_commands",
+diff --git a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+index 8472351..1ef8ab9 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
++++ b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+@@ -126,7 +126,13 @@
+ #import "ios/chrome/browser/shared/coordinator/scene/url_context.h"
+ #import "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #import "ios/chrome/browser/shared/model/browser/browser.h"
++#import "extensions/buildflags/buildflags.h"
++#import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
++#import "ios/chrome/browser/curium/curium_browser_host.h"
++#import "ios/chrome/browser/curium/curium_browser_provider.h"
++#import "ios/chrome/browser/shared/model/browser/browser_list.h"
+ #import "ios/chrome/browser/shared/model/browser/browser_list_factory.h"
++#import "ios/chrome/browser/web/model/web_state_delegate_browser_agent.h"
+ #import "ios/chrome/browser/shared/model/browser/browser_provider_interface.h"
+ #import "ios/chrome/browser/shared/model/prefs/pref_names.h"
+ #import "ios/chrome/browser/shared/model/profile/profile_attributes_storage_ios.h"
+@@ -358,6 +364,9 @@ @interface SceneController () <ProfileStateObserver,
+   // across tab switcher dismissal.
+   std::optional<RemoteActorRequest> _remoteActorRequest;
+   BOOL _handleExternalIntentsInProgress;
++  std::unique_ptr<Browser> _headlessBrowser;
++  CuriumBrowserProvider* _headlessBrowserProvider;
++  CuriumBrowserHost* _curiumBrowserHost;
+ }
+ 
+ // Coordinates the creation of PDF screenshots with the window's content.
+@@ -423,6 +432,9 @@ - (instancetype)initWithSceneState:(SceneState*)sceneState {
+ 
+ // TODO(crbug.com/429347474): Get rid of BrowserProviderInterface
+ - (id<BrowserProviderInterface>)browserProviderInterface {
++  if (_headlessBrowserProvider) {
++    return _headlessBrowserProvider;
++  }
+   return self.browserLifecycleManager;
+ }
+ 
+@@ -526,7 +538,7 @@ - (void)sceneState:(SceneState*)sceneState
+ 
+ - (void)sceneState:(SceneState*)sceneState
+     receivedUserActivity:(NSUserActivity*)userActivity {
+-  if (!userActivity) {
++  if (_curiumBrowserHost || !userActivity) {
+     return;
+   }
+ 
+@@ -1513,7 +1525,8 @@ - (void)transitionToSceneActivationLevel:(SceneActivationLevel)level
+     self.sceneState.scene.title = [self displayTitleForAppSwitcher];
+   }
+ 
+-  if (level == SceneActivationLevelForegroundActive &&
++  if (!_curiumBrowserHost &&
++      level == SceneActivationLevelForegroundActive &&
+       profileInitStage == ProfileInitStage::kFinal) {
+     if (!IsFullscreenSigninPromoManagerMigrationEnabled()) {
+       [self tryPresentFullscreenSigninPromo];
+@@ -1552,6 +1565,13 @@ - (void)initializeUI {
+     return;
+   }
+ 
++  if (id<CrIOSShellBootstrapDelegate> bootstrapDelegate =
++          [CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    [self startUpCuriumShellUI:bootstrapDelegate];
++    self.sceneState.UIEnabled = YES;
++    return;
++  }
++
+   if (tests_hook::ShouldLoadMinimalAppUI()) {
+     tests_hook::LoadMinimalAppUI(self.sceneState.window);
+   } else {
+@@ -1560,6 +1580,43 @@ - (void)initializeUI {
+   self.sceneState.UIEnabled = YES;
+ }
+ 
++- (void)startUpCuriumShellUI:(id<CrIOSShellBootstrapDelegate>)bootstrapDelegate {
++  TRACE_EVENT("ui", "-[SceneController startUpCuriumShellUI:]");
++  DCHECK(!_headlessBrowser);
++  DCHECK(!_curiumBrowserHost);
++  DCHECK(self.profile);
++
++  ProfileIOS* profile = self.profile;
++  SceneState* sceneState = self.sceneState;
++
++  _headlessBrowser = Browser::Create(profile, sceneState);
++  _headlessBrowser->RemoveUserData(WebStateDelegateBrowserAgent::UserDataKey());
++  BrowserListFactory::GetForProfile(profile)->AddBrowser(_headlessBrowser.get());
++  WebUsageEnablerBrowserAgent::FromBrowser(_headlessBrowser.get())
++      ->SetWebUsageEnabled(true);
++
++  _headlessBrowserProvider =
++      [[CuriumBrowserProvider alloc] initWithBrowser:_headlessBrowser.get()];
++  _curiumBrowserHost =
++      [[CuriumBrowserHost alloc] initWithBrowser:_headlessBrowser.get()
++                                      sceneState:sceneState];
++
++  id<CrIOSExtensionManagingV1> extensionManager = nil;
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  Class managerClass = NSClassFromString(@"CrIOSExtensionManagerV1");
++  if ([managerClass respondsToSelector:@selector(sharedManager)]) {
++    extensionManager = [(id)managerClass sharedManager];
++  }
++#endif
++
++  UIViewController* rootViewController =
++      [bootstrapDelegate makeRootViewControllerForScene:sceneState.scene
++                                            browserHost:_curiumBrowserHost
++                                       extensionManager:extensionManager];
++  sceneState.window.rootViewController = rootViewController;
++  [sceneState.window makeKeyAndVisible];
++}
++
+ // Starts up a single chrome window and its UI.
+ - (void)startUpChromeUI {
+   TRACE_EVENT("ui", "-[SceneController startUpChromeUI]");
+@@ -1755,6 +1812,30 @@ - (void)setProfileState:(ProfileState*)profileState {
+ }
+ 
+ - (void)teardownUI {
++  if (_curiumBrowserHost || _headlessBrowser) {
++    [_curiumBrowserHost shutdown];
++    _curiumBrowserHost = nil;
++    _headlessBrowserProvider = nil;
++    self.sceneState.UIEnabled = NO;
++    if (_headlessBrowser) {
++      ProfileIOS* profile = _headlessBrowser->GetProfile();
++      if (BrowserList* browserList =
++              BrowserListFactory::GetForProfileIfExists(profile)) {
++        browserList->RemoveBrowser(_headlessBrowser.get());
++      }
++      @autoreleasepool {
++        CloseAllWebStates(*_headlessBrowser->GetWebStateList(),
++                          WebStateList::ClosingReason::kDefault);
++      }
++      _headlessBrowser.reset();
++    }
++    [self.sceneState.profileState removeObserver:self];
++    [_sceneState.uiBlockerState removeObserver:self];
++    _sceneURLLoadingService.reset();
++    _imageTranscoder = nullptr;
++    return;
++  }
++
+   // Prepare command dispatchers across all browsers for shutdown right at the
+   // start. This ensures that any command targets (like SceneCoordinator) that
+   // unregister during `-stop` are recorded in CommandDispatcher's silently
+@@ -1791,6 +1872,10 @@ - (void)teardownUI {
+ // domain of the foreground tab and the tab count. Assumes the scene is
+ // visible. Will return nil if there are no tabs.
+ - (NSString*)displayTitleForAppSwitcher {
++  if (_curiumBrowserHost) {
++    NSString* title = _curiumBrowserHost.activeTab.title;
++    return title.length > 0 ? title : nil;
++  }
+   if (tests_hook::ShouldLoadMinimalAppUI()) {
+     return nil;
+   }
+@@ -1919,7 +2004,7 @@ - (BOOL)canHandleIntents {
+     }
+   }
+ 
+-  if (tests_hook::ShouldLoadMinimalAppUI()) {
++  if (_curiumBrowserHost || tests_hook::ShouldLoadMinimalAppUI()) {
+     return NO;
+   }
+ 
+@@ -2120,7 +2205,8 @@ - (void)addAgents {
+ // Adds agents that may depend on profileState. Called after a profileState has
+ // been connected to the sceneState.
+ - (void)addProfileStateDependentAgents {
+-  if (tests_hook::ShouldLoadMinimalAppUI()) {
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate] ||
++      tests_hook::ShouldLoadMinimalAppUI()) {
+     return;
+   }
+ 
+@@ -2923,6 +3009,9 @@ - (void)showTabSwitcher {
+ }
+ 
+ - (void)openURLContexts:(NSSet<UIOpenURLContext*>*)URLContexts {
++  if (_curiumBrowserHost) {
++    return;
++  }
+   if (self.sceneState.profileState.initStage <= ProfileInitStage::kUIReady ||
+       !self.currentInterface.profile) {
+     // Don't handle the intent if the browser UI objects aren't yet initialized.
+@@ -2977,7 +3066,7 @@ - (void)addANewTabAndPresentBrowser:(Browser*)browser
+ #pragma mark - Handling of Destroying the Incognito Profile
+ 
+ - (void)willDestroyIncognitoProfile {
+-  if (!_browserLifecycleManager) {
++  if (_curiumBrowserHost || !_browserLifecycleManager) {
+     // Nothing to do if the UI has not yet been created.
+     return;
+   }
+@@ -2999,7 +3088,7 @@ - (void)willDestroyIncognitoProfile {
+ }
+ 
+ - (void)incognitoProfileCreated {
+-  if (!_browserLifecycleManager) {
++  if (_curiumBrowserHost || !_browserLifecycleManager) {
+     // Nothing to do if the UI has not yet been created.
+     return;
+   }
