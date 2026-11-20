@@ -726,7 +726,7 @@ new file mode 100644
 index 0000000..a27d332
 --- /dev/null
 +++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1321 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1178,11 +1178,22 @@ index 0000000..a27d332
 +  return self;
 +}
 +
++// The owner tears down on the UI sequence before releasing the bridge, but render
++// queue blocks may hold the last reference, so dealloc can run on that queue. It
++// must not touch UIKit or capture self in a block: a block retaining a
++// deallocating object releases freed memory when it is disposed.
 +- (void)dealloc {
-+  [self teardownObserversAndViews];
++  [self detachObservers];
++  if (UIView* hostView = _hostView) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      [hostView removeFromSuperview];
++    });
++  }
 +}
 +
-+- (void)teardownObserversAndViews {
++// Unregisters observers. Removal may run on any thread; it does not make a
++// callback already in flight safe against concurrent teardown.
++- (void)detachObservers {
 +  NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
 +  if (_didEnterBgObserver) {
 +    [nc removeObserver:_didEnterBgObserver];
@@ -1204,6 +1215,11 @@ index 0000000..a27d332
 +    [_pipController removeObserver:self forKeyPath:@"pictureInPicturePossible"];
 +    _observingPossible = NO;
 +  }
++}
++
++// UI sequence only, and never from dealloc: the render-state reset retains self.
++- (void)teardownObserversAndViews {
++  [self detachObservers];
 +  _waitingForPossible = NO;
 +  _startAttemptActive = NO;
 +  _pipController.delegate = nil;
@@ -1598,11 +1614,12 @@ index 0000000..a27d332
 +  _isFlushing = YES;
 +  _renderTimebasePrimed = NO;
 +  __weak CuriumPiPBridge* weakSelf = self;
++  dispatch_queue_t renderQueue = _renderQueue;
 +#pragma clang diagnostic push
 +#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 +  [_renderRenderer flushWithRemovalOfDisplayedImage:removeImage
 +                            completionHandler:^{
-+                              dispatch_async(self->_renderQueue, ^{
++                              dispatch_async(renderQueue, ^{
 +                                CuriumPiPBridge* strongSelf = weakSelf;
 +                                if (!strongSelf ||
 +                                    strongSelf->_atomicGeneration.load(
