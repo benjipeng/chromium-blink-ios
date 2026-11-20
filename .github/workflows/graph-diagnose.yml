@@ -11,7 +11,7 @@ on:
     inputs:
       baseline_run:
         description: Run ID of an earlier diagnosis whose artifact is the comparison baseline (blank to skip)
-        default: "43868838103"
+        default: "44736679414"
         type: string
       extra_gn_args:
         description: Extra GN args appended to args.gn (newline or semicolon separated)

@@ -129,12 +129,6 @@ obj/content/browser/browser/render_widget_host_impl.o
 obj/content/browser/browser/render_widget_host_view_ios.o
 obj/content/browser/browser/render_widget_host_view_ios_uiview.o
 obj/content/browser/browser/web_contents_view_ios.o
-obj/ios/chrome/browser/metrics/model/model/ios_profile_session_durations_service.o
-obj/ios/chrome/browser/optimization_guide/model/model/optimization_guide_service.o
-obj/ios/chrome/browser/optimization_guide/model/model/optimization_guide_service_factory.o
-obj/ios/chrome/browser/passwords/model/ode/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.o
-obj/ios/chrome/browser/signin/model/authentication_service/authentication_service.o
-obj/ios/chrome/browser/unified_consent/model/model/unified_consent_service_factory.o
 obj/third_party/blink/renderer/core/core_hot/document.o
 obj/third_party/blink/renderer/core/exported/exported/web_view_impl.o
 obj/third_party/blink/renderer/core/core/browser_controls.o
