@@ -1,0 +1,1130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: drop AI, Lens, voice, and Discover entry points
+
+Remove the AIM navigation observer, Lens browser and navigation hooks,
+voice navigation observer, and Discover refresh and app agents. Keep the
+Discover visibility and provider interfaces used by Chrome UI fallbacks.
+Use the Gemini kill switch and send ordinary text entry to the existing
+omnibox instead of starting Composebox or contextual search.
+
+Default iOS segmentation and its UKM database off. Return Chromium's dummy
+service on the disabled path so callers can still receive results. Keep
+visited-URL ranking active without its segmentation metrics transform.
+
+diff --git a/components/segmentation_platform/public/features.cc b/components/segmentation_platform/public/features.cc
+index 6c4e914..f4875ce 100644
+--- a/components/segmentation_platform/public/features.cc
++++ b/components/segmentation_platform/public/features.cc
+@@ -13,11 +13,15 @@ namespace segmentation_platform::features {
+ 
+ BASE_FEATURE(kSegmentationPlatformFeature,
+              "SegmentationPlatform",
++#if BUILDFLAG(IS_IOS)
++             base::FEATURE_DISABLED_BY_DEFAULT);
++#else
+              base::FEATURE_ENABLED_BY_DEFAULT);
++#endif
+ 
+ BASE_FEATURE(kSegmentationPlatformUkmEngine,
+ 
+-#if BUILDFLAG(IS_CHROMEOS)
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_IOS)
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ #else
+              base::FEATURE_ENABLED_BY_DEFAULT);
+diff --git a/components/visited_url_ranking/public/fetch_options.cc b/components/visited_url_ranking/public/fetch_options.cc
+index 81753c7..366ed27 100644
+--- a/components/visited_url_ranking/public/fetch_options.cc
++++ b/components/visited_url_ranking/public/fetch_options.cc
+@@ -127,7 +127,7 @@ FetchOptions FetchOptions::CreateFetchOptionsForTabResumption(
+         URLVisitAggregatesTransformType::kHistoryVisibilityScoreFilter);
+   }
+ 
+-#if !BUILDFLAG(IS_CHROMEOS)
++#if !BUILDFLAG(IS_CHROMEOS) && !BUILDFLAG(IS_IOS)
+   if (base::FeatureList::IsEnabled(
+           features::kVisitedURLRankingSegmentationMetricsData)) {
+     transforms.push_back(
+diff --git a/ios/chrome/app/BUILD.gn b/ios/chrome/app/BUILD.gn
+index de269ae..381e934 100644
+--- a/ios/chrome/app/BUILD.gn
++++ b/ios/chrome/app/BUILD.gn
+@@ -691,7 +691,6 @@ source_set("app_internal") {
+     "//ios/chrome/browser/default_browser/model:features",
+     "//ios/chrome/browser/default_browser/model:utils",
+     "//ios/chrome/browser/device_orientation/ui_bundled",
+-    "//ios/chrome/browser/discover_feed/model:discover_feed_app_agent",
+     "//ios/chrome/browser/download/model",
+     "//ios/chrome/browser/download/model/auto_deletion",
+     "//ios/chrome/browser/download/model/background_service",
+diff --git a/ios/chrome/app/background_refresh/BUILD.gn b/ios/chrome/app/background_refresh/BUILD.gn
+index 10d2398..5c1fca5 100644
+--- a/ios/chrome/app/background_refresh/BUILD.gn
++++ b/ios/chrome/app/background_refresh/BUILD.gn
+@@ -13,10 +13,6 @@ source_set("background_refresh") {
+     "background_refresh_app_agent+Testing.h",
+     "background_refresh_app_agent.h",
+     "background_refresh_app_agent.mm",
+-    "discover_feed_provider.h",
+-    "discover_feed_provider.mm",
+-    "discover_feed_task.h",
+-    "discover_feed_task.mm",
+     "test_refresher.h",
+     "test_refresher.mm",
+   ]
+@@ -31,8 +27,6 @@ source_set("background_refresh") {
+     "//ios/chrome/app/application_delegate:app_state",
+     "//ios/chrome/app/application_delegate:observing_app_state_agent",
+     "//ios/chrome/app/application_delegate:startup_information",
+-    "//ios/chrome/browser/discover_feed/model",
+-    "//ios/chrome/browser/discover_feed/model:discover_feed_factory",
+     "//ios/chrome/browser/shared/model/application_context",
+     "//ios/chrome/browser/shared/model/prefs:pref_names",
+     "//ios/chrome/browser/shared/model/profile",
+@@ -64,12 +58,17 @@ source_set("unit_tests") {
+   sources = [
+     "app_refresh_provider_unittest.mm",
+     "background_refresh_app_agent_unittest.mm",
++    "discover_feed_provider.h",
++    "discover_feed_provider.mm",
+     "discover_feed_provider_unittest.mm",
++    "discover_feed_task.h",
++    "discover_feed_task.mm",
+   ]
+   deps = [
+     ":background_refresh",
+     ":headers",
+     ":metrics",
++    "//base",
+     "//base/test:test_support",
+     "//components/prefs",
+     "//components/test/ios",
+@@ -77,10 +76,12 @@ source_set("unit_tests") {
+     "//ios/chrome/app/application_delegate:app_init_stage",
+     "//ios/chrome/app/application_delegate:app_state",
+     "//ios/chrome/app/application_delegate:test_support",
++    "//ios/chrome/browser/discover_feed/model",
+     "//ios/chrome/browser/discover_feed/model:discover_feed_factory",
+     "//ios/chrome/browser/profile/model:ios_thread",
+     "//ios/chrome/browser/shared/model/application_context",
+     "//ios/chrome/browser/shared/model/prefs:pref_names",
++    "//ios/chrome/browser/shared/model/profile",
+     "//ios/chrome/browser/shared/model/profile/test",
+     "//ios/chrome/browser/shared/public/features",
+     "//ios/chrome/browser/signin/model:fake_system_identity",
+diff --git a/ios/chrome/app/main_controller.mm b/ios/chrome/app/main_controller.mm
+index b00dd8e..bcc1101 100644
+--- a/ios/chrome/app/main_controller.mm
++++ b/ios/chrome/app/main_controller.mm
+@@ -55,7 +55,6 @@
+ #import "ios/chrome/app/application_delegate/memory_warning_helper.h"
+ #import "ios/chrome/app/application_delegate/metrics_mediator.h"
+ #import "ios/chrome/app/background_refresh/background_refresh_app_agent.h"
+-#import "ios/chrome/app/background_refresh/discover_feed_provider.h"
+ #import "ios/chrome/app/background_refresh/test_refresher.h"
+ #import "ios/chrome/app/background_task/background_continued_processing_app_agent.h"
+ #import "ios/chrome/app/blocking_scene_commands.h"
+@@ -100,7 +99,6 @@
+ #import "ios/chrome/browser/default_browser/model/features.h"
+ #import "ios/chrome/browser/default_browser/model/utils.h"
+ #import "ios/chrome/browser/device_orientation/ui_bundled/scoped_force_portrait_orientation.h"
+-#import "ios/chrome/browser/discover_feed/model/discover_feed_app_agent.h"
+ #import "ios/chrome/browser/download/model/download_directory_util.h"
+ #import "ios/chrome/browser/enterprise/cloud_content_scanning/model/background_cloud_scanner_manager.h"
+ #import "ios/chrome/browser/first_run/model/first_run.h"
+@@ -1204,15 +1202,10 @@ - (void)setAppState:(AppState*)appState {
+   refreshAgent.startupInformation = self;
+   refreshAgent.audience = _appState;
+   [_appState addAgent:refreshAgent];
+-  // Register background refresh providers.
+-  [refreshAgent addAppRefreshProvider:[[DiscoverFeedProvider alloc] init]];
+ 
+   [refreshAgent addAppRefreshProvider:[[TestRefresher alloc]
+                                           initWithAppState:self.appState]];
+ 
+-  // TODO(crbug.com/355142171): Remove the DiscoverFeedAppAgent.
+-  [appState addAgent:[[DiscoverFeedAppAgent alloc] init]];
+-
+   // Create the window accessibility agent only when multiple windows are
+   // possible.
+   if (base::ios::IsMultipleScenesSupported()) {
+diff --git a/ios/chrome/browser/browser_content/ui_bundled/BUILD.gn b/ios/chrome/browser/browser_content/ui_bundled/BUILD.gn
+index bf621f4..9e860f2 100644
+--- a/ios/chrome/browser/browser_content/ui_bundled/BUILD.gn
++++ b/ios/chrome/browser/browser_content/ui_bundled/BUILD.gn
+@@ -18,9 +18,6 @@ source_set("ui_bundled") {
+     "//base",
+     "//components/search_engines",
+     "//ios/chrome/app/strings",
+-    "//ios/chrome/browser/aim/model:aim_availability",
+-    "//ios/chrome/browser/cobrowse/model",
+-    "//ios/chrome/browser/composebox/model",
+     "//ios/chrome/browser/enterprise/data_controls/model",
+     "//ios/chrome/browser/enterprise/data_protection/public:features",
+     "//ios/chrome/browser/fullscreen/ui_bundled",
+diff --git a/ios/chrome/browser/browser_content/ui_bundled/browser_content_coordinator.mm b/ios/chrome/browser/browser_content/ui_bundled/browser_content_coordinator.mm
+index 4419141..305d0b2 100644
+--- a/ios/chrome/browser/browser_content/ui_bundled/browser_content_coordinator.mm
++++ b/ios/chrome/browser/browser_content/ui_bundled/browser_content_coordinator.mm
+@@ -8,14 +8,11 @@
+ 
+ #import "base/check.h"
+ #import "components/search_engines/template_url_service.h"
+-#import "ios/chrome/browser/aim/model/ios_chrome_aim_eligibility_service_factory.h"
+ #import "ios/chrome/browser/browser_content/ui_bundled/browser_content_mediator.h"
+ #import "ios/chrome/browser/browser_content/ui_bundled/browser_content_view_controller.h"
+ #import "ios/chrome/browser/browser_content/ui_bundled/browser_content_view_controller_delegate.h"
+ #import "ios/chrome/browser/browser_content/ui_bundled/browser_edit_menu_handler.h"
+ #import "ios/chrome/browser/browser_content/ui_bundled/edit_menu_alert_delegate.h"
+-#import "ios/chrome/browser/cobrowse/model/cobrowse_browser_agent.h"
+-#import "ios/chrome/browser/composebox/model/ios_contextual_search_service_factory.h"
+ #import "ios/chrome/browser/enterprise/data_controls/model/data_controls_edit_menu_builder.h"
+ #import "ios/chrome/browser/enterprise/data_protection/public/features.h"
+ #import "ios/chrome/browser/fullscreen/ui_bundled/fullscreen_controller.h"
+@@ -127,17 +124,11 @@ - (void)start {
+ 
+   TemplateURLService* templateURLService =
+       ios::TemplateURLServiceFactory::GetForProfile(profile);
+-  AimEligibilityService* aimEligibilityService =
+-      IOSChromeAimEligibilityServiceFactory::GetForProfile(profile);
+-  CobrowseBrowserAgent* cobrowseBrowserAgent =
+-      CobrowseBrowserAgent::FromBrowser(browser);
+-  contextual_search::ContextualSearchService* contextualSearchService =
+-      ContextualSearchServiceFactory::GetForProfile(profile);
+   _searchWithMediator = [[SearchWithMediator alloc]
+       initWithTemplateURLService:templateURLService
+-           aimEligibilityService:aimEligibilityService
+-            cobrowseBrowserAgent:cobrowseBrowserAgent
+-         contextualSearchService:contextualSearchService
++           aimEligibilityService:nullptr
++            cobrowseBrowserAgent:nullptr
++         contextualSearchService:nullptr
+                      prefService:profile->GetPrefs()
+                        incognito:incognito];
+ 
+diff --git a/ios/chrome/browser/browser_view/ui_bundled/BUILD.gn b/ios/chrome/browser/browser_view/ui_bundled/BUILD.gn
+index f93dcea..77fdfb8 100644
+--- a/ios/chrome/browser/browser_view/ui_bundled/BUILD.gn
++++ b/ios/chrome/browser/browser_view/ui_bundled/BUILD.gn
+@@ -197,7 +197,6 @@ source_set("ui_bundled") {
+     "//ios/chrome/browser/itunes_urls/model",
+     "//ios/chrome/browser/keyboard/ui_bundled",
+     "//ios/chrome/browser/language/model",
+-    "//ios/chrome/browser/lens/model",
+     "//ios/chrome/browser/lens/ui_bundled:coordinator",
+     "//ios/chrome/browser/lens_overlay/coordinator",
+     "//ios/chrome/browser/lens_overlay/model",
+@@ -345,7 +344,6 @@ source_set("ui_bundled") {
+     "//ios/chrome/browser/url_loading/model",
+     "//ios/chrome/browser/url_loading/model:new_tab_animation_tab_helper",
+     "//ios/chrome/browser/view_source/model",
+-    "//ios/chrome/browser/voice/model",
+     "//ios/chrome/browser/voice/ui_bundled",
+     "//ios/chrome/browser/web/model",
+     "//ios/chrome/browser/web/model:delegate",
+diff --git a/ios/chrome/browser/browser_view/ui_bundled/browser_coordinator.mm b/ios/chrome/browser/browser_view/ui_bundled/browser_coordinator.mm
+index d092fc1..0518b4a 100644
+--- a/ios/chrome/browser/browser_view/ui_bundled/browser_coordinator.mm
++++ b/ios/chrome/browser/browser_view/ui_bundled/browser_coordinator.mm
+@@ -255,7 +255,6 @@
+ #import "ios/chrome/browser/url_loading/model/url_loading_notifier_browser_agent.h"
+ #import "ios/chrome/browser/url_loading/model/url_loading_params.h"
+ #import "ios/chrome/browser/view_source/model/view_source_browser_agent.h"
+-#import "ios/chrome/browser/voice/model/voice_search_navigations_tab_helper.h"
+ #import "ios/chrome/browser/voice/ui_bundled/text_to_speech_playback_controller.h"
+ #import "ios/chrome/browser/voice/ui_bundled/text_to_speech_playback_controller_factory.h"
+ #import "ios/chrome/browser/web/model/choose_file/choose_file_tab_helper.h"
+@@ -1801,6 +1800,9 @@ - (void)preloadVoiceSearch {
+ }
+ 
+ - (void)startVoiceSearch {
++  if (!ios::provider::IsVoiceSearchEnabled()) {
++    return;
++  }
+   id<SceneCommands> sceneHandler =
+       HandlerForProtocol(self.browser->GetCommandDispatcher(), SceneCommands);
+   [sceneHandler stopAllVoiceSearch];
+@@ -2013,6 +2015,13 @@ - (void)showComposeboxFromEntrypoint:(ComposeboxEntrypoint)entrypoint
+ }
+ 
+ - (void)showComposeboxWithParams:(ComposeboxFocusParams*)params {
++  if (!IsComposeboxIOSEnabled()) {
++    [_omniboxCommandsHandler focusOmniboxFromFakebox];
++    if (params.query.length) {
++      [_omniboxCommandsHandler insertTextToOmnibox:params.query];
++    }
++    return;
++  }
+   if (_composeboxCoordinator) {
+     return;
+   }
+@@ -3169,10 +3178,6 @@ - (void)voiceSearchCoordinator:(ChromeCoordinator*)coordinator
+              didRecognizeQuery:(NSString*)query {
+   CHECK_EQ(coordinator, _voiceSearchCoordinator);
+   [self stopVoiceSearchCoordinator];
+-  if (web::WebState* activeWebState = self.activeWebState) {
+-    VoiceSearchNavigationTabHelper::FromWebState(activeWebState)
+-        ->WillLoadVoiceSearchResult();
+-  }
+   _urlLoadingBrowserAgent->LoadURLForQuery(query);
+ }
+ 
+diff --git a/ios/chrome/browser/browser_view/ui_bundled/tab_lifecycle_mediator.mm b/ios/chrome/browser/browser_view/ui_bundled/tab_lifecycle_mediator.mm
+index 047b29b..8f428fb 100644
+--- a/ios/chrome/browser/browser_view/ui_bundled/tab_lifecycle_mediator.mm
++++ b/ios/chrome/browser/browser_view/ui_bundled/tab_lifecycle_mediator.mm
+@@ -23,7 +23,6 @@
+ #import "ios/chrome/browser/intelligence/contextual_cueing/contextual_cueing_tab_helper.h"
+ #import "ios/chrome/browser/intelligence/features/features.h"
+ #import "ios/chrome/browser/itunes_urls/model/itunes_urls_handler_tab_helper.h"
+-#import "ios/chrome/browser/lens/model/lens_tab_helper.h"
+ #import "ios/chrome/browser/mini_map/model/mini_map_tab_helper.h"
+ #import "ios/chrome/browser/ntp/model/new_tab_page_tab_helper.h"
+ #import "ios/chrome/browser/overscroll_actions/model/overscroll_actions_tab_helper.h"
+@@ -44,7 +43,6 @@
+ #import "ios/chrome/browser/shared/public/commands/fullscreen_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/gemini_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/help_commands.h"
+-#import "ios/chrome/browser/shared/public/commands/lens_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/mini_map_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/parent_access_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/reader_mode_commands.h"
+@@ -65,7 +63,6 @@
+ #import "ios/chrome/browser/web/model/repost_form_tab_helper_delegate.h"
+ #import "ios/chrome/browser/webui/model/net_export_tab_helper.h"
+ #import "ios/chrome/browser/webui/model/net_export_tab_helper_delegate.h"
+-#import "ios/public/provider/chrome/browser/lens/lens_api.h"
+ #import "ui/base/device_form_factor.h"
+ 
+ @interface TabLifecycleMediator () <TabsDependencyInstalling>
+@@ -153,14 +150,6 @@ - (void)webStateInserted:(web::WebState*)webState {
+         HandlerForProtocol(_commandDispatcher, ParentAccessCommands));
+   }
+ 
+-  if (ios::provider::IsLensSupported()) {
+-    LensTabHelper* lensTabHelper = LensTabHelper::FromWebState(webState);
+-    if (lensTabHelper) {
+-      lensTabHelper->SetLensCommandsHandler(
+-          HandlerForProtocol(_commandDispatcher, LensCommands));
+-    }
+-  }
+-
+   DCHECK(_overscrollActionsDelegate);
+   OverscrollActionsTabHelper::FromWebState(webState)->SetDelegate(
+       _overscrollActionsDelegate);
+@@ -352,11 +341,6 @@ - (void)webStateRemoved:(web::WebState*)webState {
+     supervisedUserErrorContainer->SetParentAccessBottomSheetHandler(nil);
+   }
+ 
+-  LensTabHelper* lensTabHelper = LensTabHelper::FromWebState(webState);
+-  if (lensTabHelper) {
+-    lensTabHelper->SetLensCommandsHandler(nil);
+-  }
+-
+   OverscrollActionsTabHelper::FromWebState(webState)->SetDelegate(nil);
+ 
+   data_controls::DataControlsTabHelper::FromWebState(webState)
+diff --git a/ios/chrome/browser/composebox/coordinator/BUILD.gn b/ios/chrome/browser/composebox/coordinator/BUILD.gn
+index 45e9077..d6da993 100644
+--- a/ios/chrome/browser/composebox/coordinator/BUILD.gn
++++ b/ios/chrome/browser/composebox/coordinator/BUILD.gn
+@@ -126,7 +126,6 @@ source_set("input_plate") {
+     "//ios/chrome/browser/tab_switcher/ui_bundled:utils",
+     "//ios/chrome/browser/tabs/model",
+     "//ios/chrome/browser/variations/model/client",
+-    "//ios/chrome/browser/voice/model",
+     "//ios/chrome/browser/web/model",
+     "//ios/chrome/browser/web/model:page_placeholder",
+     "//ios/web",
+diff --git a/ios/chrome/browser/composebox/coordinator/composebox_availability.mm b/ios/chrome/browser/composebox/coordinator/composebox_availability.mm
+index 23b2f97..50e476f 100644
+--- a/ios/chrome/browser/composebox/coordinator/composebox_availability.mm
++++ b/ios/chrome/browser/composebox/coordinator/composebox_availability.mm
+@@ -4,14 +4,17 @@
+ 
+ #import "ios/chrome/browser/composebox/coordinator/composebox_availability.h"
+ 
+-#import "base/metrics/field_trial_params.h"
+ #import "ios/chrome/browser/shared/model/browser/browser.h"
+ #import "ios/chrome/browser/shared/public/commands/browser_coordinator_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/command_dispatcher.h"
++#import "ios/chrome/browser/shared/public/features/features.h"
+ 
+ bool MaybeShowComposebox(Browser* browser,
+                          ComposeboxEntrypoint entrypoint,
+                          NSString* query) {
++  if (!IsComposeboxIOSEnabled()) {
++    return false;
++  }
+   id<BrowserCoordinatorCommands> commands = HandlerForProtocol(
+       browser->GetCommandDispatcher(), BrowserCoordinatorCommands);
+   [commands showComposeboxFromEntrypoint:entrypoint withQuery:query];
+diff --git a/ios/chrome/browser/composebox/coordinator/composebox_input_plate_mediator.mm b/ios/chrome/browser/composebox/coordinator/composebox_input_plate_mediator.mm
+index 8d9ee4e..082d301 100644
+--- a/ios/chrome/browser/composebox/coordinator/composebox_input_plate_mediator.mm
++++ b/ios/chrome/browser/composebox/coordinator/composebox_input_plate_mediator.mm
+@@ -109,7 +109,6 @@
+ #import "ios/chrome/browser/tab_switcher/ui_bundled/tab_utils.h"
+ #import "ios/chrome/browser/url_loading/model/url_loading_params.h"
+ #import "ios/chrome/browser/url_loading/model/url_loading_util.h"
+-#import "ios/chrome/browser/voice/model/voice_search_navigations_tab_helper.h"
+ #import "ios/chrome/common/NSString+Chromium.h"
+ #import "ios/chrome/common/ui/favicon/favicon_attributes.h"
+ #import "ios/chrome/common/ui/util/image_util.h"
+@@ -826,24 +825,12 @@ - (void)sendText:(NSString*)text {
+   [self sendText:text additionalParams:{}];
+ }
+ 
+-- (void)sendText:(NSString*)text
+-    additionalParams:(std::map<std::string, std::string>)additionalParams {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(_sequenceChecker);
+-  [self sendText:text
+-      additionalParams:std::move(additionalParams)
+-       fromVoiceSearch:NO];
+-}
+-
+ - (void)sendVoiceSearchQuery:(NSString*)query {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(_sequenceChecker);
+-  [self sendText:query additionalParams:{} fromVoiceSearch:YES];
++  [self sendText:query additionalParams:{}];
+ }
+ 
+-// Sends `text` with `additionalParams`. `fromVoiceSearch` indicates whether
+-// `text` was recognized by Voice Search.
+ - (void)sendText:(NSString*)text
+-    additionalParams:(std::map<std::string, std::string>)additionalParams
+-     fromVoiceSearch:(BOOL)fromVoiceSearch {
++    additionalParams:(std::map<std::string, std::string>)additionalParams {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(_sequenceChecker);
+   // If the session is null, or if this is a regular search with no attachments,
+   // the contextual session is bypassed and a standard search URL is generated.
+@@ -853,7 +840,7 @@ - (void)sendText:(NSString*)text
+     if (_templateURLService) {
+       GURL URL = GetDefaultSearchURLForSearchTerms(_templateURLService,
+                                                    [text cr_UTF16String]);
+-      [self didCreateSearchURL:URL fromVoiceSearch:fromVoiceSearch];
++      [self didCreateSearchURL:URL];
+     }
+     return;
+   }
+@@ -888,7 +875,7 @@ - (void)sendText:(NSString*)text
+   __weak __typeof(self) weakSelf = self;
+   auto callback =
+       base::BindPostTaskToCurrentDefault(base::BindOnce(^(GURL URL) {
+-        [weakSelf didCreateSearchURL:URL fromVoiceSearch:fromVoiceSearch];
++        [weakSelf didCreateSearchURL:URL];
+       }));
+ 
+   auto createSearchUrlCallback = base::BindOnce(
+@@ -2146,10 +2133,8 @@ - (BOOL)shouldInvokeAssistantForAIMQuery {
+          [self isActiveTabAttached];
+ }
+ 
+-// Loads the aim query once the URL is generated by the Contextual search
+-// session. `fromVoiceSearch` indicates whether the query was recognized by
+-// Voice Search.
+-- (void)didCreateSearchURL:(GURL)URL fromVoiceSearch:(BOOL)fromVoiceSearch {
++// Loads a query once its search URL is available.
++- (void)didCreateSearchURL:(GURL)URL {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(_sequenceChecker);
+   [self recordNavigationInitiated];
+ 
+@@ -2178,12 +2163,6 @@ - (void)didCreateSearchURL:(GURL)URL fromVoiceSearch:(BOOL)fromVoiceSearch {
+       ui::PAGE_TRANSITION_GENERATED,
+       /*destination_url_entered_without_scheme=*/false, _isIncognito);
+ 
+-  if (fromVoiceSearch && _webStateList) {
+-    if (web::WebState* activeWebState = _webStateList->GetActiveWebState()) {
+-      VoiceSearchNavigationTabHelper::FromWebState(activeWebState)
+-          ->WillLoadVoiceSearchResult();
+-    }
+-  }
+   [self.URLLoader loadURLParams:params];
+ }
+ 
+diff --git a/ios/chrome/browser/content_suggestions/coordinator/content_suggestions_coordinator.mm b/ios/chrome/browser/content_suggestions/coordinator/content_suggestions_coordinator.mm
+index d4305e0..5f9535e 100644
+--- a/ios/chrome/browser/content_suggestions/coordinator/content_suggestions_coordinator.mm
++++ b/ios/chrome/browser/content_suggestions/coordinator/content_suggestions_coordinator.mm
+@@ -958,6 +958,9 @@ - (void)logEphemeralCardVisibility:(ContentSuggestionsModuleType)card {
+   segmentation_platform::home_modules::HomeModulesCardRegistry* registry =
+       segmentation_platform::SegmentationPlatformServiceFactory::
+           GetHomeCardRegistryForProfile(self.profile);
++  if (!registry) {
++    return;
++  }
+ 
+   switch (card) {
+     case ContentSuggestionsModuleType::kPriceTrackingPromo:
+@@ -1626,8 +1629,9 @@ - (void)recordTipInteractionIfNeeded:(segmentation_platform::TipIdentifier)tip {
+     segmentation_platform::home_modules::HomeModulesCardRegistry* registry =
+         segmentation_platform::SegmentationPlatformServiceFactory::
+             GetHomeCardRegistryForProfile(self.profile);
+-    CHECK(registry);
+-    registry->NotifyCardInteracted(std::string(name.value()).c_str());
++    if (registry) {
++      registry->NotifyCardInteracted(std::string(name.value()).c_str());
++    }
+   }
+ }
+ 
+diff --git a/ios/chrome/browser/intelligence/features/features.mm b/ios/chrome/browser/intelligence/features/features.mm
+index f9c2688..fd36cc6 100644
+--- a/ios/chrome/browser/intelligence/features/features.mm
++++ b/ios/chrome/browser/intelligence/features/features.mm
+@@ -38,7 +38,7 @@ bool IsEnhancedCalendarEnabled() {
+ // remains disabled by default for other locales and countries.
+ BASE_FEATURE(kPageActionMenu, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+-BASE_FEATURE(kGeminiKillSwitch, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE(kGeminiKillSwitch, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ // Default enabled countries for PageActionMenu in Gemini for Chrome
+ // Expansion V4.
+diff --git a/ios/chrome/browser/main/model/BUILD.gn b/ios/chrome/browser/main/model/BUILD.gn
+index b73aaac..98c9e3d 100644
+--- a/ios/chrome/browser/main/model/BUILD.gn
++++ b/ios/chrome/browser/main/model/BUILD.gn
+@@ -44,7 +44,6 @@ source_set("model") {
+     "//ios/chrome/browser/intelligence/features",
+     "//ios/chrome/browser/intelligence/persist_tab_context/model",
+     "//ios/chrome/browser/intents/model:user_activity_browser_agent",
+-    "//ios/chrome/browser/lens/model",
+     "//ios/chrome/browser/metrics/model",
+     "//ios/chrome/browser/metrics/model:tab_usage_recorder_browser_agent",
+     "//ios/chrome/browser/omnibox/model/omnibox_focus",
+diff --git a/ios/chrome/browser/main/model/browser_agent_util.mm b/ios/chrome/browser/main/model/browser_agent_util.mm
+index 0fb7a94..dfdb3fe 100644
+--- a/ios/chrome/browser/main/model/browser_agent_util.mm
++++ b/ios/chrome/browser/main/model/browser_agent_util.mm
+@@ -36,7 +36,6 @@
+ #import "ios/chrome/browser/intelligence/features/features.h"
+ #import "ios/chrome/browser/intelligence/persist_tab_context/model/persist_tab_context_browser_agent.h"
+ #import "ios/chrome/browser/intents/model/user_activity_browser_agent.h"
+-#import "ios/chrome/browser/lens/model/lens_browser_agent.h"
+ #import "ios/chrome/browser/metrics/model/tab_usage_recorder_browser_agent.h"
+ #import "ios/chrome/browser/omnibox/model/omnibox_focus/omnibox_focus_browser_agent.h"
+ #import "ios/chrome/browser/policy/model/policy_watcher_browser_agent.h"
+@@ -151,8 +150,6 @@ void AttachBrowserAgentsForActiveBrowser(Browser* browser) {
+     ReaderModeBrowserAgent::CreateForBrowser(browser);
+   }
+ 
+-  // LensBrowserAgent must be created before WebNavigationBrowserAgent.
+-  LensBrowserAgent::CreateForBrowser(browser);
+   WebNavigationBrowserAgent::CreateForBrowser(browser);
+ 
+   if (!browser_is_off_record) {
+diff --git a/ios/chrome/browser/main/ui_bundled/default_browser_promo_scene_agent.mm b/ios/chrome/browser/main/ui_bundled/default_browser_promo_scene_agent.mm
+index 294e855..9fde4ff 100644
+--- a/ios/chrome/browser/main/ui_bundled/default_browser_promo_scene_agent.mm
++++ b/ios/chrome/browser/main/ui_bundled/default_browser_promo_scene_agent.mm
+@@ -171,6 +171,15 @@
+     return;
+   }
+ 
++  auto* deviceSwitcherDispatcher =
++      segmentation_platform::SegmentationPlatformServiceFactory::
++          GetDispatcherForProfile(self.sceneState.profileState.profile);
++  if (!deviceSwitcherDispatcher) {
++    // [curium] The disabled segmentation service has no dispatcher.
++    [self updateGenericPromoRegistration];
++    return;
++  }
++
+   // Only evaluate the propensity model for clients who pass non-model promo
+   // eligibility and read-only FET cooldown checks.
+   if (![self isUserEligibleForPromo]) {
+@@ -199,9 +208,7 @@
+       segmentation_platform::kCountryBRIIM,
+       segmentation_platform::processing::ProcessedValue::FromFloat(isBRIIM));
+   segmentation_platform::ClassificationResult deviceSwitcherResult =
+-      segmentation_platform::SegmentationPlatformServiceFactory::
+-          GetDispatcherForProfile(self.sceneState.profileState.profile)
+-              ->GetCachedClassificationResult();
++      deviceSwitcherDispatcher->GetCachedClassificationResult();
+   BOOL isAndroidPhone = NO;
+   BOOL isIOSPhoneChrome = NO;
+   BOOL isSyncedAndFirstDevice = NO;
+diff --git a/ios/chrome/browser/metrics/model/BUILD.gn b/ios/chrome/browser/metrics/model/BUILD.gn
+index 1b86aee..698b052 100644
+--- a/ios/chrome/browser/metrics/model/BUILD.gn
++++ b/ios/chrome/browser/metrics/model/BUILD.gn
+@@ -427,7 +427,6 @@ source_set("metrics_internal") {
+     "//components/google/core/common",
+     "//ios/chrome/browser/shared/model/url:constants",
+     "//ios/chrome/browser/shared/model/web_state_list",
+-    "//ios/chrome/browser/voice/model",
+     "//ios/web",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//ui/base",
+diff --git a/ios/chrome/browser/metrics/model/new_tab_page_uma.mm b/ios/chrome/browser/metrics/model/new_tab_page_uma.mm
+index 9ecf68e..978ff53 100644
+--- a/ios/chrome/browser/metrics/model/new_tab_page_uma.mm
++++ b/ios/chrome/browser/metrics/model/new_tab_page_uma.mm
+@@ -8,7 +8,6 @@
+ #import "components/google/core/common/google_util.h"
+ #import "ios/chrome/browser/shared/model/url/chrome_url_constants.h"
+ #import "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
+-#import "ios/chrome/browser/voice/model/voice_search_navigations_tab_helper.h"
+ #import "ios/web/public/web_state.h"
+ #import "url/gurl.h"
+ 
+@@ -35,13 +34,6 @@ void RecordActionFromOmnibox(bool is_incognito,
+                              web::WebState* web_state,
+                              const GURL& url,
+                              ui::PageTransition transition) {
+-  bool is_expecting_voice_search =
+-      VoiceSearchNavigationTabHelper::FromWebState(web_state)
+-          ->IsExpectingVoiceSearch();
+-  if (is_expecting_voice_search) {
+-    RecordAction(is_incognito, web_state, ACTION_NAVIGATED_USING_VOICE_SEARCH);
+-    return;
+-  }
+   ui::PageTransition core_transition = static_cast<ui::PageTransition>(
+       transition & ui::PAGE_TRANSITION_CORE_MASK);
+   if (PageTransitionCoreTypeIs(core_transition,
+diff --git a/ios/chrome/browser/ntp/ui_bundled/new_tab_page_coordinator.mm b/ios/chrome/browser/ntp/ui_bundled/new_tab_page_coordinator.mm
+index 898daff..a7f89b6 100644
+--- a/ios/chrome/browser/ntp/ui_bundled/new_tab_page_coordinator.mm
++++ b/ios/chrome/browser/ntp/ui_bundled/new_tab_page_coordinator.mm
+@@ -896,6 +896,10 @@ - (void)initializeNTPComponents {
+     self.NTPViewController.mutator = self.NTPMediator;
+   }
+ 
++  if (!IsComposeboxIOSEnabled()) {
++    return;
++  }
++
+   if (IsPlusButtonInFakeboxEnabled()) {
+     [self createMenuCoordinator];
+   }
+diff --git a/ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.mm b/ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.mm
+index 328dc8c..e54db55 100644
+--- a/ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.mm
++++ b/ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.mm
+@@ -26,6 +26,7 @@
+ #import "components/segmentation_platform/embedder/input_delegate/tab_session_source.h"
+ #import "components/segmentation_platform/embedder/model_provider_factory_impl.h"
+ #import "components/segmentation_platform/embedder/tab_fetcher.h"
++#import "components/segmentation_platform/internal/dummy_segmentation_platform_service.h"
+ #import "components/segmentation_platform/internal/dummy_ukm_data_manager.h"
+ #import "components/segmentation_platform/internal/segmentation_platform_service_impl.h"
+ #import "components/segmentation_platform/internal/ukm_data_manager.h"
+@@ -109,7 +110,7 @@
+     ProfileIOS& profile) {
+   DCHECK(!profile.IsOffTheRecord());
+   if (!base::FeatureList::IsEnabled(features::kSegmentationPlatformFeature)) {
+-    return nullptr;
++    return std::make_unique<DummySegmentationPlatformService>();
+   }
+ 
+   const base::FilePath profile_path = profile.GetStatePath();
+diff --git a/ios/chrome/browser/segmentation_platform/model/ukm_database_client.mm b/ios/chrome/browser/segmentation_platform/model/ukm_database_client.mm
+index 1bf4bc0..180df34 100644
+--- a/ios/chrome/browser/segmentation_platform/model/ukm_database_client.mm
++++ b/ios/chrome/browser/segmentation_platform/model/ukm_database_client.mm
+@@ -58,6 +58,10 @@
+ }
+ 
+ void UkmDatabaseClient::StartObservation() {
++  if (!base::FeatureList::IsEnabled(features::kSegmentationPlatformUkmEngine)) {
++    return;
++  }
++
+   CHECK(!ukm_observer_);
+   if (ukm_recorder_for_testing_) {
+     CHECK_IS_TEST();
+diff --git a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn b/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
+index 1725644..7277fdd 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
++++ b/ios/chrome/browser/shared/coordinator/scene/BUILD.gn
+@@ -180,7 +180,6 @@ source_set("scene") {
+     "//ios/chrome/browser/intelligence/features",
+     "//ios/chrome/browser/intents/model:user_activity_browser_agent",
+     "//ios/chrome/browser/intents/model:user_activity_compatibility_util",
+-    "//ios/chrome/browser/lens/ui_bundled:lens_entrypoint",
+     "//ios/chrome/browser/lens_overlay/model",
+     "//ios/chrome/browser/level_up/model",
+     "//ios/chrome/browser/main/ui_bundled",
+@@ -252,7 +251,6 @@ source_set("scene") {
+     "//ios/public/provider/chrome/browser/multiwindow:multiwindow_api",
+     "//ios/public/provider/chrome/browser/user_feedback:user_feedback_api",
+     "//ios/web/common:features",
+-    "//ios/web/public/js_image_transcoder",
+     "//ios/web/public/session/proto",
+     "//ui/base",
+   ]
+diff --git a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+index fb64c65..0014336 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
++++ b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+@@ -82,7 +82,6 @@
+ #import "ios/chrome/browser/intelligence/features/features.h"
+ #import "ios/chrome/browser/intents/model/user_activity_browser_agent.h"
+ #import "ios/chrome/browser/intents/model/user_activity_compatibility_util.h"
+-#import "ios/chrome/browser/lens/ui_bundled/lens_entrypoint.h"
+ #import "ios/chrome/browser/lens_overlay/model/lens_overlay_tab_helper.h"
+ #import "ios/chrome/browser/level_up/model/level_up_scene_agent.h"
+ #import "ios/chrome/browser/main/ui_bundled/browser_lifecycle_manager.h"
+@@ -152,15 +151,12 @@
+ #import "ios/chrome/browser/shared/public/commands/command_dispatcher.h"
+ #import "ios/chrome/browser/shared/public/commands/gemini_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/google_one_commands.h"
+-#import "ios/chrome/browser/shared/public/commands/lens_commands.h"
+-#import "ios/chrome/browser/shared/public/commands/open_lens_input_selection_command.h"
+ #import "ios/chrome/browser/shared/public/commands/open_new_tab_command.h"
+ #import "ios/chrome/browser/shared/public/commands/policy_change_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/qr_scanner_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/quick_delete_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/scene_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/scene_sign_in_commands.h"
+-#import "ios/chrome/browser/shared/public/commands/search_image_with_lens_command.h"
+ #import "ios/chrome/browser/shared/public/commands/show_signin_command.h"
+ #import "ios/chrome/browser/shared/public/commands/snackbar_commands.h"
+ #import "ios/chrome/browser/shared/public/features/features.h"
+@@ -193,7 +189,6 @@
+ #import "ios/public/provider/chrome/browser/cobalt/cobalt_api.h"
+ #import "ios/public/provider/chrome/browser/google_one/google_one_api.h"
+ #import "ios/web/common/features.h"
+-#import "ios/web/public/js_image_transcoder/java_script_image_transcoder.h"
+ #import "ios/web/public/navigation/navigation_manager.h"
+ #import "ios/web/public/web_state.h"
+ #import "net/base/apple/url_conversions.h"
+@@ -362,13 +357,6 @@ @interface SceneController () <ProfileStateObserver,
+   // operation started.
+   std::map<WebStateList*, int> _tabCountBeforeBatchOperation;
+ 
+-  // JavaScript image transcoder to locally re-encode images to search.
+-  std::unique_ptr<web::JavaScriptImageTranscoder> _imageTranscoder;
+-
+-  // A property to track the image to search after dismissing the tab switcher.
+-  // This is used to ensure that the image search is only triggered when the BVC
+-  // is active.
+-  NSData* _imageSearchData;
+   // A property to track a pending Remote Actor credential sharing request
+   // across tab switcher dismissal.
+   std::optional<RemoteActorRequest> _remoteActorRequest;
+@@ -600,31 +588,15 @@ - (ProceduralBlock)completionBlockForTriggeringAction:
+   __weak __typeof(self) weakSelf = self;
+   switch (action) {
+     case START_VOICE_SEARCH:
+-      return ^{
+-        id<BrowserCoordinatorCommands> handler = HandlerForProtocol(
+-            weakSelf.currentInterface.browser->GetCommandDispatcher(),
+-            BrowserCoordinatorCommands);
+-        [handler startVoiceSearch];
+-      };
+-    case START_QR_CODE_SCANNER:
+-      return ^{
+-        [weakSelf startQRCodeScanner];
+-      };
+     case START_LENS_FROM_HOME_SCREEN_WIDGET:
+-      return ^{
+-        [weakSelf startLensWithEntryPoint:LensEntrypoint::HomeScreenWidget];
+-      };
+     case START_LENS_FROM_APP_ICON_LONG_PRESS:
+-      return ^{
+-        [weakSelf startLensWithEntryPoint:LensEntrypoint::AppIconLongPress];
+-      };
+     case START_LENS_FROM_SPOTLIGHT:
+-      return ^{
+-        [weakSelf startLensWithEntryPoint:LensEntrypoint::Spotlight];
+-      };
+     case START_LENS_FROM_INTENTS:
++    case START_LENS_FROM_SHARE_EXTENSION:
++      return nil;
++    case START_QR_CODE_SCANNER:
+       return ^{
+-        [weakSelf startLensWithEntryPoint:LensEntrypoint::Intents];
++        [weakSelf startQRCodeScanner];
+       };
+     case FOCUS_OMNIBOX:
+       return ^{
+@@ -719,10 +691,6 @@ - (ProceduralBlock)completionBlockForTriggeringAction:
+         [weakSelf showDefaultBrowserSettingsWithSourceForUMA:
+                       DefaultBrowserSettingsPageSource::kExternalAction];
+       };
+-    case START_LENS_FROM_SHARE_EXTENSION:
+-      return ^{
+-        [weakSelf searchShareExtensionImageWithLens];
+-      };
+     case CREDENTIAL_EXCHANGE_IMPORT:
+       if (@available(iOS 26, *)) {
+         return ^{
+@@ -752,9 +720,12 @@ - (ProceduralBlock)completionBlockForTriggeringAction:
+       return nil;
+     }
+     case START_GEMINI_AI_SUMMARIZATION:
+-      return ^{
+-        [weakSelf startGeminiFlowForAppSwitcherIntent];
+-      };
++      if (IsPageActionMenuEnabled()) {
++        return ^{
++          [weakSelf startGeminiFlowForAppSwitcherIntent];
++        };
++      }
++      return nil;
+     case REMOTE_ACTOR_CREDENTIAL_SHARING:
+       return ^{
+         [weakSelf handleRemoteActorCredentialSharing];
+@@ -1009,7 +980,6 @@ - (void)openSelectedTabInMode:(ApplicationModeForTabOpening)tabOpeningTargetMode
+                                          ? self.mainInterface
+                                          : self.incognitoInterface;
+   AppStartupParameters* startupParameters = self.startupParameters;
+-  _imageSearchData = [startupParameters imageSearchData];
+   if (startupParameters && startupParameters.remoteActorRequest) {
+     _remoteActorRequest = startupParameters.remoteActorRequest;
+   } else {
+@@ -1859,7 +1829,6 @@ - (void)teardownUI {
+     [self.sceneState.profileState removeObserver:self];
+     [_sceneState.uiBlockerState removeObserver:self];
+     _sceneURLLoadingService.reset();
+-    _imageTranscoder = nullptr;
+     return;
+   }
+ #endif
+@@ -1892,8 +1861,6 @@ - (void)teardownUI {
+   [self.sceneState.profileState removeObserver:self];
+   [_sceneState.uiBlockerState removeObserver:self];
+   _sceneURLLoadingService.reset();
+-
+-  _imageTranscoder = nullptr;
+ }
+ 
+ // Formats string for display on iPadOS application switcher with the
+@@ -2345,45 +2312,6 @@ - (void)finishActivatingBrowserDismissingTabSwitcher {
+   }
+ }
+ 
+-// Starts a lens search for share extension.
+-- (void)searchShareExtensionImageWithLens {
+-  CHECK(_imageSearchData);
+-  if (!_imageTranscoder) {
+-    _imageTranscoder = std::make_unique<web::JavaScriptImageTranscoder>();
+-  }
+-  __weak __typeof(self) weakSelf = self;
+-
+-  // TODO(b/541315801): C2PA: Shared image could have C2PA metadata; candidate
+-  // to pass raw bytes.
+-  _imageTranscoder->TranscodeImage(
+-      _imageSearchData, @"image/jpeg", nil, nil, nil,
+-      base::BindOnce(
+-          [](SceneController* controller, NSData* safeImageData,
+-             NSError* error) {
+-            [controller triggerLensSearchWithImageData:safeImageData
+-                                                 error:error];
+-          },
+-          weakSelf));
+-}
+-
+-// Triggers a lens seach based on a given trusted image data.
+-- (void)triggerLensSearchWithImageData:(NSData*)imageData
+-                                 error:(NSError*)error {
+-  if (error) {
+-    return;
+-  }
+-
+-  id<LensCommands> lensHandler = HandlerForProtocol(
+-      self.currentInterface.browser->GetCommandDispatcher(), LensCommands);
+-  // TODO(b/541315801): C2PA: Shared image could have C2PA metadata; candidate
+-  // to pass raw bytes.
+-  UIImage* image = [UIImage imageWithData:imageData];
+-  SearchImageWithLensCommand* command = [[SearchImageWithLensCommand alloc]
+-      initWithImage:image
+-         entryPoint:LensEntrypoint::ContextMenu];
+-  [lensHandler searchImageWithLens:command];
+-}
+-
+ - (void)startQRCodeScanner {
+   if (!self.currentInterface.browser) {
+     return;
+@@ -2393,20 +2321,6 @@ - (void)startQRCodeScanner {
+   [QRHandler showQRScanner];
+ }
+ 
+-- (void)startLensWithEntryPoint:(LensEntrypoint)entryPoint {
+-  if (!self.currentInterface.browser) {
+-    return;
+-  }
+-  id<LensCommands> lensHandler = HandlerForProtocol(
+-      self.currentInterface.browser->GetCommandDispatcher(), LensCommands);
+-  OpenLensInputSelectionCommand* command = [[OpenLensInputSelectionCommand
+-      alloc]
+-          initWithEntryPoint:entryPoint
+-           presentationStyle:LensInputSelectionPresentationStyle::SlideFromRight
+-      presentationCompletion:nil];
+-  [lensHandler openLensInputSelection:command];
+-}
+-
+ - (void)focusOmnibox {
+   if (!self.currentInterface.browser) {
+     return;
+diff --git a/ios/chrome/browser/shared/public/features/features.mm b/ios/chrome/browser/shared/public/features/features.mm
+index 88d3caf..9697925 100644
+--- a/ios/chrome/browser/shared/public/features/features.mm
++++ b/ios/chrome/browser/shared/public/features/features.mm
+@@ -752,7 +752,7 @@ bool IsLocationBarBadgeMigrationEnabled() {
+ }
+ 
+ bool IsComposeboxIOSEnabled() {
+-  return true;
++  return false;
+ }
+ 
+ BASE_FEATURE(kContextMenuPreviewDownsampleImage,
+@@ -765,7 +765,7 @@ bool IsOmniboxCrashFixKillSwitchEnabled() {
+ }
+ 
+ BASE_FEATURE(kAIMEligibilityServiceStartWithProfile,
+-             base::FEATURE_ENABLED_BY_DEFAULT);
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ bool IsAIMEligibilityServiceStartWithProfileEnabled() {
+   return base::FeatureList::IsEnabled(kAIMEligibilityServiceStartWithProfile);
+@@ -1045,6 +1045,9 @@ bool IsUpdateTabGroupColorsEnabled() {
+ 
+ // Returns true if the plus button in NTP fakebox is enabled.
+ bool IsPlusButtonInFakeboxEnabled() {
++  if (!IsComposeboxIOSEnabled()) {
++    return false;
++  }
+   // Launched by default on phones.
+   if (ui::GetDeviceFormFactor() != ui::DEVICE_FORM_FACTOR_TABLET) {
+     return true;
+@@ -1054,7 +1057,8 @@ bool IsPlusButtonInFakeboxEnabled() {
+ 
+ // Returns true if the plus button contextual menu in NTP fakebox is enabled.
+ bool IsPlusButtonMenuInFakeboxEnabled() {
+-  return base::FeatureList::IsEnabled(kPlusButtonMenuInFakebox);
++  return IsComposeboxIOSEnabled() &&
++         base::FeatureList::IsEnabled(kPlusButtonMenuInFakebox);
+ }
+ 
+ // Enables the submenu with more options in the plus menu.
+diff --git a/ios/chrome/browser/tabs/model/BUILD.gn b/ios/chrome/browser/tabs/model/BUILD.gn
+index bf43819..5644fd9 100644
+--- a/ios/chrome/browser/tabs/model/BUILD.gn
++++ b/ios/chrome/browser/tabs/model/BUILD.gn
+@@ -70,7 +70,6 @@ source_set("tabs_internal") {
+     "//components/webauthn/ios",
+     "//components/webauthn/ios:features",
+     "//ios/chrome/browser/aim/model:aim_availability",
+-    "//ios/chrome/browser/aim/model:tab_helper",
+     "//ios/chrome/browser/app_launcher/model",
+     "//ios/chrome/browser/autofill/model",
+     "//ios/chrome/browser/autofill/model:model_internal",
+@@ -112,7 +111,6 @@ source_set("tabs_internal") {
+     "//ios/chrome/browser/intelligence/on_device_category_classifier",
+     "//ios/chrome/browser/itunes_urls/model",
+     "//ios/chrome/browser/language/model",
+-    "//ios/chrome/browser/lens/model",
+     "//ios/chrome/browser/lens_overlay/model",
+     "//ios/chrome/browser/lens_overlay/public:lens_overlay_availability",
+     "//ios/chrome/browser/link_to_text/model",
+@@ -155,7 +153,6 @@ source_set("tabs_internal") {
+     "//ios/chrome/browser/supervised_user/model",
+     "//ios/chrome/browser/sync/model",
+     "//ios/chrome/browser/translate/model",
+-    "//ios/chrome/browser/voice/model",
+     "//ios/chrome/browser/web/model",
+     "//ios/chrome/browser/web/model:page_placeholder",
+     "//ios/chrome/browser/web/model/annotations",
+diff --git a/ios/chrome/browser/tabs/model/tab_helper_util.mm b/ios/chrome/browser/tabs/model/tab_helper_util.mm
+index db8ac6a..2ffae3e 100644
+--- a/ios/chrome/browser/tabs/model/tab_helper_util.mm
++++ b/ios/chrome/browser/tabs/model/tab_helper_util.mm
+@@ -22,7 +22,6 @@
+ #import "components/ukm/ios/ukm_url_recorder.h"
+ #import "components/webauthn/ios/features.h"
+ #import "components/webauthn/ios/passkey_tab_helper.h"
+-#import "ios/chrome/browser/aim/model/aim_tab_helper.h"
+ #import "ios/chrome/browser/aim/model/ios_chrome_aim_eligibility_service_factory.h"
+ #import "ios/chrome/browser/app_launcher/model/app_launcher_abuse_detector.h"
+ #import "ios/chrome/browser/app_launcher/model/app_launcher_tab_helper.h"
+@@ -78,7 +77,6 @@
+ #import "ios/chrome/browser/intelligence/contextual_cueing/features.h"
+ #import "ios/chrome/browser/intelligence/features/features.h"
+ #import "ios/chrome/browser/itunes_urls/model/itunes_urls_handler_tab_helper.h"
+-#import "ios/chrome/browser/lens/model/lens_tab_helper.h"
+ #import "ios/chrome/browser/lens_overlay/model/lens_overlay_tab_helper.h"
+ #import "ios/chrome/browser/lens_overlay/public/lens_overlay_availability.h"
+ #import "ios/chrome/browser/link_to_text/model/link_to_text_tab_helper.h"
+@@ -126,7 +124,6 @@
+ #import "ios/chrome/browser/tabs/model/tab_helper_attacher.h"
+ #import "ios/chrome/browser/translate/model/chrome_ios_translate_client.h"
+ #import "ios/chrome/browser/translate/model/translate_pdf_metric_logger.h"
+-#import "ios/chrome/browser/voice/model/voice_search_navigations_tab_helper.h"
+ #import "ios/chrome/browser/web/model/annotations/annotations_tab_helper.h"
+ #import "ios/chrome/browser/web/model/blocked_popup_tab_helper.h"
+ #import "ios/chrome/browser/web/model/choose_file/choose_file_tab_helper.h"
+@@ -186,7 +183,6 @@ void AttachTabHelpers(web::WebState* web_state, TabHelperFilter filter_flags) {
+       attacher.IsForStandardNavigation());
+ 
+   attacher.Create<OverlayRequestQueue>();
+-  attacher.Create<VoiceSearchNavigationTabHelper>();
+   attacher.Create<InfoBarManagerImpl>();
+   attacher.Create<FindTabHelper>();
+ 
+@@ -211,10 +207,6 @@ void AttachTabHelpers(web::WebState* web_state, TabHelperFilter filter_flags) {
+       attacher.IsOffTheRecord(),
+       commerce::ShoppingServiceFactory::GetForProfile(profile));
+ 
+-  // Since LensTabHelper listens for a custom scheme, it needs to be
+-  // created before AppLauncherTabHelper, which will filter out
+-  // unhandled schemes.
+-  attacher.CreateWhen<LensTabHelper>(attacher.IsNotInTabHelperFilter());
+   attacher.CreateWhen<LensOverlayTabHelper>(attacher.IsNotInTabHelperFilter());
+   attacher
+       .CreateDeferredWhen<AppLauncherTabHelper>(!attacher.IsForLensOverlay() &&
+@@ -427,9 +419,6 @@ void AttachTabHelpers(web::WebState* web_state, TabHelperFilter filter_flags) {
+             [&]() { return profile->GetPrefs(); });
+   }
+ 
+-  attacher.CreateWhen<AimTabHelper>(!attacher.IsForPrerender() &&
+-                                    !attacher.IsForReaderMode());
+-
+   attacher.CreateWhen<GeminiTabHelper>(!attacher.IsOffTheRecord() &&
+                                        !attacher.IsForPrerender() &&
+                                        IsPageActionMenuEnabled());
+diff --git a/ios/chrome/browser/visited_url_ranking/model/BUILD.gn b/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
+index 45e65be..9843a94 100644
+--- a/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
++++ b/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
+@@ -18,7 +18,6 @@ source_set("model") {
+     "//components/visited_url_ranking/public",
+     "//ios/chrome/browser/bookmarks/model",
+     "//ios/chrome/browser/history/model",
+-    "//ios/chrome/browser/segmentation_platform/model",
+     "//ios/chrome/browser/shared/model/browser",
+     "//ios/chrome/browser/shared/model/profile",
+     "//ios/chrome/browser/shared/model/profile:profile_keyed_service_factory",
+diff --git a/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm b/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
+index 8687a2c..5c1a2d0 100644
+--- a/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
++++ b/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
+@@ -14,13 +14,11 @@
+ #import "components/visited_url_ranking/internal/transformer/history_url_visit_aggregates_categories_transformer.h"
+ #import "components/visited_url_ranking/internal/transformer/history_url_visit_aggregates_visibility_score_transformer.h"
+ #import "components/visited_url_ranking/internal/transformer/recency_filter_transformer.h"
+-#import "components/visited_url_ranking/internal/transformer/url_visit_aggregates_segmentation_metrics_transformer.h"
+ #import "components/visited_url_ranking/internal/visited_url_ranking_service_impl.h"
+ #import "components/visited_url_ranking/public/url_visit_util.h"
+ #import "components/visited_url_ranking/public/visited_url_ranking_service.h"
+ #import "ios/chrome/browser/bookmarks/model/bookmark_model_factory.h"
+ #import "ios/chrome/browser/history/model/history_service_factory.h"
+-#import "ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.h"
+ #import "ios/chrome/browser/shared/model/profile/profile_ios.h"
+ #import "ios/chrome/browser/sync/model/device_info_sync_service_factory.h"
+ #import "ios/chrome/browser/sync/model/session_sync_service_factory.h"
+@@ -31,8 +29,6 @@
+   DependsOn(SessionSyncServiceFactory::GetInstance());
+   DependsOn(ios::HistoryServiceFactory::GetInstance());
+   DependsOn(ios::BookmarkModelFactory::GetInstance());
+-  DependsOn(
+-      segmentation_platform::SegmentationPlatformServiceFactory::GetInstance());
+   DependsOn(DeviceInfoSyncServiceFactory::GetInstance());
+ }
+ 
+@@ -71,16 +67,6 @@
+            std::unique_ptr<visited_url_ranking::URLVisitAggregatesTransformer>>
+       transformers = {};
+ 
+-  segmentation_platform::SegmentationPlatformService*
+-      segmentation_platform_service = segmentation_platform::
+-          SegmentationPlatformServiceFactory::GetForProfile(profile);
+-  transformers.emplace(
+-      visited_url_ranking::URLVisitAggregatesTransformType::
+-          kSegmentationMetricsData,
+-      std::make_unique<visited_url_ranking::
+-                           URLVisitAggregatesSegmentationMetricsTransformer>(
+-          segmentation_platform_service));
+-
+   // TODO(crbug.com/329242209): Add various aggregate transformers (e.g,
+   // shopping) to the service's map of supported transformers.
+   bookmarks::BookmarkModel* bookmark_model =
+diff --git a/ios/chrome/browser/voice/model/BUILD.gn b/ios/chrome/browser/voice/model/BUILD.gn
+index 111dc98..1b5d602 100644
+--- a/ios/chrome/browser/voice/model/BUILD.gn
++++ b/ios/chrome/browser/voice/model/BUILD.gn
+@@ -11,8 +11,6 @@ source_set("model") {
+     "speech_input_locale_config_impl.mm",
+     "speech_input_locale_match.h",
+     "speech_input_locale_match.mm",
+-    "voice_search_navigations_tab_helper.h",
+-    "voice_search_navigations_tab_helper.mm",
+   ]
+ 
+   deps = [
+@@ -77,6 +75,8 @@ source_set("unit_tests") {
+     "speech_input_locale_config_impl_unittest.mm",
+     "text_to_speech_listener_unittest.mm",
+     "text_to_speech_parser_unittest.mm",
++    "voice_search_navigations_tab_helper.h",
++    "voice_search_navigations_tab_helper.mm",
+     "voice_search_navigations_tab_helper_unittest.mm",
+   ]
+ 
+diff --git a/ios/chrome/browser/web/model/BUILD.gn b/ios/chrome/browser/web/model/BUILD.gn
+index 8cd6576..573e47c 100644
+--- a/ios/chrome/browser/web/model/BUILD.gn
++++ b/ios/chrome/browser/web/model/BUILD.gn
+@@ -49,7 +49,6 @@ source_set("model") {
+     "//ios/chrome/browser/infobars/model",
+     "//ios/chrome/browser/infobars/model:public",
+     "//ios/chrome/browser/intelligence/actor/model:tab_helper",
+-    "//ios/chrome/browser/lens/model",
+     "//ios/chrome/browser/lens_overlay/public:lens_overlay_availability",
+     "//ios/chrome/browser/ntp/model:util",
+     "//ios/chrome/browser/shared/model/application_context",
+diff --git a/ios/chrome/browser/web/model/web_navigation_browser_agent.mm b/ios/chrome/browser/web/model/web_navigation_browser_agent.mm
+index 86309d8..f7f0074 100644
+--- a/ios/chrome/browser/web/model/web_navigation_browser_agent.mm
++++ b/ios/chrome/browser/web/model/web_navigation_browser_agent.mm
+@@ -8,13 +8,11 @@
+ #import "components/feature_engagement/public/tracker.h"
+ #import "ios/chrome/browser/feature_engagement/model/tracker_factory.h"
+ #import "ios/chrome/browser/intelligence/actor/model/actor_tab_helper.h"
+-#import "ios/chrome/browser/lens/model/lens_browser_agent.h"
+ #import "ios/chrome/browser/lens_overlay/public/lens_overlay_availability.h"
+ #import "ios/chrome/browser/shared/model/browser/browser.h"
+ #import "ios/chrome/browser/shared/model/profile/profile_ios.h"
+ #import "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
+ #import "ios/chrome/browser/shared/public/commands/command_dispatcher.h"
+-#import "ios/chrome/browser/shared/public/commands/lens_commands.h"
+ #import "ios/chrome/browser/shared/public/commands/page_side_swipe_commands.h"
+ #import "ios/chrome/browser/web/model/web_navigation_ntp_delegate.h"
+ #import "ios/chrome/browser/web/model/web_navigation_util.h"
+@@ -36,17 +34,7 @@
+   const web::NavigationManager* navigation_manager =
+       web_state->GetNavigationManager();
+   DCHECK(navigation_manager);
+-  if (navigation_manager->CanGoBack()) {
+-    return true;
+-  }
+-
+-  const LensBrowserAgent* lens_browser_agent =
+-      LensBrowserAgent::FromBrowser(browser_);
+-  if (!lens_browser_agent) {
+-    return false;
+-  }
+-
+-  return lens_browser_agent->CanGoBackToLensViewFinder();
++  return navigation_manager->CanGoBack();
+ }
+ 
+ bool WebNavigationBrowserAgent::CanGoBack() {
+@@ -88,13 +76,6 @@
+   }
+ 
+   web_navigation_util::GoBack(active_web_state);
+-
+-  // If the previous page was an eligible Lens Web Page, then display the LVF.
+-  const LensBrowserAgent* lens_browser_agent =
+-      LensBrowserAgent::FromBrowser(browser_);
+-  if (lens_browser_agent && lens_browser_agent->CanGoBackToLensViewFinder()) {
+-    lens_browser_agent->GoBackToLensViewFinder();
+-  }
+ }
+ 
+ void WebNavigationBrowserAgent::GoForward() {

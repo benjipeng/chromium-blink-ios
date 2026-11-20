@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Read-only registry probe: compile selected extension objects without a stage checkpoint.
+# Read-only registry probe: audit the link graph and compile selected objects without a stage checkpoint.
 # Sourced by scripts/stage.sh to reuse tree, cache and build-budget helpers.
 
 probe_compile() {
@@ -31,6 +31,8 @@ obj/extensions/browser/browser_sources/renderer_startup_helper.o
 obj/ios/web/content/init/init/ios_content_client.o
 obj/ios/web/content/init/init/ios_content_renderer_client.o
 obj/ios/web/content/init/init/ios_content_browser_client.o
+obj/ios/web/content/init/init/ios_browser_main_parts.o
+obj/ios/components/security_interstitials/safe_browsing/safe_browsing/safe_browsing_tab_helper.o
 obj/ios/web/content/content/content_web_state.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_client.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_renderer_client.o
@@ -69,6 +71,8 @@ obj/extensions/browser/browser_sources/rules_monitor_service.o
 obj/extensions/browser/browser_sources/ruleset_manager.o
 obj/extensions/browser/api/declarative_net_request/declarative_net_request/declarative_net_request_api.o
 obj/content/browser/browser/render_frame_host_impl.o
+obj/content/browser/browser/network_handler.o
+obj/services/network/network_service/network_context.o
 obj/extensions/browser/api/messaging/messaging/message_service.o
 obj/extensions/browser/api/messaging/messaging/messaging_delegate.o
 obj/extensions/renderer/renderer/service_worker_data.o
@@ -112,9 +116,41 @@ import os
 import sys
 from pathlib import Path
 sys.path.insert(0, "scripts")
-from ninja_graph import Graph, deps, is_target_object, is_target_work
+from ninja_graph import Graph, deps, is_target_object, is_target_work, unescape
 
 graph = Graph(Path("/tmp/cb_work/src/out/Release"))
+
+# Check the framework's actual link inputs and archive members. The public
+# Mojo wire types and unrelated metrics or enterprise reporting can stay.
+framework = "obj/ios/chrome/app/chrome_framework"
+link_index = graph.producer.get(framework)
+if link_index is None or not graph.edges[link_index].rule.endswith("solink"):
+    sys.exit(f"Cannot audit Reporting/NEL: missing framework link edge for {framework}")
+link = graph.edges[link_index]
+pending = link.ins + link.iins
+seen = set()
+reporting_sources = set()
+while pending:
+    node = pending.pop()
+    index = graph.producer.get(node)
+    if index is None or index in seen:
+        continue
+    seen.add(index)
+    edge = graph.edges[index]
+    if is_target_object(edge):
+        for source in map(unescape, edge.ins):
+            if source.startswith(("../../net/reporting/", "../../net/network_error_logging/")) or source in {
+                "../../net/extras/sqlite/sqlite_persistent_reporting_and_nel_store.cc",
+                "../../services/network/public/cpp/reporting_api_endpoint_mojom_traits.cc",
+                "../../services/network/public/cpp/reporting_api_report_mojom_traits.cc",
+            }:
+                reporting_sources.add(source)
+    elif unescape(node).endswith(".a"):
+        pending.extend(edge.ins + edge.iins)
+if reporting_sources:
+    sys.exit("Reporting/NEL still in the candidate framework link:\n" + "\n".join(sorted(reporting_sources)))
+print("Verified candidate framework link excludes Reporting/NEL objects")
+
 targets_path = Path(os.environ["RUNNER_TEMP"]) / "graph-diagnosis/compile_targets.txt"
 targets = targets_path.read_text().splitlines()
 # Also resolve our patched V8 target objects (handles v8_cluster_source_set names).

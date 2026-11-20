@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: quiet Google services and start opt-in loopback DevTools
+
+Disable component update checks, AIM eligibility requests, unbranded JS
+error uploads and background Translate resources. Default iOS profiles to
+no Safe Browsing protection and bypass consumer checks for opted-out
+profiles. Keep managed URL filtering and explicit Translate script fetches.
+
+Start Content's DevTools HTTP server only for a valid remote debugging port
+switch. Listen on IPv4 loopback and stop the server during browser shutdown.
+
+diff --git a/components/omnibox/browser/aim_eligibility_service.cc b/components/omnibox/browser/aim_eligibility_service.cc
+index 1337973..776fd4b 100644
+--- a/components/omnibox/browser/aim_eligibility_service.cc
++++ b/components/omnibox/browser/aim_eligibility_service.cc
+@@ -1111,6 +1111,10 @@ void AimEligibilityService::ScheduleServerEligibilityRequest(
+ void AimEligibilityService::StartServerEligibilityRequest(
+     RequestSource request_source,
+     const std::string& locale) {
++  if (!IsServerEligibilityEnabled()) {
++    return;
++  }
++
+   if (IsManualOverrideActive() && request_source != RequestSource::kUser) {
+     return;
+   }
+diff --git a/components/omnibox/browser/aim_eligibility_service_features.cc b/components/omnibox/browser/aim_eligibility_service_features.cc
+index c23cef8..bcdc350 100644
+--- a/components/omnibox/browser/aim_eligibility_service_features.cc
++++ b/components/omnibox/browser/aim_eligibility_service_features.cc
+@@ -8,9 +8,9 @@
+ 
+ namespace omnibox {
+ 
+-BASE_FEATURE(kAimEnabled, base::FEATURE_ENABLED_BY_DEFAULT);
++BASE_FEATURE(kAimEnabled, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+-BASE_FEATURE(kAimServerEligibilityEnabled, base::FEATURE_ENABLED_BY_DEFAULT);
++BASE_FEATURE(kAimServerEligibilityEnabled, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kAimCoBrowseEligibilityCheckEnabled,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+@@ -36,7 +36,7 @@ BASE_FEATURE(kAimServerEligibilityForPrimaryAccountEnabled,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kAimServerRequestOnStartupEnabled,
+-             base::FEATURE_ENABLED_BY_DEFAULT);
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kAimStartupRequestDelayedUntilNetworkAvailableEnabled,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+diff --git a/components/safe_browsing/core/common/safe_browsing_prefs.cc b/components/safe_browsing/core/common/safe_browsing_prefs.cc
+index 71ef1f8..57b2ab4 100644
+--- a/components/safe_browsing/core/common/safe_browsing_prefs.cc
++++ b/components/safe_browsing/core/common/safe_browsing_prefs.cc
+@@ -11,6 +11,7 @@
+ #include "base/notreached.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+@@ -362,7 +363,7 @@ void RegisterProfilePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterTimePref(
+       prefs::kSafeBrowsingEsbProtegoPingWithoutTokenLastLogTime, base::Time());
+   registry->RegisterBooleanPref(
+-      prefs::kSafeBrowsingEnabled, true,
++      prefs::kSafeBrowsingEnabled, !BUILDFLAG(IS_IOS),
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   if (base::FeatureList::IsEnabled(kEsbAsASyncedSetting)) {
+     registry->RegisterBooleanPref(
+diff --git a/components/translate/core/browser/translate_ranker_impl.cc b/components/translate/core/browser/translate_ranker_impl.cc
+index e159d0d..35c5849 100644
+--- a/components/translate/core/browser/translate_ranker_impl.cc
++++ b/components/translate/core/browser/translate_ranker_impl.cc
+@@ -89,8 +89,8 @@ const char kDefaultTranslateRankerModelURL[] =
+     "translate/2017/03/translate_ranker_model_20170329.pb.bin";
+ #endif
+ 
+-BASE_FEATURE(kTranslateRankerQuery, base::FEATURE_ENABLED_BY_DEFAULT);
+-BASE_FEATURE(kTranslateRankerEnforcement, base::FEATURE_ENABLED_BY_DEFAULT);
++BASE_FEATURE(kTranslateRankerQuery, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE(kTranslateRankerEnforcement, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ TranslateRankerFeatures::TranslateRankerFeatures() = default;
+ 
+diff --git a/ios/chrome/browser/application_context/model/application_context_impl.mm b/ios/chrome/browser/application_context/model/application_context_impl.mm
+index 28f55a5..b02e013 100644
+--- a/ios/chrome/browser/application_context/model/application_context_impl.mm
++++ b/ios/chrome/browser/application_context/model/application_context_impl.mm
+@@ -488,7 +488,10 @@
+         component_updater::MakeIOSComponentUpdaterConfigurator(
+             base::CommandLine::ForCurrentProcess()),
+         std::make_unique<component_updater::TimerUpdateScheduler>(),
+-        ios::provider::GetBrandCode());
++        ios::provider::GetBrandCode(),
++        // [curium] Never poll update.googleapis.com. Registered components
++        // keep their bundled or cached versions.
++        /*update_checks_disabled=*/true);
+   }
+   return component_updater_.get();
+ }
+diff --git a/ios/chrome/browser/translate/model/translate_service_ios.mm b/ios/chrome/browser/translate/model/translate_service_ios.mm
+index 717fe62..f412312 100644
+--- a/ios/chrome/browser/translate/model/translate_service_ios.mm
++++ b/ios/chrome/browser/translate/model/translate_service_ios.mm
+@@ -69,8 +69,9 @@
+     NOTREACHED();
+   }
+ 
+-  language_list->SetResourceRequestsAllowed(
+-      resource_request_allowed_notifier_.ResourceRequestsAllowed());
++  // Use the bundled languages. Explicit translation fetches its script
++  // separately and does not depend on language list requests.
++  language_list->SetResourceRequestsAllowed(false);
+ }
+ 
+ // static
+diff --git a/ios/components/security_interstitials/safe_browsing/safe_browsing_tab_helper.mm b/ios/components/security_interstitials/safe_browsing/safe_browsing_tab_helper.mm
+index e8da24d..a53fafc 100644
+--- a/ios/components/security_interstitials/safe_browsing/safe_browsing_tab_helper.mm
++++ b/ios/components/security_interstitials/safe_browsing/safe_browsing_tab_helper.mm
+@@ -38,6 +38,18 @@
+ 
+ namespace {
+ 
++bool ShouldCheckUrl(SafeBrowsingClient* client, const GURL& url) {
++  const PrefService* prefs = client->GetPrefs();
++  // Consumer real-time lookups can otherwise use the URL-keyed metrics opt-in
++  // even when Safe Browsing is off. Preserve explicit enterprise filtering.
++  if (prefs && prefs->FindPreference(prefs::kSafeBrowsingEnabled) &&
++      !safe_browsing::IsSafeBrowsingEnabled(*prefs) &&
++      !client->ShouldForceSyncRealTimeUrlChecks()) {
++    return false;
++  }
++  return client->GetSafeBrowsingService()->CanCheckUrl(url);
++}
++
+ // Creates a PolicyDecision that cancels a navigation to show a safe browsing
+ // error for an unsafe `resource`.
+ web::WebStatePolicyDecider::PolicyDecision CreateSafeBrowsingErrorDecision(
+@@ -556,10 +568,7 @@ void RecordTotalDelayMetricForDelayedAllowedNavigation(
+   // Allow navigations for URLs that cannot be checked by the service.
+   GURL request_url = GetCanonicalizedUrl(net::GURLWithNSURL(request.URL));
+ 
+-  SafeBrowsingService* safe_browsing_service =
+-      client_->GetSafeBrowsingService();
+-  client_->GetSafeBrowsingService();
+-  if (!safe_browsing_service->CanCheckUrl(request_url)) {
++  if (!ShouldCheckUrl(client_, request_url)) {
+     return std::move(callback).Run(
+         web::WebStatePolicyDecider::PolicyDecision::Allow());
+   }
+@@ -614,11 +623,9 @@ void RecordTotalDelayMetricForDelayedAllowedNavigation(
+   }
+ 
+   // Allow navigations for URLs that cannot be checked by the service.
+-  SafeBrowsingService* safe_browsing_service =
+-      client_->GetSafeBrowsingService();
+   GURL response_url = GetCanonicalizedUrl(net::GURLWithNSURL(response.URL));
+ 
+-  if (!safe_browsing_service->CanCheckUrl(response_url)) {
++  if (!ShouldCheckUrl(client_, response_url)) {
+     pending_main_frame_query_.reset();
+     previous_main_frame_query_.reset();
+     pending_main_frame_redirect_chain_.clear();
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index 3330e9b..20dbf58 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -27,6 +27,7 @@ source_set("init") {
+   ]
+ 
+   deps = [
++    "//base",
+     "//build:blink_buildflags",
+     "//extensions/buildflags",
+     "//components/embedder_support:user_agent",
+@@ -46,6 +47,7 @@ source_set("init") {
+     "//ios/web/content/common:non_code_constants",
+     "//ios/web/public",
+     "//ios/web/public/init",
++    "//net",
+     "//services/device/public/cpp/geolocation",
+     "//services/network/public/cpp",
+     "//third_party/blink/public/common",
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+index 555a93d..4da6bfd 100644
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -15,6 +15,11 @@ include_rules = [
+   "+extensions/buildflags",
+   "+extensions/common",
+   "+extensions/renderer",
++  "+net/base/ip_address.h",
++  "+net/base/ip_endpoint.h",
++  "+net/base/net_errors.h",
++  "+net/log/net_log_source.h",
++  "+net/socket/tcp_server_socket.h",
+   "+services/device/public/cpp/geolocation",
+   "+services/service_manager/public/cpp",
+   "+third_party/blink/public/common/switches.h",
+diff --git a/ios/web/content/init/ios_browser_main_parts.h b/ios/web/content/init/ios_browser_main_parts.h
+index 575f218..a0b7504 100644
+--- a/ios/web/content/init/ios_browser_main_parts.h
++++ b/ios/web/content/init/ios_browser_main_parts.h
+@@ -35,6 +35,7 @@ class IOSBrowserMainParts : public content::BrowserMainParts {
+   int PreCreateThreads() override;
+   int PostCreateThreads() override;
+   int PreMainMessageLoopRun() override;
++  void PostMainMessageLoopRun() override;
+ 
+   // [ios-blink-sideload] The manager of the app's location permission, which
+   // the device service needs to get the location from Core Location (as in
+@@ -44,6 +45,7 @@ class IOSBrowserMainParts : public content::BrowserMainParts {
+ 
+  private:
+   std::unique_ptr<web::WebMainParts> parts_;
++  bool started_devtools_server_ = false;
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/init/ios_browser_main_parts.mm b/ios/web/content/init/ios_browser_main_parts.mm
+index fe48b1f..71f80a5 100644
+--- a/ios/web/content/init/ios_browser_main_parts.mm
++++ b/ios/web/content/init/ios_browser_main_parts.mm
+@@ -4,12 +4,55 @@
+ 
+ #import "ios/web/content/init/ios_browser_main_parts.h"
+ 
++#import <cstdint>
++#import <memory>
++#import <optional>
++#import <string>
++
++#import "base/command_line.h"
++#import "base/files/file_path.h"
++#import "base/strings/string_number_conversions.h"
++#import "content/public/browser/devtools_agent_host.h"
++#import "content/public/browser/devtools_socket_factory.h"
++#import "content/public/common/content_switches.h"
+ #import "content/public/common/result_codes.h"
+ #import "ios/web/public/init/web_main_parts.h"
+ #import "ios/web/public/web_client.h"
++#import "net/base/ip_address.h"
++#import "net/base/ip_endpoint.h"
++#import "net/base/net_errors.h"
++#import "net/log/net_log_source.h"
++#import "net/socket/tcp_server_socket.h"
+ #import "services/device/public/cpp/geolocation/system_geolocation_source_apple.h"
+ 
+ namespace web {
++namespace {
++
++class TCPServerSocketFactory final : public content::DevToolsSocketFactory {
++ public:
++  explicit TCPServerSocketFactory(uint16_t port) : port_(port) {}
++
++ private:
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++    constexpr int kBacklog = 10;
++    auto socket =
++        std::make_unique<net::TCPServerSocket>(nullptr, net::NetLogSource());
++    if (socket->Listen(net::IPEndPoint(net::IPAddress::IPv4Localhost(), port_),
++                       kBacklog, /*ipv6_only=*/std::nullopt) != net::OK) {
++      return nullptr;
++    }
++    return socket;
++  }
++
++  std::unique_ptr<net::ServerSocket> CreateForTethering(
++      std::string* out_name) override {
++    return nullptr;
++  }
++
++  const uint16_t port_;
++};
++
++}  // namespace
+ 
+ IOSBrowserMainParts::IOSBrowserMainParts() {
+   parts_ = web::GetWebClient()->CreateWebMainParts();
+@@ -43,9 +86,31 @@
+ 
+ int IOSBrowserMainParts::PreMainMessageLoopRun() {
+   parts_->PreMainMessageLoopRun();
++
++  const auto& command_line = *base::CommandLine::ForCurrentProcess();
++  if (command_line.HasSwitch(switches::kRemoteDebuggingPort)) {
++    int port;
++    if (base::StringToInt(
++            command_line.GetSwitchValueASCII(switches::kRemoteDebuggingPort),
++            &port) &&
++        port >= 0 && port <= 65535) {
++      content::DevToolsAgentHost::StartRemoteDebuggingServer(
++          std::make_unique<TCPServerSocketFactory>(static_cast<uint16_t>(port)),
++          /*active_port_output_directory=*/base::FilePath(),
++          /*debug_frontend_dir=*/base::FilePath());
++      started_devtools_server_ = true;
++    }
++  }
+   return 0;
+ }
+ 
++void IOSBrowserMainParts::PostMainMessageLoopRun() {
++  if (started_devtools_server_) {
++    content::DevToolsAgentHost::StopRemoteDebuggingServer();
++    started_devtools_server_ = false;
++  }
++}
++
+ // static
+ device::GeolocationSystemPermissionManager*
+ IOSBrowserMainParts::GetGeolocationSystemPermissionManager() {
+diff --git a/ios/web/js_features/window_error/web_js_error_report_processor.mm b/ios/web/js_features/window_error/web_js_error_report_processor.mm
+index f2e1b89..0feba69 100644
+--- a/ios/web/js_features/window_error/web_js_error_report_processor.mm
++++ b/ios/web/js_features/window_error/web_js_error_report_processor.mm
+@@ -235,6 +235,10 @@ void AddStandardReportParams(ParameterMap& report_params) {
+ 
+ void WebJsErrorReportProcessor::SendErrorReport(
+     IOSJavaScriptErrorReport error_report) {
++  if (!BUILDFLAG(GOOGLE_CHROME_BRANDING)) {
++    return;
++  }
++
+   if (error_report.api.empty()) {
+     UMA_HISTOGRAM_ENUMERATION(
+         "IOS.JavaScript.ErrorReportProcessor",

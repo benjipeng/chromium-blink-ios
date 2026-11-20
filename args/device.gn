@@ -16,6 +16,9 @@ enable_platform_apps = false
 enable_hosted_apps = false
 enable_guest_view = false
 
+# Omit the network Reporting API and Network Error Logging backend.
+enable_reporting = false
+
 # Official release optimization with Apple Silicon mac-arm PGO and local symbol
 # stripping (-x -S). ThinLTO and CFI stay disabled so 4-vCPU/16 GB Linux Link
 # runners remain fast and within RAM headroom.
