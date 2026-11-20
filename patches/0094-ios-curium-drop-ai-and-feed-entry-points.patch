@@ -987,23 +987,11 @@ index db8ac6a..2ffae3e 100644
    attacher.CreateWhen<GeminiTabHelper>(!attacher.IsOffTheRecord() &&
                                         !attacher.IsForPrerender() &&
                                         IsPageActionMenuEnabled());
-diff --git a/ios/chrome/browser/visited_url_ranking/model/BUILD.gn b/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
-index 45e65be..9843a94 100644
---- a/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
-+++ b/ios/chrome/browser/visited_url_ranking/model/BUILD.gn
-@@ -18,7 +18,6 @@ source_set("model") {
-     "//components/visited_url_ranking/public",
-     "//ios/chrome/browser/bookmarks/model",
-     "//ios/chrome/browser/history/model",
--    "//ios/chrome/browser/segmentation_platform/model",
-     "//ios/chrome/browser/shared/model/browser",
-     "//ios/chrome/browser/shared/model/profile",
-     "//ios/chrome/browser/shared/model/profile:profile_keyed_service_factory",
 diff --git a/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm b/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
-index 8687a2c..5c1a2d0 100644
+index 8687a2c..2d77be8 100644
 --- a/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
 +++ b/ios/chrome/browser/visited_url_ranking/model/visited_url_ranking_service_factory.mm
-@@ -14,13 +14,11 @@
+@@ -14,7 +14,6 @@
  #import "components/visited_url_ranking/internal/transformer/history_url_visit_aggregates_categories_transformer.h"
  #import "components/visited_url_ranking/internal/transformer/history_url_visit_aggregates_visibility_score_transformer.h"
  #import "components/visited_url_ranking/internal/transformer/recency_filter_transformer.h"
@@ -1011,28 +999,10 @@ index 8687a2c..5c1a2d0 100644
  #import "components/visited_url_ranking/internal/visited_url_ranking_service_impl.h"
  #import "components/visited_url_ranking/public/url_visit_util.h"
  #import "components/visited_url_ranking/public/visited_url_ranking_service.h"
- #import "ios/chrome/browser/bookmarks/model/bookmark_model_factory.h"
- #import "ios/chrome/browser/history/model/history_service_factory.h"
--#import "ios/chrome/browser/segmentation_platform/model/segmentation_platform_service_factory.h"
- #import "ios/chrome/browser/shared/model/profile/profile_ios.h"
- #import "ios/chrome/browser/sync/model/device_info_sync_service_factory.h"
- #import "ios/chrome/browser/sync/model/session_sync_service_factory.h"
-@@ -31,8 +29,6 @@
-   DependsOn(SessionSyncServiceFactory::GetInstance());
-   DependsOn(ios::HistoryServiceFactory::GetInstance());
-   DependsOn(ios::BookmarkModelFactory::GetInstance());
--  DependsOn(
--      segmentation_platform::SegmentationPlatformServiceFactory::GetInstance());
-   DependsOn(DeviceInfoSyncServiceFactory::GetInstance());
- }
- 
-@@ -71,16 +67,6 @@
-            std::unique_ptr<visited_url_ranking::URLVisitAggregatesTransformer>>
-       transformers = {};
- 
--  segmentation_platform::SegmentationPlatformService*
--      segmentation_platform_service = segmentation_platform::
--          SegmentationPlatformServiceFactory::GetForProfile(profile);
+@@ -74,13 +73,6 @@
+   segmentation_platform::SegmentationPlatformService*
+       segmentation_platform_service = segmentation_platform::
+           SegmentationPlatformServiceFactory::GetForProfile(profile);
 -  transformers.emplace(
 -      visited_url_ranking::URLVisitAggregatesTransformType::
 -          kSegmentationMetricsData,
