@@ -12,7 +12,7 @@ remote hint and model requests, including on-demand hints and model
 execution.
 
 diff --git a/components/gcm_driver/gcm_driver_desktop.cc b/components/gcm_driver/gcm_driver_desktop.cc
-index f31c49582484744363a90dcc0b3a36855be092c9..fad0b8d7739a1070f1f922f500f15cb402485df9 100644
+index f31c49582484744363a90dcc0b3a36855be092c9..ec79cc0664fac48e04eb5dc793436a1bba8aa322 100644
 --- a/components/gcm_driver/gcm_driver_desktop.cc
 +++ b/components/gcm_driver/gcm_driver_desktop.cc
 @@ -19,6 +19,7 @@
@@ -27,30 +27,45 @@ index f31c49582484744363a90dcc0b3a36855be092c9..fad0b8d7739a1070f1f922f500f15cb4
      GCMClient::StartMode start_mode) {
    DCHECK(ui_thread_->RunsTasksInCurrentSequence());
  
-+  // [ios-blink-sideload] Keep both iOS GCM drivers offline.
-+  if (BUILDFLAG(IS_IOS)) {
-+    return GCMClient::GCM_DISABLED;
-+  }
-+
++  // [ios-blink-sideload] Keep both iOS GCM drivers offline. The rest of the
++  // body is compiled out rather than skipped, which -Wunreachable-code rejects.
++#if BUILDFLAG(IS_IOS)
++  return GCMClient::GCM_DISABLED;
++#else
    if (gcm_started_) {
      return GCMClient::SUCCESS;
    }
+@@ -1032,6 +1038,7 @@ GCMClient::Result GCMDriverDesktop::EnsureStarted(
+                                 /*time_task_posted=*/base::TimeTicks::Now()));
+ 
+   return GCMClient::SUCCESS;
++#endif  // BUILDFLAG(IS_IOS)
+ }
+ 
+ void GCMDriverDesktop::RemoveCachedData() {
 diff --git a/components/optimization_guide/core/delivery/prediction_model_download_manager.cc b/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
-index 8a8a6ea142895df07bd301b97f0b7112afa4eebc..292dd3af15eb0968d8f3020d81d664c1caf21b51 100644
+index 8a8a6ea142895df07bd301b97f0b7112afa4eebc..a5cf9ea701ee0cac9741bfa6dfc5f5cfa0abf301 100644
 --- a/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
 +++ b/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
-@@ -206,6 +206,11 @@ bool PredictionModelDownloadManager::IsAvailableForDownloads() const {
+@@ -206,6 +206,10 @@ bool PredictionModelDownloadManager::IsAvailableForDownloads() const {
  }
  
  bool PredictionModelDownloadManager::ShouldFetchModels() const {
 +  // [ios-blink-sideload] Keep cached models available without fetching updates.
-+  if (BUILDFLAG(IS_IOS)) {
-+    return false;
-+  }
-+
++#if BUILDFLAG(IS_IOS)
++  return false;
++#else
    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
            kDisableModelDownloadsForBenchmarking) ||
        base::CommandLine::ForCurrentProcess()->HasSwitch(
+@@ -215,6 +219,7 @@ bool PredictionModelDownloadManager::ShouldFetchModels() const {
+   return (ShouldSkipGoogleApiKeyConfigurationCheck() ||
+           google_apis::IsGoogleChromeAPIKeyUsed()) &&
+          local_state_->GetBoolean(::prefs::kComponentUpdatesEnabled);
++#endif  // BUILDFLAG(IS_IOS)
+ }
+ 
+ void PredictionModelDownloadManager::AddObserver(
 diff --git a/components/optimization_guide/core/hints/hints_manager.cc b/components/optimization_guide/core/hints/hints_manager.cc
 index 07687e807322a9d1b298dec3c3b8ca0a49d85e06..6d8c2a51fac567095d60906851a4bce85f1ce06d 100644
 --- a/components/optimization_guide/core/hints/hints_manager.cc
@@ -85,7 +100,7 @@ index 07687e807322a9d1b298dec3c3b8ca0a49d85e06..6d8c2a51fac567095d60906851a4bce8
    InsertionOrderedSet<std::string> hosts_to_fetch;
    for (const auto& url : urls) {
 diff --git a/components/optimization_guide/core/optimization_guide_permissions_util.cc b/components/optimization_guide/core/optimization_guide_permissions_util.cc
-index c9690ef4b838862570aeed22c865589f0fcfdb53..d11b4c9aacbcd2f84414cd93dfae971edda27f5c 100644
+index c9690ef4b838862570aeed22c865589f0fcfdb53..b8d7cf21623ce2471c68d1e92ce48ab378f00ee6 100644
 --- a/components/optimization_guide/core/optimization_guide_permissions_util.cc
 +++ b/components/optimization_guide/core/optimization_guide_permissions_util.cc
 @@ -7,6 +7,7 @@
@@ -96,19 +111,30 @@ index c9690ef4b838862570aeed22c865589f0fcfdb53..d11b4c9aacbcd2f84414cd93dfae971e
  #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
  #include "google_apis/google_api_keys.h"
  
-@@ -39,8 +40,11 @@ bool ShouldSkipGoogleApiKeyConfigurationCheck() {
+@@ -39,8 +40,14 @@ bool ShouldSkipGoogleApiKeyConfigurationCheck() {
  bool IsUserPermittedToFetchFromRemoteOptimizationGuide(
      bool is_off_the_record,
      PrefService* pref_service) {
 -  if (is_off_the_record)
 +  // [ios-blink-sideload] Use local hints even if remote fetches are allowed
 +  // by the profile or a testing switch.
-+  if (BUILDFLAG(IS_IOS) || is_off_the_record) {
++#if BUILDFLAG(IS_IOS)
++  return false;
++#else
++  if (is_off_the_record) {
      return false;
 +  }
  
    if (ShouldOverrideCheckingUserPermissionsToFetchHintsForTesting()) {
      return true;
+@@ -53,6 +60,7 @@ bool IsUserPermittedToFetchFromRemoteOptimizationGuide(
+ 
+   return IsUserConsentedToAnonymousDataCollectionAndAllowedToFetchFromRemoteService(
+       pref_service);
++#endif  // BUILDFLAG(IS_IOS)
+ }
+ 
+ }  // namespace optimization_guide
 diff --git a/ios/chrome/browser/credential_provider/model/credential_provider_service.mm b/ios/chrome/browser/credential_provider/model/credential_provider_service.mm
 index 5eb0e734518ea6f865fa81008e76199737925b77..70ab9207f155a5796837d50f62b1ad04c01390a7 100644
 --- a/ios/chrome/browser/credential_provider/model/credential_provider_service.mm

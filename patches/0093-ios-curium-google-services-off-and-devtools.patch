@@ -315,14 +315,28 @@ index fe48b1f..71f80a5 100644
  device::GeolocationSystemPermissionManager*
  IOSBrowserMainParts::GetGeolocationSystemPermissionManager() {
 diff --git a/ios/web/js_features/window_error/web_js_error_report_processor.mm b/ios/web/js_features/window_error/web_js_error_report_processor.mm
-index f2e1b89..0feba69 100644
+index f2e1b89feacaa43ca79e8b42051b13cb61f0d17a..b3c66c6549c2c9dbb825cc70ddadf1d7374cd9aa 100644
 --- a/ios/web/js_features/window_error/web_js_error_report_processor.mm
 +++ b/ios/web/js_features/window_error/web_js_error_report_processor.mm
-@@ -235,6 +235,10 @@ void AddStandardReportParams(ParameterMap& report_params) {
+@@ -152,6 +152,13 @@ void AddStandardReportParams(ParameterMap& report_params) {
+   return base::JoinString(kept_frames, kNewlineSeparator);
+ }
+ 
++// [ios-blink-sideload] Only Google-branded builds upload JavaScript error
++// reports. A call keeps -Wunreachable-code from rejecting the code after the
++// early return in unbranded builds.
++bool UploadsJavaScriptErrorReports() {
++  return BUILDFLAG(GOOGLE_CHROME_BRANDING);
++}
++
+ }  // namespace
+ 
+ namespace web {
+@@ -235,6 +242,10 @@ void AddStandardReportParams(ParameterMap& report_params) {
  
  void WebJsErrorReportProcessor::SendErrorReport(
      IOSJavaScriptErrorReport error_report) {
-+  if (!BUILDFLAG(GOOGLE_CHROME_BRANDING)) {
++  if (!UploadsJavaScriptErrorReports()) {
 +    return;
 +  }
 +

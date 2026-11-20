@@ -132,6 +132,7 @@ obj/content/browser/browser/web_contents_view_ios.o
 obj/third_party/blink/renderer/core/core_hot/document.o
 obj/third_party/blink/renderer/core/exported/exported/web_view_impl.o
 obj/third_party/blink/renderer/core/core/browser_controls.o
+obj/ios/web/js_features/window_error/error_reporting/web_js_error_report_processor.o
 obj/third_party/blink/renderer/core/core/web_frame_widget_impl.o
 obj/third_party/blink/renderer/core/core/frame_loader.o
 obj/components/viz/common/common/presented_top_controls_offset_ios.o
