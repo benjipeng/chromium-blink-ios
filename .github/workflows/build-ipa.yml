@@ -275,6 +275,15 @@ jobs:
       - name: Persist checkpoint
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh link persist
+      - name: Upload engine symbols
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: Chromium-Blink-${{ needs.plan.outputs.chromium_version }}-arm64-symbols
+          path: ${{ runner.temp }}/stage/symbols/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Summary
         continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'

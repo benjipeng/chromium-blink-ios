@@ -48,6 +48,16 @@ link_persist() {
   "$SCRIPTS/reclaim_disk_linux.sh" --drop-swap
   mkdir -p "$STATE/app" "$STATE/link_out"
   mv "$LOUT/Chromium.app" "$STATE/app/Chromium.app"
+  # Keep the unstripped engine beside the checkpoint so crash reports can be
+  # symbolicated. It never ships; the IPA carries the stripped binary.
+  local unstripped
+  unstripped="$(find "$LOUT" -maxdepth 1 -name 'chrome_framework*.unstripped' -print -quit)"
+  if [ -n "$unstripped" ]; then
+    mkdir -p "$STATE/symbols"
+    zstd -T0 -10 -q -o "$STATE/symbols/$(basename "$unstripped").zst" "$unstripped"
+  else
+    echo "::warning::No unstripped chrome_framework found; crash symbols not saved"
+  fi
   [ -d "$LOUT/.deferred_extract_metadata" ] && mv "$LOUT/.deferred_extract_metadata" "$STATE/app/"
   tar -C "$STATE/app" -cf - . | zstd -T0 -5 -o "$STATE/link_out/chromium_app_unsigned.tar.zst"
   rm -rf "$LWORK" "$STATE/app" || echo "::warning::Work tree not fully removed; continuing"

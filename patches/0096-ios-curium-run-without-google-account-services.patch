@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: run without Google account services
+
+Honor --disable-sync during profile startup. Keep authentication, local
+credentials, and session metrics available; skip services that require
+sync. Chromium's existing switch leaves the sync transport unstarted.
+
+Return GCM's disabled status before either iOS driver starts its worker.
+Keep Optimization Guide's local hints and cached models, but deny all
+remote hint and model requests, including on-demand hints and model
+execution.
+
+diff --git a/components/gcm_driver/gcm_driver_desktop.cc b/components/gcm_driver/gcm_driver_desktop.cc
+index f31c49582484744363a90dcc0b3a36855be092c9..fad0b8d7739a1070f1f922f500f15cb402485df9 100644
+--- a/components/gcm_driver/gcm_driver_desktop.cc
++++ b/components/gcm_driver/gcm_driver_desktop.cc
+@@ -19,6 +19,7 @@
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/trace_event/trace_event.h"
++#include "build/build_config.h"
+ #include "components/fcm/crypto/fcm_decryption_result.h"
+ #include "components/fcm/engine/chrome_build_info.h"
+ #include "components/fcm/engine/system_encryptor.h"
+@@ -1010,6 +1011,11 @@ GCMClient::Result GCMDriverDesktop::EnsureStarted(
+     GCMClient::StartMode start_mode) {
+   DCHECK(ui_thread_->RunsTasksInCurrentSequence());
+ 
++  // [ios-blink-sideload] Keep both iOS GCM drivers offline.
++  if (BUILDFLAG(IS_IOS)) {
++    return GCMClient::GCM_DISABLED;
++  }
++
+   if (gcm_started_) {
+     return GCMClient::SUCCESS;
+   }
+diff --git a/components/optimization_guide/core/delivery/prediction_model_download_manager.cc b/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
+index 8a8a6ea142895df07bd301b97f0b7112afa4eebc..292dd3af15eb0968d8f3020d81d664c1caf21b51 100644
+--- a/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
++++ b/components/optimization_guide/core/delivery/prediction_model_download_manager.cc
+@@ -206,6 +206,11 @@ bool PredictionModelDownloadManager::IsAvailableForDownloads() const {
+ }
+ 
+ bool PredictionModelDownloadManager::ShouldFetchModels() const {
++  // [ios-blink-sideload] Keep cached models available without fetching updates.
++  if (BUILDFLAG(IS_IOS)) {
++    return false;
++  }
++
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           kDisableModelDownloadsForBenchmarking) ||
+       base::CommandLine::ForCurrentProcess()->HasSwitch(
+diff --git a/components/optimization_guide/core/hints/hints_manager.cc b/components/optimization_guide/core/hints/hints_manager.cc
+index 07687e807322a9d1b298dec3c3b8ca0a49d85e06..6d8c2a51fac567095d60906851a4bce85f1ce06d 100644
+--- a/components/optimization_guide/core/hints/hints_manager.cc
++++ b/components/optimization_guide/core/hints/hints_manager.cc
+@@ -1080,6 +1080,12 @@ void HintsManager::FetchHintsForURLs(const std::vector<GURL>& urls,
+                                      proto::RequestContext request_context) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  if (BUILDFLAG(IS_IOS) &&
++      !IsUserPermittedToFetchFromRemoteOptimizationGuide(is_off_the_record_,
++                                                         pref_service_)) {
++    return;
++  }
++
+   // Collect hosts, stripping duplicates, but preserving the ordering.
+   InsertionOrderedSet<GURL> target_urls;
+   InsertionOrderedSet<std::string> target_hosts;
+@@ -1277,6 +1283,15 @@ void HintsManager::CanApplyOptimizationOnDemand(
+     return;
+   }
+ 
++  if (BUILDFLAG(IS_IOS) &&
++      !IsUserPermittedToFetchFromRemoteOptimizationGuide(is_off_the_record_,
++                                                         pref_service_)) {
++    for (const GURL& url : urls) {
++      InvokeOnDemandHintsCallbackForURL(url, optimization_types, callback);
++    }
++    return;
++  }
++
+   InsertionOrderedSet<GURL> urls_to_fetch;
+   InsertionOrderedSet<std::string> hosts_to_fetch;
+   for (const auto& url : urls) {
+diff --git a/components/optimization_guide/core/optimization_guide_permissions_util.cc b/components/optimization_guide/core/optimization_guide_permissions_util.cc
+index c9690ef4b838862570aeed22c865589f0fcfdb53..d11b4c9aacbcd2f84414cd93dfae971edda27f5c 100644
+--- a/components/optimization_guide/core/optimization_guide_permissions_util.cc
++++ b/components/optimization_guide/core/optimization_guide_permissions_util.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "base/command_line.h"
++#include "build/build_config.h"
+ #include "components/unified_consent/url_keyed_data_collection_consent_helper.h"
+ #include "google_apis/google_api_keys.h"
+ 
+@@ -39,8 +40,11 @@ bool ShouldSkipGoogleApiKeyConfigurationCheck() {
+ bool IsUserPermittedToFetchFromRemoteOptimizationGuide(
+     bool is_off_the_record,
+     PrefService* pref_service) {
+-  if (is_off_the_record)
++  // [ios-blink-sideload] Use local hints even if remote fetches are allowed
++  // by the profile or a testing switch.
++  if (BUILDFLAG(IS_IOS) || is_off_the_record) {
+     return false;
++  }
+ 
+   if (ShouldOverrideCheckingUserPermissionsToFetchHintsForTesting()) {
+     return true;
+diff --git a/ios/chrome/browser/credential_provider/model/credential_provider_service.mm b/ios/chrome/browser/credential_provider/model/credential_provider_service.mm
+index 5eb0e734518ea6f865fa81008e76199737925b77..70ab9207f155a5796837d50f62b1ad04c01390a7 100644
+--- a/ios/chrome/browser/credential_provider/model/credential_provider_service.mm
++++ b/ios/chrome/browser/credential_provider/model/credential_provider_service.mm
+@@ -180,7 +180,6 @@ void RecordNumberFaviconsFetched(size_t fetched_favicon_count) {
+       dual_credential_store_(credential_store) {
+   CHECK(profile_password_store_);
+   CHECK(identity_manager_);
+-  CHECK(sync_service_);
+   CHECK(favicon_loader_);
+   CHECK(dual_credential_store_);
+ 
+@@ -207,7 +206,9 @@ void RecordNumberFaviconsFetched(size_t fetched_favicon_count) {
+   UpdateUserEmail();
+ 
+   identity_manager_->AddObserver(this);
+-  sync_service_->AddObserver(this);
++  if (sync_service_) {
++    sync_service_->AddObserver(this);
++  }
+ 
+   // This class should usually handle incremental PasswordStore updates in
+   // OnLoginsChanged(), but there could be bugs. E.g. maybe an update is fired
+diff --git a/ios/chrome/browser/metrics/model/ios_profile_session_durations_service.mm b/ios/chrome/browser/metrics/model/ios_profile_session_durations_service.mm
+index acc5f409966189a4c08f0087d7ae2c979625ab58..9d5ea9a2fbafbb63d28ebd0de2d137d3714dfabc 100644
+--- a/ios/chrome/browser/metrics/model/ios_profile_session_durations_service.mm
++++ b/ios/chrome/browser/metrics/model/ios_profile_session_durations_service.mm
+@@ -14,7 +14,6 @@
+     PrefService* pref_service,
+     signin::IdentityManager* identity_manager,
+     metrics::ProfileMetricsService* profile_metrics_service) {
+-  CHECK(sync_service);
+   CHECK(pref_service);
+   CHECK(identity_manager);
+ 
+diff --git a/ios/chrome/browser/optimization_guide/model/optimization_guide_service.mm b/ios/chrome/browser/optimization_guide/model/optimization_guide_service.mm
+index e84d8036d8fa335e571c134ff33c5cb0f7b3bf63..02af86abd25ef07c6807ca07dc035994df3e1bfa 100644
+--- a/ios/chrome/browser/optimization_guide/model/optimization_guide_service.mm
++++ b/ios/chrome/browser/optimization_guide/model/optimization_guide_service.mm
+@@ -101,7 +101,8 @@
+       top_host_provider_.get(), tab_url_provider_.get(), url_loader_factory,
+       identity_manager, optimization_guide_logger_.get());
+ 
+-  if (!off_the_record_) {
++  // [ios-blink-sideload] Curium omits the remote execution context.
++  if (!off_the_record_ && network_context_getter_) {
+     variations::VariationsService* variations_service =
+         GetApplicationContext()->GetVariationsService();
+     auto dogfood_status =
+diff --git a/ios/chrome/browser/optimization_guide/model/optimization_guide_service_factory.mm b/ios/chrome/browser/optimization_guide/model/optimization_guide_service_factory.mm
+index 128c49beb2c86d6205d8d93c71159340974107b2..93b42f1f26b528f7c07c01cf21eecb8d0fd1b5cc 100644
+--- a/ios/chrome/browser/optimization_guide/model/optimization_guide_service_factory.mm
++++ b/ios/chrome/browser/optimization_guide/model/optimization_guide_service_factory.mm
+@@ -16,9 +16,7 @@
+ #import "components/optimization_guide/core/hints/optimization_guide_store.h"
+ #import "components/optimization_guide/core/optimization_guide_features.h"
+ #import "ios/chrome/browser/optimization_guide/model/ios_chrome_hints_manager.h"
+-#import "ios/chrome/browser/optimization_guide/model/ios_model_execution_manager_delegate.h"
+ #import "ios/chrome/browser/optimization_guide/model/optimization_guide_service.h"
+-#import "ios/chrome/browser/private_ai/model/private_ai_service_factory.h"
+ #import "ios/chrome/browser/shared/model/application_context/application_context.h"
+ #import "ios/chrome/browser/shared/model/browser/browser_list_factory.h"
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+@@ -28,15 +26,6 @@
+ 
+ namespace {
+ 
+-// Returns the NetworkContext from `weak_profile` or nullptr.
+-network::mojom::NetworkContext* GetNetworkContext(
+-    base::WeakPtr<ProfileIOS> weak_profile) {
+-  if (ProfileIOS* profile = weak_profile.get()) {
+-    return profile->GetNetworkContext();
+-  }
+-  return nullptr;
+-}
+-
+ std::unique_ptr<KeyedService> BuildOptimizationGuideService(
+     ProfileIOS& profile) {
+   if (!optimization_guide::features::IsOptimizationHintsEnabled()) {
+@@ -58,15 +47,6 @@
+     hint_store = original_ogs->GetHintsManager()->hint_store();
+   }
+ 
+-  std::unique_ptr<optimization_guide::ModelExecutionManager::Delegate>
+-      delegate = nullptr;
+-  if (!profile.IsOffTheRecord()) {
+-    private_ai::PrivateAiService* private_ai_service =
+-        PrivateAiServiceFactory::GetForProfile(profile);
+-    delegate =
+-        std::make_unique<IOSModelExecutionManagerDelegate>(private_ai_service);
+-  }
+-
+   auto service = std::make_unique<OptimizationGuideService>(
+       proto_db_provider, profile_path, profile.IsOffTheRecord(),
+       std::string(GetApplicationContext()
+@@ -76,8 +56,8 @@
+       hint_store, profile.GetPrefs(),
+       BrowserListFactory::GetForProfile(profile),
+       GetApplicationContext()->GetSharedURLLoaderFactory(),
+-      IdentityManagerFactory::GetForProfile(profile), std::move(delegate),
+-      base::BindRepeating(&GetNetworkContext, profile.AsWeakPtr()));
++      IdentityManagerFactory::GetForProfile(profile), /*delegate=*/nullptr,
++      network::NetworkContextGetter());
+ 
+   service->DoFinalInit(
+       BackgroundDownloadServiceFactory::GetForProfile(profile));
+@@ -108,7 +88,6 @@
+   DependsOn(BackgroundDownloadServiceFactory::GetInstance());
+   DependsOn(BrowserListFactory::GetInstance());
+   DependsOn(IdentityManagerFactory::GetInstance());
+-  DependsOn(PrivateAiServiceFactory::GetInstance());
+ }
+ 
+ // static
+diff --git a/ios/chrome/browser/passwords/model/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.mm b/ios/chrome/browser/passwords/model/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.mm
+index e740b1657e275e5baecbb28b8f5ab45190893e9c..0ab9146a8ecb84b0116dd07551d03ff069819844 100644
+--- a/ios/chrome/browser/passwords/model/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.mm
++++ b/ios/chrome/browser/passwords/model/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.mm
+@@ -53,6 +53,11 @@
+ 
+   syncer::SyncService* sync_service =
+       SyncServiceFactory::GetForProfile(profile);
++  // Both trackers need sync to report an encryption state.
++  if (!sync_service) {
++    return nullptr;
++  }
++
+   std::unique_ptr<password_manager::OnDeviceEncryptionStateTracker>
+       passkey_tracker;
+   if (base::FeatureList::IsEnabled(kIOSPasskeyOnDeviceEncryptionStateTracker)) {
+diff --git a/ios/chrome/browser/signin/model/authentication_service.mm b/ios/chrome/browser/signin/model/authentication_service.mm
+index 9a501d300e39ed3fdef8a26ad376509631601b10..fc616ccb20bc1da6a536b7740f8120dd0ee2d91d 100644
+--- a/ios/chrome/browser/signin/model/authentication_service.mm
++++ b/ios/chrome/browser/signin/model/authentication_service.mm
+@@ -91,7 +91,6 @@ void MultiProfileSignOutForProfile(
+   DCHECK(profile_);
+   DCHECK(pref_service_);
+   DCHECK(identity_manager_);
+-  DCHECK(sync_service_);
+ }
+ 
+ AuthenticationService::~AuthenticationService() = default;
+@@ -694,10 +693,11 @@ void MultiProfileSignOutForProfile(
+     AccountInfo extended_account_info =
+         identity_manager_->FindExtendedAccountInfoByAccountId(
+             account_info.account_id);
+-    syncer::SyncUserSettings* user_settings = sync_service_->GetUserSettings();
+-    bool history_sync_enabled = user_settings->GetSelectedTypes().HasAll(
+-        {syncer::UserSelectableType::kHistory,
+-         syncer::UserSelectableType::kTabs});
++    const bool history_sync_enabled =
++        sync_service_ &&
++        sync_service_->GetUserSettings()->GetSelectedTypes().HasAll(
++            {syncer::UserSelectableType::kHistory,
++             syncer::UserSelectableType::kTabs});
+     StorePreRestoreIdentity(pref_service_, extended_account_info,
+                             history_sync_enabled);
+   }
+@@ -783,6 +783,11 @@ void MultiProfileSignOutForProfile(
+ }
+ 
+ void AuthenticationService::ClearAccountSettingsPrefsOfRemovedAccounts() {
++  // [ios-blink-sideload] Curium keeps authentication available without sync.
++  if (!sync_service_) {
++    return;
++  }
++
+   std::vector<GaiaId> available_gaia_ids;
+   for (id<SystemIdentity> identity in account_manager_service_
+            ->GetAllIdentities()) {
+diff --git a/ios/chrome/browser/unified_consent/model/unified_consent_service_factory.mm b/ios/chrome/browser/unified_consent/model/unified_consent_service_factory.mm
+index bb8b409aad7a9eb3124db9b597a54cf6041df34e..8f75294bc16054bf21645fa3329d1f2b41eba4df 100644
+--- a/ios/chrome/browser/unified_consent/model/unified_consent_service_factory.mm
++++ b/ios/chrome/browser/unified_consent/model/unified_consent_service_factory.mm
+@@ -36,6 +36,9 @@
+       IdentityManagerFactory::GetForProfile(profile);
+   syncer::SyncService* sync_service =
+       SyncServiceFactory::GetForProfile(profile);
++  if (!sync_service) {
++    return nullptr;
++  }
+ 
+   // Record settings for pre- and post-UnifiedConsent users.
+   unified_consent::metrics::RecordSettingsHistogram(user_pref_service);
