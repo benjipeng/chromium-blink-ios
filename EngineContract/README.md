@@ -33,9 +33,21 @@ cancelled.
 
 The shell and Blink run in one process and share the engine's regular browsing
 context. V1 does not expose an off-the-record (Incognito) context. The tab's
-`webView` is the live engine view. Where a tab supplies a `scrollView`, apply
-shell chrome insets directly to its `contentInset` using the scene's layout
-geometry; avoid applying the same inset through a second scroll container.
+`webView` is the live engine view. When using the optional compositor controls
+on a tab, give `webView` its full viewport, leave `scrollView.contentInset.top`
+at zero, and set `topControlsHeight` to the full address bar band in points.
+Keep that height fixed while scrolling. Observe `topControlsShownRatio` via
+KVO on the main thread to morph the shell's chrome; the engine moves the page.
+A height of zero disables the band. These selectors are additive to V1. In
+Swift, conditionally cast the tab to `CrIOSTabBrowserControlsV1` to read and
+write the properties. Objective-C callers on `CrIOSTabHostingV1` can probe
+the two getters and the height setter. For an older engine, the tab's
+`scrollView.contentInset` remains available for static chrome insets.
+
+Record history from the optional navigation-commit callback rather than from
+tab updates, which are coalesced. It reports each main-frame commit once, after
+it happens, and excludes error pages. Same-document commits cover fragment and
+History API changes; `isReload` marks reloads, including script reloads.
 
 Probe each optional extension selector before calling it. Use the module or
 the legacy helper header as the declaration source in a given translation unit.

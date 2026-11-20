@@ -62,10 +62,24 @@ NS_SWIFT_UI_ACTOR
     (void (^NS_SWIFT_UI_ACTOR)(UIImage *_Nullable image))completion;
 
 @optional
+/// Maximum height of the floating top controls in points. Zero disables the band.
+@property (nonatomic) CGFloat topControlsHeight;
+/// Compositor shown fraction, from 0 through 1. Observe this key via KVO on the main thread.
+@property (nonatomic, readonly) CGFloat topControlsShownRatio;
+
 @property (nonatomic, readonly) BOOL hasPlayingVideo;
 @property (nonatomic, readonly) BOOL isPictureInPictureActive;
 - (void)enterPictureInPicture;
 - (void)exitPictureInPicture;
+
+@end
+
+/// Swift can cast a tab to this protocol to get a writable height property.
+NS_SWIFT_UI_ACTOR
+@protocol CrIOSTabBrowserControlsV1 <CrIOSTabHostingV1>
+
+@property (nonatomic) CGFloat topControlsHeight;
+@property (nonatomic, readonly) CGFloat topControlsShownRatio;
 
 @end
 
@@ -140,6 +154,15 @@ NS_SWIFT_UI_ACTOR
               mimeType:(nullable NSString *)mimeType
         httpStatusCode:(NSInteger)httpStatusCode
          contentLength:(int64_t)contentLength;
+
+/// Called on the main thread after a document commits in the tab's main frame.
+/// Error pages are excluded. The navigation ID is unique while the engine runs.
+- (void)browserHost:(id<CrIOSBrowserHostV1>)host
+                         tab:(id<CrIOSTabHostingV1>)tab
+    didCommitNavigationToURL:(NSURL *)url
+                navigationID:(int64_t)navigationID
+              isSameDocument:(BOOL)isSameDocument
+                    isReload:(BOOL)isReload;
 
 @end
 

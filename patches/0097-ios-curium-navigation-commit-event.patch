@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: report committed main-frame navigations
+
+Curium's history needs the documents a tab actually committed, not the
+coalesced tab updates it gets today. Report each commit in the primary main
+frame, excluding error pages, through an optional delegate callback with the
+committed URL, the engine's navigation ID, and whether it was same-document
+or a reload. Deliver it on the main thread after content has notified its
+observers, so the shell may close the tab from the callback.
+
+---
+ ios/chrome/browser/curium/curium_browser_host.mm   | 19 ++++++++++
+ .../curium/curium_engine_contract_internal.h       |  6 +++
+ ios/chrome/browser/curium/curium_tab_host.mm       | 44 ++++++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+index a1d94ced419f24a4d2532cd33a6df6b34e5d479f..9e8502ab023aa7d52a7e6960d19394e16b972d5c 100644
+--- a/ios/chrome/browser/curium/curium_browser_host.mm
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -525,6 +525,25 @@ - (void)tabHost:(CuriumTabHost*)tabHost
+   }
+ }
+ 
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didCommitNavigationToURL:(NSURL*)url
++                navigationID:(int64_t)navigationID
++              isSameDocument:(BOOL)isSameDocument
++                    isReload:(BOOL)isReload {
++  if (_isShutdown) {
++    return;
++  }
++  if ([_delegate respondsToSelector:@selector
++                 (browserHost:tab:didCommitNavigationToURL:navigationID:isSameDocument:isReload:)]) {
++    [_delegate browserHost:self
++                             tab:tabHost
++        didCommitNavigationToURL:url
++                    navigationID:navigationID
++                  isSameDocument:isSameDocument
++                        isReload:isReload];
++  }
++}
++
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     runFileChooserWithEvent:(const ChooseFileEvent&)event
+                  completion:(void (^)(NSArray<NSURL*>* _Nullable))completion {
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 590d74de65dcd7a46661139371658cdfd16795fc..54b5bd636ff360ffd0912e40403e3952bb97b410 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -137,6 +137,12 @@ __attribute__((visibility("default")))
+               mimeType:(nullable NSString*)mimeType
+         httpStatusCode:(NSInteger)httpStatusCode
+          contentLength:(int64_t)contentLength;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++                         tab:(id<CrIOSTabHostingV1>)tab
++    didCommitNavigationToURL:(NSURL*)url
++                navigationID:(int64_t)navigationID
++              isSameDocument:(BOOL)isSameDocument
++                    isReload:(BOOL)isReload;
+ @end
+ 
+ @protocol CrIOSBrowserHostV1 <NSObject>
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+index 8ea4b7f544013e5af0045096c312d40db2b692a4..fee56c974d45218286845d1f4f5a17b2b4900795 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.mm
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -17,6 +17,8 @@
+ #import "content/public/browser/host_zoom_map.h"
+ #import "content/public/browser/media_session.h"
+ #import "content/public/browser/navigation_controller.h"
++#import "content/public/browser/navigation_handle.h"
++#import "content/public/browser/reload_type.h"
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/browser/web_contents_observer.h"
+@@ -45,6 +47,11 @@ - (void)tabHost:(CuriumTabHost*)tabHost
+               mimeType:(nullable NSString*)mimeType
+         httpStatusCode:(NSInteger)httpStatusCode
+          contentLength:(int64_t)contentLength;
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didCommitNavigationToURL:(NSURL*)url
++                navigationID:(int64_t)navigationID
++              isSameDocument:(BOOL)isSameDocument
++                    isReload:(BOOL)isReload;
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     runFileChooserWithEvent:(const ChooseFileEvent&)event
+                  completion:
+@@ -54,6 +61,7 @@ - (void)tabHost:(CuriumTabHost*)tabHost
+ @interface CuriumTabHost () <FileUploadPanelCommands>
+ - (void)notifyUpdated;
+ - (void)handleNavigationCommitted;
++- (void)handleMainFrameCommit:(content::NavigationHandle*)navigation;
+ - (void)updateTopControlsShownRatio:(CGFloat)ratio;
+ - (void)handleWebStateDestroyed;
+ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info;
+@@ -83,6 +91,14 @@ void MediaStoppedPlaying(const MediaPlayerInfo&,
+     [owner_ notifyUpdated];
+   }
+   void MediaPictureInPictureChanged(bool) override { [owner_ notifyUpdated]; }
++  void DidFinishNavigation(content::NavigationHandle* navigation) override {
++    // [ios-blink-sideload] Curium records history from committed documents in
++    // the tab's own frame; subframes and error pages are not history entries.
++    if (navigation->HasCommitted() && navigation->IsInPrimaryMainFrame() &&
++        !navigation->IsErrorPage()) {
++      [owner_ handleMainFrameCommit:navigation];
++    }
++  }
+   void ResourceLoadComplete(
+       content::RenderFrameHost* render_frame_host,
+       const content::GlobalRequestID& request_id,
+@@ -561,6 +577,34 @@ - (void)handleNavigationCommitted {
+   [self applyZoomIfNeeded];
+ }
+ 
++- (void)handleMainFrameCommit:(content::NavigationHandle*)navigation {
++  if (!_browserHost) {
++    return;
++  }
++  NSURL* url = net::NSURLWithGURL(navigation->GetURL());
++  if (!url) {
++    return;
++  }
++  const int64_t navigationID = navigation->GetNavigationId();
++  const BOOL isSameDocument = navigation->IsSameDocument();
++  const BOOL isReload =
++      navigation->GetReloadType() != content::ReloadType::NONE;
++  // Deliver after content finishes notifying observers: the shell may close
++  // the tab in response, which must not happen mid-notification.
++  __weak CuriumTabHost* weakSelf = self;
++  dispatch_async(dispatch_get_main_queue(), ^{
++    CuriumTabHost* strongSelf = weakSelf;
++    if (!strongSelf || !strongSelf->_webState) {
++      return;
++    }
++    [strongSelf->_browserHost tabHost:strongSelf
++             didCommitNavigationToURL:url
++                         navigationID:navigationID
++                       isSameDocument:isSameDocument
++                             isReload:isReload];
++  });
++}
++
+ - (void)handleWebStateDestroyed {
+   [self detach];
+ }

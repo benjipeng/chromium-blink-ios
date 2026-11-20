@@ -110,6 +110,37 @@ obj/third_party/blink/renderer/platform/media/media/web_media_player_impl.o
 obj/content/app/app/content_main.o
 obj/v8/v8_libbase/ios-jit-memory.o
 obj/third_party/blink/renderer/modules/webaudio/webaudio/audio_context.o
+obj/cc/cc/browser_controls_offset_manager.o
+obj/cc/cc/viewport.o
+obj/cc/cc/layer_tree_host.o
+obj/cc/cc/layer_tree_host_impl.o
+obj/cc/cc/layer_tree_impl.o
+obj/components/gcm_driver/gcm_driver/gcm_driver_desktop.o
+obj/components/input/input/input_router_impl.o
+obj/components/input/input/render_input_router.o
+obj/components/input/input/render_widget_host_input_event_router.o
+obj/components/optimization_guide/core/prediction/prediction_model_download_manager.o
+obj/components/optimization_guide/core/hints/hints_manager.o
+obj/components/optimization_guide/core/core_util/optimization_guide_permissions_util.o
+obj/components/viz/service/service/surface_aggregator.o
+obj/components/viz/service/service/compositor_frame_sink_support.o
+obj/content/browser/browser/popup_menu_helper_ios.o
+obj/content/browser/browser/render_widget_host_impl.o
+obj/content/browser/browser/render_widget_host_view_ios.o
+obj/content/browser/browser/render_widget_host_view_ios_uiview.o
+obj/content/browser/browser/web_contents_view_ios.o
+obj/ios/chrome/browser/metrics/model/model/ios_profile_session_durations_service.o
+obj/ios/chrome/browser/optimization_guide/model/model/optimization_guide_service.o
+obj/ios/chrome/browser/optimization_guide/model/model/optimization_guide_service_factory.o
+obj/ios/chrome/browser/passwords/model/ode/ode/ios_chrome_on_device_encryption_metrics_reporter_factory.o
+obj/ios/chrome/browser/signin/model/authentication_service/authentication_service.o
+obj/ios/chrome/browser/unified_consent/model/model/unified_consent_service_factory.o
+obj/third_party/blink/renderer/core/core_hot/document.o
+obj/third_party/blink/renderer/core/exported/exported/web_view_impl.o
+obj/third_party/blink/renderer/core/core/browser_controls.o
+obj/third_party/blink/renderer/core/core/web_frame_widget_impl.o
+obj/third_party/blink/renderer/core/core/frame_loader.o
+obj/components/viz/common/common/presented_top_controls_offset_ios.o
 EOF
   python3 - <<'PY'
 import os

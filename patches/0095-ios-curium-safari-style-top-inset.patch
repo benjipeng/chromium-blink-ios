@@ -1,0 +1,2126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: scroll the page under floating top controls
+
+Keep the UIKit viewport fixed and let Blink and cc consume scroll delta for
+the top browser controls. Viz embeds the page at the offset carried by the
+frame it draws and records that offset when the frame is presented. Native
+input and selection map through the presented offset. A pinch keeps its
+native point for cc, which anchors zoom with its live offset; hit tests and
+the synthetic Ctrl-wheel of a touchpad pinch use page space.
+
+Keep the full-size widget and update the band height with the viewport.
+Allow gesture reveals only at page top, including while settling. Commit
+the ratio of a new document, of a history load and of a restored scroll in
+place of compositor deltas and animations. Account for the band when
+revealing a focused field, and retain the ratio through DOM fullscreen.
+
+---
+ cc/input/browser_controls_offset_manager.cc        |  62 ++++++++--
+ cc/input/browser_controls_offset_manager.h         |   3 +
+ .../browser_controls_offset_manager_unittest.cc    |  44 +++++++
+ cc/layers/viewport.cc                              |  31 ++++-
+ cc/layers/viewport.h                               |   1 +
+ cc/trees/commit_state.h                            |   3 +
+ cc/trees/layer_tree_host.cc                        |   8 ++
+ cc/trees/layer_tree_host.h                         |   3 +
+ cc/trees/layer_tree_host_impl.cc                   |  14 ++-
+ cc/trees/layer_tree_impl.cc                        |  16 +++
+ cc/trees/layer_tree_impl.h                         |   2 +
+ components/input/input_router_client.h             |   5 +
+ components/input/input_router_impl.cc              |   9 +-
+ components/input/render_input_router.cc            |   4 +
+ components/input/render_input_router.h             |   1 +
+ .../input/render_widget_host_input_event_router.cc |  52 ++++++--
+ components/input/render_widget_host_view_input.h   |   4 +
+ components/viz/common/BUILD.gn                     |   2 +
+ .../presented_top_controls_offset_ios.cc           |  54 +++++++++
+ .../presented_top_controls_offset_ios.h            |  37 ++++++
+ .../viz/service/display/surface_aggregator.cc      |  42 ++++++-
+ .../frame_sinks/compositor_frame_sink_support.cc   |  36 ++++++
+ .../frame_sinks/compositor_frame_sink_support.h    |   7 ++
+ .../browser/renderer_host/popup_menu_helper_ios.mm |   7 +-
+ .../renderer_host/render_widget_host_impl.cc       |   8 ++
+ .../renderer_host/render_widget_host_view_ios.h    |   5 +
+ .../renderer_host/render_widget_host_view_ios.mm   |  64 ++++++++--
+ .../render_widget_host_view_ios_uiview.mm          | 110 ++++++++++-------
+ .../browser/web_contents/web_contents_view_ios.mm  |   3 -
+ .../curium/curium_engine_contract_internal.h       |   9 ++
+ ios/chrome/browser/curium/curium_tab_host.h        |   2 +-
+ ios/chrome/browser/curium/curium_tab_host.mm       |  39 ++++++
+ ios/web/content/BUILD.gn                           |   1 +
+ ios/web/content/DEPS                               |   1 +
+ ios/web/content/web_state/content_web_state.h      |  26 ++++
+ ios/web/content/web_state/content_web_state.mm     | 131 +++++++++++++++++++++
+ third_party/blink/renderer/core/dom/document.cc    |  15 +++
+ .../blink/renderer/core/exported/web_view_impl.cc  |  29 +++++
+ .../blink/renderer/core/exported/web_view_impl.h   |   5 +
+ .../blink/renderer/core/frame/browser_controls.cc  |   5 +
+ .../renderer/core/frame/web_frame_widget_impl.cc   |   6 +
+ .../renderer/core/frame/web_frame_widget_impl.h    |   3 +
+ .../blink/renderer/core/loader/frame_loader.cc     |  38 ++++++
+ 43 files changed, 861 insertions(+), 86 deletions(-)
+
+diff --git a/cc/input/browser_controls_offset_manager.cc b/cc/input/browser_controls_offset_manager.cc
+index 20785d5218cf6cabbe3bc38be3196ef7d5831984..b1d8a3b13d613c4900be4a0ee7cf6737956c7c58 100644
+--- a/cc/input/browser_controls_offset_manager.cc
++++ b/cc/input/browser_controls_offset_manager.cc
+@@ -208,6 +208,7 @@ void BrowserControlsOffsetManager::OnBrowserControlsStateUpdated(
+           : BottomControlsShownRatio();
+   if (animated_top_shown_ratio == final_top_shown_ratio &&
+       animated_bottom_shown_ratio == final_bottom_shown_ratio) {
++    showing_from_scroll_ = false;
+     return;
+   }
+ 
+@@ -222,7 +223,7 @@ void BrowserControlsOffsetManager::OnBrowserControlsStateUpdated(
+   }
+ 
+   if (animate)
+-    SetupAnimation(direction, kShowHideMaxDurationMs);
++    SetupAnimation(direction, kShowHideMaxDurationMs, /*from_scroll=*/false);
+   else
+     client().SetCurrentBrowserControlsShownRatio(final_top_shown_ratio,
+                                                  final_bottom_shown_ratio);
+@@ -265,6 +266,15 @@ void BrowserControlsOffsetManager::OnBrowserControlsParamsChanged(
+     // 4. For any other cases, we should update the shown ratio so the visible
+     // height remains the same.
+     bool hide_controls = (permitted_state() == BrowserControlsState::kHidden);
++#if BUILDFLAG(IS_IOS)
++    // Curium suppresses the height in fullscreen but keeps the fraction.
++    if (old_top_height == 0.f) {
++      new_top_ratio = TopControlsShownRatio();
++    } else if (TopControlsHeight() == 0.f) {
++      ResetAnimations();
++      show_controls_when_scroll_completes_ = false;
++    }
++#endif
+     if (hide_controls) {
+       new_top_ratio = TopControlsMinShownRatio();
+     } else if (TopControlsShownRatio() == 1.0f) {
+@@ -620,7 +630,7 @@ void BrowserControlsOffsetManager::ApplySnapHint(
+   int64_t duration_ms = gfx::Tween::IntValueBetween(
+       hint->slowness, kShowHideMinDurationMs, kShowHideMaxDurationMs);
+ 
+-  SetupAnimation(direction, duration_ms, curve);
++  SetupAnimation(direction, duration_ms, /*from_scroll=*/true, curve);
+   if (extra_hide_gestures_enabled_) {
+     is_snap_animation_ = HasAnimation();
+   }
+@@ -628,7 +638,8 @@ void BrowserControlsOffsetManager::ApplySnapHint(
+ 
+ void BrowserControlsOffsetManager::ScrollEnd(
+     const gfx::Vector2dF& compensated_scroll_delta) {
+-  if (pinch_gesture_active_)
++  if (pinch_gesture_active_ ||
++      (!TopControlsHeight() && !BottomControlsHeight()))
+     return;
+ 
+   if (snap_controller_) {
+@@ -647,7 +658,7 @@ void BrowserControlsOffsetManager::ScrollEnd(
+   // when scroll delta is negative (i.e. scrolling up), with the only difference
+   // being the specific height and ratio values.
+   float compensated_scroll_delta_y = compensated_scroll_delta.y();
+-  if (!show_controls_when_scroll_completes_ &&
++  if (!show_controls_when_scroll_completes_ && CanShowFromScroll() &&
+       compensated_scroll_delta_y < 0.0f) {
+     const ActiveControls controls = GetActiveControls();
+     if (controls.height > 0.0f && controls.min_shown_ratio < 1.0f) {
+@@ -665,10 +676,10 @@ void BrowserControlsOffsetManager::ScrollEnd(
+   // See if we should animate the top or bottom bar in, in case there was a race
+   // between chrome showing the controls and the user performing a scroll. We
+   // only need to animate the controls if they're not fully shown.
+-  if (show_controls_when_scroll_completes_ &&
++  if (show_controls_when_scroll_completes_ && CanShowFromScroll() &&
+       (TopControlsShownRatio() != 1.0f || BottomControlsShownRatio() != 1.0f)) {
+     SetupAnimation(BrowserControlsAnimation::Direction::kShowingControls,
+-                   kShowHideMaxDurationMs);
++                   kShowHideMaxDurationMs, /*from_scroll=*/true);
+     return;
+   }
+ 
+@@ -695,6 +706,16 @@ gfx::Vector2dF BrowserControlsOffsetManager::Animate(
+     return gfx::Vector2dF();
+   }
+ 
++  if (showing_from_scroll_ && !CanShowFromScroll()) {
++    // A programmatic scroll or a compositor update may move the page after
++    // a reveal began. End that reveal without moving the page back to top.
++    ResetAnimations();
++    show_controls_when_scroll_completes_ = false;
++    client().SetCurrentBrowserControlsShownRatio(TopControlsMinShownRatio(),
++                                                 BottomControlsMinShownRatio());
++    return gfx::Vector2dF();
++  }
++
+   float old_top_offset = ContentTopOffset();
+   float old_bottom_offset = ContentBottomOffset();
+   std::optional<float> new_top_ratio =
+@@ -713,6 +734,7 @@ gfx::Vector2dF BrowserControlsOffsetManager::Animate(
+   bool was_snap_animation = is_snap_animation_;
+   if (animation_completed) {
+     is_snap_animation_ = false;
++    showing_from_scroll_ = false;
+   }
+ 
+   client().SetCurrentBrowserControlsShownRatio(new_top_ratio.value(),
+@@ -818,14 +840,30 @@ void BrowserControlsOffsetManager::ResetAnimations() {
+   top_min_height_change_in_progress_ = false;
+   bottom_min_height_change_in_progress_ = false;
+   is_snap_animation_ = false;
++  showing_from_scroll_ = false;
+   top_min_height_offset_animation_range_.reset();
+   bottom_min_height_offset_animation_range_.reset();
+ }
+ 
++bool BrowserControlsOffsetManager::CanShowFromScroll() const {
++  return !client().OnlyExpandTopControlsAtPageTop() ||
++         client().ViewportScrollOffset().y() <= 0.f;
++}
++
+ void BrowserControlsOffsetManager::SetupAnimation(
+     BrowserControlsAnimation::Direction direction,
+     int64_t duration_ms,
++    bool from_scroll,
+     gfx::Tween::Type tween_type) {
++  using Direction = BrowserControlsAnimation::Direction;
++  if (from_scroll && direction == Direction::kShowingControls &&
++      !CanShowFromScroll()) {
++    if (TopControlsShownRatio() <= TopControlsMinShownRatio() &&
++        BottomControlsShownRatio() <= BottomControlsMinShownRatio()) {
++      return;
++    }
++    direction = Direction::kHidingControls;
++  }
+   DCHECK_NE(BrowserControlsAnimation::Direction::kNoAnimation, direction);
+   DCHECK(direction != BrowserControlsAnimation::Direction::kHidingControls ||
+          TopControlsShownRatio() > 0.0f || BottomControlsShownRatio() > 0.0f);
+@@ -837,9 +875,12 @@ void BrowserControlsOffsetManager::SetupAnimation(
+        top_controls_animation_.direction() == direction) &&
+       (!bottom_controls_animation_.IsInitialized() ||
+        bottom_controls_animation_.direction() == direction)) {
++    showing_from_scroll_ &= from_scroll;
+     return;
+   }
+ 
++  showing_from_scroll_ =
++      from_scroll && direction == Direction::kShowingControls;
+   MaybeRecordHasExistingAnimationHistogram();
+ 
+   if (!TopControlsHeight() && !BottomControlsHeight()) {
+@@ -896,6 +937,9 @@ BrowserControlsOffsetManager::GetActiveControls() const {
+ }
+ 
+ void BrowserControlsOffsetManager::StartAnimationIfNecessary() {
++  if (!TopControlsHeight() && !BottomControlsHeight()) {
++    return;
++  }
+   if ((TopControlsShownRatio() == TopControlsMinShownRatio() ||
+        TopControlsShownRatio() == 1.0f) &&
+       (BottomControlsShownRatio() == BottomControlsMinShownRatio() ||
+@@ -909,11 +953,11 @@ void BrowserControlsOffsetManager::StartAnimationIfNecessary() {
+   if (normalized_shown_ratio >= 1.0f - controls_hide_threshold_) {
+     // If we're showing so much that the hide threshold won't trigger, show.
+     SetupAnimation(BrowserControlsAnimation::Direction::kShowingControls,
+-                   kShowHideMaxDurationMs);
++                   kShowHideMaxDurationMs, /*from_scroll=*/true);
+   } else if (normalized_shown_ratio <= controls_show_threshold_) {
+     // If we're showing so little that the show threshold won't trigger, hide.
+     SetupAnimation(BrowserControlsAnimation::Direction::kHidingControls,
+-                   kShowHideMaxDurationMs);
++                   kShowHideMaxDurationMs, /*from_scroll=*/true);
+   } else {
+     // If we could be either showing or hiding, we determine which one to
+     // do based on whether or not the total scroll delta was moving up or
+@@ -921,7 +965,7 @@ void BrowserControlsOffsetManager::StartAnimationIfNecessary() {
+     SetupAnimation(accumulated_scroll_delta_ <= 0.0f
+                        ? BrowserControlsAnimation::Direction::kShowingControls
+                        : BrowserControlsAnimation::Direction::kHidingControls,
+-                   kShowHideMaxDurationMs);
++                   kShowHideMaxDurationMs, /*from_scroll=*/true);
+   }
+ }
+ 
+diff --git a/cc/input/browser_controls_offset_manager.h b/cc/input/browser_controls_offset_manager.h
+index 4f33ecb9659c4000da0b071d028b4f4bc69c158a..bd16987a2090782e52c94b015eea4db794e87bad 100644
+--- a/cc/input/browser_controls_offset_manager.h
++++ b/cc/input/browser_controls_offset_manager.h
+@@ -86,8 +86,10 @@ class CC_EXPORT BrowserControlsOffsetManager
+                                      bool animate) override;
+ 
+  private:
++  bool CanShowFromScroll() const;
+   void SetupAnimation(BrowserControlsAnimation::Direction direction,
+                       int64_t duration_ms,
++                      bool from_scroll,
+                       gfx::Tween::Type tween_type = gfx::Tween::LINEAR);
+ 
+   // Starts a show or hide snap animation corresponding to `hint` if no
+@@ -177,6 +179,7 @@ class CC_EXPORT BrowserControlsOffsetManager
+   // animation rather than an explicit browser state update. Only set while
+   // |extra_hide_gestures_enabled_| is true.
+   bool is_snap_animation_ = false;
++  bool showing_from_scroll_ = false;
+ 
+   // If set to true, an explicit hide (e.g. from a toolbar swipe) that completes
+   // in the always-shown region is not undone by a snap animation to show.
+diff --git a/cc/input/browser_controls_offset_manager_unittest.cc b/cc/input/browser_controls_offset_manager_unittest.cc
+index f4b9763f2db951e5ea61d3ff1650e94c7ac68c4c..28b0cf21d0df131482e3248d6749412c9870ee6f 100644
+--- a/cc/input/browser_controls_offset_manager_unittest.cc
++++ b/cc/input/browser_controls_offset_manager_unittest.cc
+@@ -1360,6 +1360,50 @@ TEST_F(BrowserControlsOffsetManagerTest, OnlyExpandTopControlsAtPageTop) {
+   manager->ScrollEnd(gfx::Vector2dF());
+ }
+ 
++TEST_F(BrowserControlsOffsetManagerTest, SettleCannotRevealBelowPageTop) {
++  MockBrowserControlsOffsetManagerClient client(100.f, 0.5f, 0.5f);
++  client.SetBrowserControlsParams(
++      {100.f, 0, 0, 0, false, false,
++       /*only_expand_top_controls_at_page_top=*/true});
++  auto* manager = client.manager();
++
++  manager->ScrollBegin();
++  client.SetViewportScrollOffset(0.f, 20.f);
++  client.SetCurrentBrowserControlsShownRatio(0.f, 0.f);
++  manager->ScrollEnd(gfx::Vector2dF(0.f, -90.f));
++  EXPECT_FALSE(manager->HasAnimation());
++
++  // A partially visible band ordinarily would settle fully shown.
++  client.SetCurrentBrowserControlsShownRatio(0.75f, 0.75f);
++  manager->ScrollEnd(gfx::Vector2dF());
++  const base::TimeTicks start = base::TimeTicks::Now();
++  manager->Animate(start);
++  manager->Animate(start + base::Seconds(1));
++  EXPECT_FLOAT_EQ(0.f, manager->TopControlsShownRatio());
++}
++
++TEST_F(BrowserControlsOffsetManagerTest, RevealStopsIfPageLeavesTop) {
++  MockBrowserControlsOffsetManagerClient client(100.f, 0.5f, 0.5f);
++  client.SetBrowserControlsParams(
++      {100.f, 0, 0, 0, false, false,
++       /*only_expand_top_controls_at_page_top=*/true});
++  auto* manager = client.manager();
++  manager->ScrollBegin();
++  client.SetCurrentBrowserControlsShownRatio(0.75f, 0.75f);
++  manager->ScrollEnd(gfx::Vector2dF());
++  ASSERT_TRUE(manager->HasAnimation());
++
++  const base::TimeTicks start = base::TimeTicks::Now();
++  manager->Animate(start);
++  manager->Animate(start + base::Milliseconds(5));
++  EXPECT_GT(manager->TopControlsShownRatio(), 0.75f);
++
++  client.SetViewportScrollOffset(0.f, 20.f);
++  EXPECT_TRUE(manager->Animate(start + base::Milliseconds(10)).IsZero());
++  EXPECT_FALSE(manager->HasAnimation());
++  EXPECT_FLOAT_EQ(0.f, manager->TopControlsShownRatio());
++}
++
+ // Tests that if the min-height changes while we're animating to the previous
+ // min-height, the animation gets updated to end at the new value.
+ TEST_F(BrowserControlsOffsetManagerTest, MinHeightChangeUpdatesAnimation) {
+diff --git a/cc/layers/viewport.cc b/cc/layers/viewport.cc
+index 8440829552a723efbb49d72d4759137b4ee1ca5a..b8b281034aaa630a046263273655f0c580b27d65 100644
+--- a/cc/layers/viewport.cc
++++ b/cc/layers/viewport.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/check.h"
+ #include "base/memory/ptr_util.h"
++#include "build/build_config.h"
+ #include "cc/input/browser_controls_offset_manager_interface.h"
+ #include "cc/input/snap_selection_strategy.h"
+ #include "cc/trees/layer_tree_host_impl.h"
+@@ -238,8 +239,24 @@ Viewport::ScrollResult Viewport::ScrollAnimated(const gfx::Vector2dF& delta,
+   return result;
+ }
+ 
++gfx::PointF Viewport::PinchAnchorInPage(const gfx::Point& anchor) const {
++  gfx::PointF point(anchor);
++#if BUILDFLAG(IS_IOS)
++  // A pinch arrives in widget space and needs the active compositor offset,
++  // even if the browser has not yet received that frame's metadata.
++  point.Offset(0.f,
++               -host_impl_->browser_controls_manager()->ContentTopOffset());
++#endif
++  return point;
++}
++
+ void Viewport::SnapPinchAnchorIfWithinMargin(const gfx::Point& anchor) {
+-  gfx::SizeF viewport_size = gfx::SizeF(InnerScrollNode()->container_bounds);
++#if BUILDFLAG(IS_IOS)
++  const gfx::SizeF viewport_size(
++      scroll_tree().container_bounds(InnerScrollNode()->id));
++#else
++  const gfx::SizeF viewport_size(InnerScrollNode()->container_bounds);
++#endif
+ 
+   if (anchor.x() < kPinchZoomSnapMarginDips)
+     pinch_anchor_adjustment_.set_x(-anchor.x());
+@@ -254,12 +271,13 @@ void Viewport::SnapPinchAnchorIfWithinMargin(const gfx::Point& anchor) {
+ 
+ void Viewport::PinchUpdate(float magnify_delta, const gfx::Point& anchor) {
+   DCHECK(InnerScrollNode());
++  const gfx::PointF anchor_in_page = PinchAnchorInPage(anchor);
+   if (!pinch_zoom_active_) {
+     // If this is the first pinch update and the pinch is within a margin-
+     // length of the screen edge, offset all updates by the amount so that we
+     // effectively snap the pinch zoom to the edge of the screen. This makes it
+     // easy to zoom in on position: fixed elements.
+-    SnapPinchAnchorIfWithinMargin(anchor);
++    SnapPinchAnchorIfWithinMargin(gfx::ToRoundedPoint(anchor_in_page));
+ 
+     pinch_zoom_active_ = true;
+   }
+@@ -268,14 +286,15 @@ void Viewport::PinchUpdate(float magnify_delta, const gfx::Point& anchor) {
+ 
+   // Keep the center-of-pinch anchor specified by (x, y) in a stable
+   // position over the course of the magnify.
+-  gfx::Point adjusted_anchor = anchor + pinch_anchor_adjustment_;
++  const gfx::PointF adjusted_anchor =
++      anchor_in_page + gfx::Vector2dF(pinch_anchor_adjustment_);
+   float page_scale = active_tree->current_page_scale_factor();
+   gfx::PointF previous_scale_anchor =
+-      gfx::ScalePoint(gfx::PointF(adjusted_anchor), 1.f / page_scale);
++      gfx::ScalePoint(adjusted_anchor, 1.f / page_scale);
+   active_tree->SetPageScaleOnActiveTree(page_scale * magnify_delta);
+   page_scale = active_tree->current_page_scale_factor();
+   gfx::PointF new_scale_anchor =
+-      gfx::ScalePoint(gfx::PointF(adjusted_anchor), 1.f / page_scale);
++      gfx::ScalePoint(adjusted_anchor, 1.f / page_scale);
+   gfx::Vector2dF move = previous_scale_anchor - new_scale_anchor;
+ 
+   // Scale back to viewport space since that's the coordinate space ScrollBy
+@@ -304,7 +323,7 @@ void Viewport::PinchEnd(const gfx::Point& anchor, bool snap_to_min) {
+     if (page_scale < min_scale * kMaxZoomForSnapToMin &&
+         page_scale != min_scale) {
+       gfx::PointF adjusted_anchor =
+-          gfx::PointF(anchor + pinch_anchor_adjustment_);
++          PinchAnchorInPage(anchor) + gfx::Vector2dF(pinch_anchor_adjustment_);
+       adjusted_anchor =
+           gfx::ScalePoint(adjusted_anchor, min_scale / page_scale);
+       adjusted_anchor += TotalScrollOffset().OffsetFromOrigin();
+diff --git a/cc/layers/viewport.h b/cc/layers/viewport.h
+index eabf1057063bc3823f2e3f654c609ecc6ffeafd5..a8ef31ab1f4e41606ce7e35e2166c19645f94a8d 100644
+--- a/cc/layers/viewport.h
++++ b/cc/layers/viewport.h
+@@ -124,6 +124,7 @@ class CC_EXPORT Viewport {
+   ScrollNode* OuterScrollNode() const;
+   ScrollTree& scroll_tree() const;
+ 
++  gfx::PointF PinchAnchorInPage(const gfx::Point& anchor) const;
+   void SnapPinchAnchorIfWithinMargin(const gfx::Point& anchor);
+ 
+   raw_ptr<LayerTreeHostImpl> host_impl_;
+diff --git a/cc/trees/commit_state.h b/cc/trees/commit_state.h
+index 0fd6e14161a0b26a581ae3e93c3a64b138ba8890..0f79378088d9a977a6585df2fe962b646fe55051 100644
+--- a/cc/trees/commit_state.h
++++ b/cc/trees/commit_state.h
+@@ -121,6 +121,9 @@ struct CC_EXPORT CommitState {
+   // The number of SurfaceLayers that have (fallback,primary) set to
+   // viz::SurfaceRange.
+   bool clear_caches_on_next_commit = false;
++  // Whether `top_controls_shown_ratio` replaces impl-side deltas and
++  // animations instead of being merged with them.
++  bool reset_browser_controls_shown_ratio = false;
+   // Whether we have a pending request to force send RenderFrameMetadata with
+   // the next frame.
+   bool force_send_metadata_request = false;
+diff --git a/cc/trees/layer_tree_host.cc b/cc/trees/layer_tree_host.cc
+index c8e94dc12447c42d0b6b73b8743dcf898c5010ed..fdc5b2f569bf52a93d754635813b37f8ca920e08 100644
+--- a/cc/trees/layer_tree_host.cc
++++ b/cc/trees/layer_tree_host.cc
+@@ -1647,6 +1647,14 @@ void LayerTreeHost::SetBrowserControlsShownRatio(float top_ratio,
+   SetNeedsCommit();
+ }
+ 
++void LayerTreeHost::ResetBrowserControlsShownRatio(float top_ratio,
++                                                   float bottom_ratio) {
++  pending_commit_state()->top_controls_shown_ratio = top_ratio;
++  pending_commit_state()->bottom_controls_shown_ratio = bottom_ratio;
++  pending_commit_state()->reset_browser_controls_shown_ratio = true;
++  SetNeedsCommit();
++}
++
+ void LayerTreeHost::SetOverscrollBehavior(const OverscrollBehavior& behavior) {
+   if (pending_commit_state()->overscroll_behavior == behavior)
+     return;
+diff --git a/cc/trees/layer_tree_host.h b/cc/trees/layer_tree_host.h
+index 4efb83ca950bc18f9ab322afe293d0f77b4034a8..756fe8885aeb3d09efe2ca45de60a5930c4e2fe7 100644
+--- a/cc/trees/layer_tree_host.h
++++ b/cc/trees/layer_tree_host.h
+@@ -606,6 +606,9 @@ class CC_EXPORT LayerTreeHost : public MutatorHostDelegate {
+ 
+   void SetBrowserControlsParams(const BrowserControlsParams& params);
+   void SetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
++  // Like SetBrowserControlsShownRatio(), but the committed ratio also clears
++  // impl-thread deltas and animations, e.g. for a newly committed document.
++  void ResetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
+ 
+   void SetOverscrollBehavior(const OverscrollBehavior& overscroll_behavior);
+   const OverscrollBehavior& overscroll_behavior() const {
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index eafe6523f3dae3a124c9e2cc2f288833f3496ff1..1b37c344079994b8f10fda0c5ae6eaab5f499412 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -4691,11 +4691,21 @@ float LayerTreeHostImpl::CurrentBottomControlsShownRatio() const {
+ }
+ 
+ gfx::PointF LayerTreeHostImpl::ViewportScrollOffset() const {
+-  return viewport_->TotalScrollOffset();
++  gfx::PointF offset = viewport_->TotalScrollOffset();
++#if BUILDFLAG(IS_IOS)
++  // Curium's controls compare this distance with a widget-space scroll
++  // delta. Apply page scale so a zoomed page still reaches zero first.
++  offset.Scale(active_tree_->page_scale_factor_for_scroll());
++#endif
++  return offset;
+ }
+ 
+ float LayerTreeHostImpl::MaxViewportScrollOffsetY() const {
+-  return viewport_->MaxUserReachableTotalScrollOffsetY();
++  float offset = viewport_->MaxUserReachableTotalScrollOffsetY();
++#if BUILDFLAG(IS_IOS)
++  offset *= active_tree_->page_scale_factor_for_scroll();
++#endif
++  return offset;
+ }
+ 
+ void LayerTreeHostImpl::AutoScrollAnimationCreate(
+diff --git a/cc/trees/layer_tree_impl.cc b/cc/trees/layer_tree_impl.cc
+index edb92bc442b3f73c8f9f10882159c67f28506666..17e79dafa5137f91c1de78c1c7da53e372ae7c5e 100644
+--- a/cc/trees/layer_tree_impl.cc
++++ b/cc/trees/layer_tree_impl.cc
+@@ -936,6 +936,17 @@ void LayerTreeImpl::PullLayerTreePropertiesFrom(CommitState& commit_state) {
+ 
+   SetBrowserControlsParams(commit_state.browser_controls_params);
+   set_overscroll_behavior(commit_state.overscroll_behavior);
++  if (commit_state.reset_browser_controls_shown_ratio) {
++    // Drop impl deltas made against the previous ratio so activation shows
++    // exactly the committed one.
++    top_controls_shown_ratio_->set_clobber_active_value();
++    bottom_controls_shown_ratio_->set_clobber_active_value();
++    if (IsActiveTree()) {
++      host_impl_->browser_controls_manager()->ResetAnimations();
++    } else {
++      reset_browser_controls_on_activation_ = true;
++    }
++  }
+   PushBrowserControlsFromMainThread(commit_state.top_controls_shown_ratio,
+                                     commit_state.bottom_controls_shown_ratio);
+ 
+@@ -1061,6 +1072,11 @@ void LayerTreeImpl::PushPropertiesTo(LayerTreeImpl* target_tree) {
+   target_tree->SetExternalPageScaleFactor(external_page_scale_factor_);
+ 
+   target_tree->SetBrowserControlsParams(browser_controls_params_);
++  if (reset_browser_controls_on_activation_) {
++    // An animation running on the active tree would overwrite the ratio.
++    host_impl_->browser_controls_manager()->ResetAnimations();
++    reset_browser_controls_on_activation_ = false;
++  }
+   target_tree->PushBrowserControls(nullptr, nullptr);
+ 
+   target_tree->set_overscroll_behavior(overscroll_behavior_);
+diff --git a/cc/trees/layer_tree_impl.h b/cc/trees/layer_tree_impl.h
+index 8844b2786ef57da59ed57eabf8011f373cff7aab..81143cf750a80f3e11fb46b1296fe803355ec8d7 100644
+--- a/cc/trees/layer_tree_impl.h
++++ b/cc/trees/layer_tree_impl.h
+@@ -1065,6 +1065,8 @@ class CC_EXPORT LayerTreeImpl {
+   // shown).
+   scoped_refptr<SyncedBrowserControls> top_controls_shown_ratio_;
+   scoped_refptr<SyncedBrowserControls> bottom_controls_shown_ratio_;
++  // Set on a pending tree whose committed shown ratio replaces impl state.
++  bool reset_browser_controls_on_activation_ = false;
+ 
+   std::unique_ptr<PendingPageScaleAnimation> pending_page_scale_animation_;
+ 
+diff --git a/components/input/input_router_client.h b/components/input/input_router_client.h
+index 90cfa9056373141a20f2e86e43e33c0c0b1e5cbd..cd35254983598d79223ef7e9c28bba82fffd7830 100644
+--- a/components/input/input_router_client.h
++++ b/components/input/input_router_client.h
+@@ -122,6 +122,11 @@ class COMPONENT_EXPORT(INPUT) InputRouterClient {
+   // Returns the size of visible viewport in screen space, in DIPs.
+   virtual gfx::Size GetRootWidgetViewportSize() = 0;
+ 
++  // [ios-blink-sideload] The band Curium draws above this widget's page, in
++  // DIPs. A root touchpad pinch carries a native point for cc's zoom anchor;
++  // its synthetic Ctrl-wheel subtracts this to reach the page content.
++  virtual float GetPresentedTopControlsOffset() { return 0.f; }
++
+   // Called when an invalid input event source is sent from the renderer.
+   virtual void OnInvalidInputEventSource() = 0;
+ 
+diff --git a/components/input/input_router_impl.cc b/components/input/input_router_impl.cc
+index d0140d4a01cb3d3e6487c03ae7a82166b0363d75..0c0be8d7c74ec348e0e8159bc13e2c0d65ec08bc 100644
+--- a/components/input/input_router_impl.cc
++++ b/components/input/input_router_impl.cc
+@@ -34,6 +34,7 @@
+ #include "ui/events/blink/web_input_event_traits.h"
+ #include "ui/events/event.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
++#include "ui/gfx/geometry/vector2d_f.h"
+ #include "ui/latency/latency_info.h"
+ 
+ namespace input {
+@@ -617,10 +618,16 @@ void InputRouterImpl::SendMouseWheelEventForPinchImmediately(
+   // be used for notifying about synthetic wheel event.
+   std::move(dispatch_callback)
+       .Run(pinch_event, DispatchToRendererResult::kNotDispatched);
++  // The pinch keeps its native point for cc; content sees the wheel where
++  // the page is drawn.
++  MouseWheelEventWithLatencyInfo wheel_event(event);
++  wheel_event.event.SetPositionInWidget(
++      wheel_event.event.PositionInWidget() -
++      gfx::Vector2dF(0.f, client_->GetPresentedTopControlsOffset()));
+   {
+     ScopedDispatchToRendererCallback wheel_dispatch_callback(
+         client_->GetDispatchToRendererCallback());
+-    SendMouseWheelEventImmediately(event, std::move(callback),
++    SendMouseWheelEventImmediately(wheel_event, std::move(callback),
+                                    wheel_dispatch_callback.callback);
+   }
+ }
+diff --git a/components/input/render_input_router.cc b/components/input/render_input_router.cc
+index f50634d22e0b0f78a88b6e3333fe1198773167e4..15ed885238619ec92dca06fc651f498fc21ecd00 100644
+--- a/components/input/render_input_router.cc
++++ b/components/input/render_input_router.cc
+@@ -338,6 +338,10 @@ void RenderInputRouter::RequestMouseLock(
+       from_user_gesture, unadjusted_movement, std::move(response));
+ }
+ 
++float RenderInputRouter::GetPresentedTopControlsOffset() {
++  return view_input_ ? view_input_->GetPresentedTopControlsOffset() : 0.f;
++}
++
+ gfx::Size RenderInputRouter::GetRootWidgetViewportSize() {
+   if (!view_input_) {
+     return gfx::Size();
+diff --git a/components/input/render_input_router.h b/components/input/render_input_router.h
+index b326f67b723f2b336e1dace8c390bdae820e4d58..6df9c03a7559c1a9ef1d363499da207959d9922d 100644
+--- a/components/input/render_input_router.h
++++ b/components/input/render_input_router.h
+@@ -111,6 +111,7 @@ class COMPONENT_EXPORT(INPUT) RenderInputRouter
+       bool unadjusted_movement,
+       InputRouterImpl::RequestMouseLockCallback response) override;
+   gfx::Size GetRootWidgetViewportSize() override;
++  float GetPresentedTopControlsOffset() override;
+   void OnUnconfirmedTapConvertedToTap() override;
+   void OnInputRouterActive() override;
+ 
+diff --git a/components/input/render_widget_host_input_event_router.cc b/components/input/render_widget_host_input_event_router.cc
+index c8e5f074657d0f5fb659bed188e43b9c1b897dc0..5411a4a66e9bc8da9afc8f2ae7db0cab09cd6984 100644
+--- a/components/input/render_widget_host_input_event_router.cc
++++ b/components/input/render_widget_host_input_event_router.cc
+@@ -31,6 +31,7 @@
+ #include "ui/base/cursor/cursor.h"
+ #include "ui/base/mojom/menu_source_type.mojom-forward.h"
+ #include "ui/gfx/geometry/dip_util.h"
++#include "ui/gfx/geometry/vector2d_f.h"
+ 
+ namespace {
+ 
+@@ -1655,6 +1656,17 @@ bool RenderWidgetHostInputEventRouter::ViewMapIsEmpty() const {
+ 
+ namespace {
+ 
++// Native views send pinches in widget space so cc can anchor them with its
++// live band offset. Everything else in the browser needs page space.
++gfx::PointF PinchPointInPage(RenderWidgetHostViewInput* root,
++                             const blink::WebGestureEvent& event) {
++  gfx::PointF point = event.PositionInWidget();
++  if (blink::WebInputEvent::IsPinchGestureEventType(event.GetType())) {
++    point.Offset(0.f, -root->GetPresentedTopControlsOffset());
++  }
++  return point;
++}
++
+ bool IsPinchCurrentlyAllowedInTarget(RenderWidgetHostViewInput* target) {
+   std::optional<cc::TouchAction> target_active_touch_action(
+       cc::TouchAction::kNone);
+@@ -1688,6 +1700,14 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+       "type", blink::WebInputEvent::GetName(gesture_event.GetType()), "target",
+       static_cast<const void*>(target));
+ 
++  // Only the root compositor will subtract its own current band offset.
++  const gfx::PointF point_in_page = PinchPointInPage(root_view, gesture_event);
++  const auto event_in_page = [&] {
++    blink::WebGestureEvent event(gesture_event);
++    event.SetPositionInWidget(point_in_page);
++    return event;
++  };
++
+   if (gesture_event.GetType() ==
+       blink::WebInputEvent::Type::kGestureScrollBegin) {
+     if (!embedded_touchscreen_pinch_in_progress_) {
+@@ -1714,7 +1734,7 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+         if (!rir->is_in_touchscreen_gesture_scroll()) {
+           SendGestureScrollBegin(
+               pinch_zoom_target,
+-              GestureEventInTarget(gesture_event, pinch_zoom_target));
++              GestureEventInTarget(event_in_page(), pinch_zoom_target));
+           embedded_touchscreen_pinch_needs_wrapping_scroll_sequence_ = true;
+         }
+       }
+@@ -1739,7 +1759,7 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+         // not already started in the root from scroll bubbling, then we need
+         // to wrap the diverted pinch events in a GestureScrollBegin/End.
+         DCHECK(!rir->is_in_touchscreen_gesture_scroll());
+-        SendGestureScrollBegin(root_view, gesture_event);
++        SendGestureScrollBegin(root_view, event_in_page());
+       }
+ 
+       touchscreen_pinch_state_.DidStartPinchInChild();
+@@ -1760,14 +1780,14 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+ 
+     ScopedInputDispatchPin pin(pinch_zoom_target);
+     pinch_zoom_target->ProcessGestureEvent(
+-        GestureEventInTarget(gesture_event, pinch_zoom_target), latency);
++        GestureEventInTarget(event_in_page(), pinch_zoom_target), latency);
+ 
+     if (gesture_event.GetType() ==
+         blink::WebInputEvent::Type::kGesturePinchEnd) {
+       if (embedded_touchscreen_pinch_needs_wrapping_scroll_sequence_) {
+         SendGestureScrollEnd(
+             pinch_zoom_target,
+-            GestureEventInTarget(gesture_event, pinch_zoom_target));
++            GestureEventInTarget(event_in_page(), pinch_zoom_target));
+       }
+       embedded_touchscreen_pinch_in_progress_ = false;
+       embedded_touchscreen_pinch_needs_wrapping_scroll_sequence_ = false;
+@@ -1788,7 +1808,7 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+       if (send_scroll_end) {
+         auto* rir = root_view->GetViewRenderInputRouter();
+         DCHECK(rir->is_in_touchscreen_gesture_scroll());
+-        SendGestureScrollEnd(root_view, gesture_event);
++        SendGestureScrollEnd(root_view, event_in_page());
+       }
+     }
+ 
+@@ -1899,7 +1919,12 @@ void RenderWidgetHostInputEventRouter::DispatchTouchscreenGestureEvent(
+   // |gesture_event.unique_touch_event_id == 0| or
+   // |no_matching_id && is_gesture_start|, we did actually do hit testing in
+   // these two cases. |target_location| pass in maybe wrong in other cases.
+-  if (fallback_target_location) {
++  if (touchscreen_gesture_target_.get() != root_view &&
++      point_in_page != gesture_event.PositionInWidget()) {
++    point_in_target =
++        touchscreen_gesture_target_->TransformRootPointToViewCoordSpace(
++            point_in_page);
++  } else if (fallback_target_location) {
+     point_in_target = fallback_target_location.value();
+   } else {
+     point_in_target =
+@@ -1967,7 +1992,11 @@ void RenderWidgetHostInputEventRouter::RouteTouchpadGestureEvent(
+     const blink::WebGestureEvent* event,
+     const ui::LatencyInfo& latency) {
+   DCHECK_EQ(blink::WebGestureDevice::kTouchpad, event->SourceDevice());
+-  event_targeter_->FindTargetAndDispatch(root_view, *event, latency);
++  // Target in page space, so the synchronous lookup and an asynchronous
++  // renderer hit test both see the same point.
++  blink::WebGestureEvent event_in_page(*event);
++  event_in_page.SetPositionInWidget(PinchPointInPage(root_view, *event));
++  event_targeter_->FindTargetAndDispatch(root_view, event_in_page, latency);
+ }
+ 
+ void RenderWidgetHostInputEventRouter::DispatchTouchpadGestureEvent(
+@@ -2043,7 +2072,14 @@ void RenderWidgetHostInputEventRouter::DispatchTouchpadGestureEvent(
+   ScopedInputDispatchPin pin(touchpad_gesture_target_);
+   blink::WebGestureEvent gesture_event = touchpad_gesture_event;
+   gfx::PointF point_in_target;
+-  if (target_location) {
++  if (touchpad_gesture_target_ == root_view &&
++      blink::WebInputEvent::IsPinchGestureEventType(gesture_event.GetType())) {
++    // Only the root compositor's zoom anchor uses the native point. Its
++    // synthetic Ctrl-wheel maps back to page space in InputRouterImpl.
++    point_in_target =
++        gesture_event.PositionInWidget() +
++        gfx::Vector2dF(0.f, root_view->GetPresentedTopControlsOffset());
++  } else if (target_location) {
+     point_in_target = target_location.value();
+   } else {
+     point_in_target =
+diff --git a/components/input/render_widget_host_view_input.h b/components/input/render_widget_host_view_input.h
+index ba296119b9bc35be415fa9fad4ea44ecc3eae774..dc74f207c0dd53cf616b06573e1daf4b17f3d400 100644
+--- a/components/input/render_widget_host_view_input.h
++++ b/components/input/render_widget_host_view_input.h
+@@ -104,6 +104,10 @@ class COMPONENT_EXPORT(INPUT) RenderWidgetHostViewInput
+   // originating in this view. Defaults to the root view.
+   virtual RenderWidgetHostViewInput* GetPinchZoomTarget();
+ 
++  // The top-controls band above the page frame on screen, in DIPs. Native
++  // points minus this offset are page points; cc anchors root pinches itself.
++  virtual float GetPresentedTopControlsOffset() const { return 0.f; }
++
+   // Obtains the root window FrameSinkId.
+   virtual viz::FrameSinkId GetRootFrameSinkId();
+ 
+diff --git a/components/viz/common/BUILD.gn b/components/viz/common/BUILD.gn
+index cf97a6d7228cb591ca3ab7651846396c33ccc35d..e7f5d98c67a838257d72570042d632b61c50a0f9 100644
+--- a/components/viz/common/BUILD.gn
++++ b/components/viz/common/BUILD.gn
+@@ -231,6 +231,8 @@ viz_component("common") {
+     sources += [
+       "frame_sinks/external_begin_frame_source_ios.h",
+       "frame_sinks/external_begin_frame_source_ios.mm",
++      "frame_sinks/presented_top_controls_offset_ios.cc",
++      "frame_sinks/presented_top_controls_offset_ios.h",
+     ]
+ 
+     frameworks = [ "CoreGraphics.framework" ]
+diff --git a/components/viz/common/frame_sinks/presented_top_controls_offset_ios.cc b/components/viz/common/frame_sinks/presented_top_controls_offset_ios.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..51ecaa348badfce3d2875cbdee707ab2a035259c
+--- /dev/null
++++ b/components/viz/common/frame_sinks/presented_top_controls_offset_ios.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/viz/common/frame_sinks/presented_top_controls_offset_ios.h"
++
++#include "base/containers/flat_map.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++
++namespace viz {
++
++namespace {
++
++// Viz writes on its compositor thread and the browser reads on the UI thread,
++// both inside the one Curium process.
++struct Registry {
++  base::Lock lock;
++  base::flat_map<FrameSinkId, PresentedTopControlsOffset> offsets
++      GUARDED_BY(lock);
++};
++
++Registry& GetRegistry() {
++  static base::NoDestructor<Registry> registry;
++  return *registry;
++}
++
++}  // namespace
++
++void SetPresentedTopControlsOffset(const FrameSinkId& frame_sink_id,
++                                   const PresentedTopControlsOffset& offset) {
++  Registry& registry = GetRegistry();
++  base::AutoLock lock(registry.lock);
++  // Presentation feedback for one frame sink arrives in presentation order.
++  registry.offsets.insert_or_assign(frame_sink_id, offset);
++}
++
++PresentedTopControlsOffset GetPresentedTopControlsOffset(
++    const FrameSinkId& frame_sink_id) {
++  Registry& registry = GetRegistry();
++  base::AutoLock lock(registry.lock);
++  auto it = registry.offsets.find(frame_sink_id);
++  return it == registry.offsets.end() ? PresentedTopControlsOffset()
++                                      : it->second;
++}
++
++void ClearPresentedTopControlsOffset(const FrameSinkId& frame_sink_id) {
++  Registry& registry = GetRegistry();
++  base::AutoLock lock(registry.lock);
++  registry.offsets.erase(frame_sink_id);
++}
++
++}  // namespace viz
+diff --git a/components/viz/common/frame_sinks/presented_top_controls_offset_ios.h b/components/viz/common/frame_sinks/presented_top_controls_offset_ios.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e6eee5217b31cff7867bd8c6b6504777751108b
+--- /dev/null
++++ b/components/viz/common/frame_sinks/presented_top_controls_offset_ios.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_VIZ_COMMON_FRAME_SINKS_PRESENTED_TOP_CONTROLS_OFFSET_IOS_H_
++#define COMPONENTS_VIZ_COMMON_FRAME_SINKS_PRESENTED_TOP_CONTROLS_OFFSET_IOS_H_
++
++#include <cstdint>
++
++#include "components/viz/common/surfaces/frame_sink_id.h"
++#include "components/viz/common/viz_common_export.h"
++
++namespace viz {
++
++// [ios-blink-sideload] Curium draws the page below its floating top controls
++// at the offset carried by each compositor frame. Viz records that offset when
++// the frame is presented; the browser reads it on the UI thread so a touch or
++// a selection handle maps to the content the user can actually see.
++struct PresentedTopControlsOffset {
++  uint32_t frame_token = 0;
++  float offset_dips = 0.f;
++};
++
++VIZ_COMMON_EXPORT void SetPresentedTopControlsOffset(
++    const FrameSinkId& frame_sink_id,
++    const PresentedTopControlsOffset& offset);
++
++// Returns a zero offset until a frame from `frame_sink_id` is presented.
++VIZ_COMMON_EXPORT PresentedTopControlsOffset
++GetPresentedTopControlsOffset(const FrameSinkId& frame_sink_id);
++
++VIZ_COMMON_EXPORT void ClearPresentedTopControlsOffset(
++    const FrameSinkId& frame_sink_id);
++
++}  // namespace viz
++
++#endif  // COMPONENTS_VIZ_COMMON_FRAME_SINKS_PRESENTED_TOP_CONTROLS_OFFSET_IOS_H_
+diff --git a/components/viz/service/display/surface_aggregator.cc b/components/viz/service/display/surface_aggregator.cc
+index 45b6bfb1d41137370667c328f154aebcbadb552c..4eb30c3becdb96b5cd6a11f0c24032ee2498d95c 100644
+--- a/components/viz/service/display/surface_aggregator.cc
++++ b/components/viz/service/display/surface_aggregator.cc
+@@ -23,6 +23,7 @@
+ #include "base/task/common/task_annotator.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
++#include "build/build_config.h"
+ #include "cc/base/math_util.h"
+ #include "components/viz/common/features.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+@@ -153,6 +154,22 @@ struct MaskFilterInfoExt {
+ 
+ namespace {
+ 
++float EmbeddedTopControlsOffset(const ResolvedFrameData& frame) {
++#if BUILDFLAG(IS_IOS)
++  // Curium's native view stays fixed. Move the embedded page using the
++  // offset from the same active frame whose quads we are aggregating.
++  if (frame.is_valid()) {
++    const float offset =
++        frame.GetMetadata().top_controls_visible_height.value_or(0.f);
++    if (std::isfinite(offset)) {
++      return std::clamp(offset, 0.f,
++                        static_cast<float>(frame.size_in_pixels().height()));
++    }
++  }
++#endif
++  return 0.f;
++}
++
+ // Used for determine when to treat opacity close to 1.f as opaque. The value is
+ // chosen to be smaller than 1/255.
+ constexpr float kOpacityEpsilon = 0.001f;
+@@ -857,6 +874,11 @@ void SurfaceAggregator::EmitSurfaceContent(
+   scaled_quad_to_target_transform.Scale(extra_content_scale_x,
+                                         extra_content_scale_y);
+ 
++  const float page_offset = EmbeddedTopControlsOffset(resolved_frame);
++  if (page_offset > 0.f) {
++    scaled_quad_to_target_transform.Translate(0.f, page_offset);
++  }
++
+   const auto& frame_metadata = resolved_frame.GetMetadata();
+   flow_ids_for_resolved_frames_.insert(frame_metadata.begin_frame_ack.trace_id);
+ 
+@@ -1072,7 +1094,12 @@ void SurfaceAggregator::EmitSurfaceContent(
+         render_pass_rect_transform.MapRect(surface_quad_sqs->quad_layer_rect),
+         render_pass_rect_transform.MapRect(
+             surface_quad_sqs->visible_quad_layer_rect),
+-        added_clip_rect, mask_filter_info, dest_pass);
++        page_offset > 0.f
++            ? CalculateClipRect(added_clip_rect,
++                                ComputeDrawableRectForQuad(surface_quad),
++                                target_transform)
++            : added_clip_rect,
++        mask_filter_info, dest_pass);
+ 
+     // At this point, we need to calculate three values in order to construct
+     // the CompositorRenderPassDrawQuad:
+@@ -1771,6 +1798,8 @@ gfx::Rect SurfaceAggregator::PrewalkRenderPass(
+         // loose here, so for those quads passed this condition but eventually
+         // don't merge, there is over-contribution of the damage passed from
+         // parent, but this shouldn't affect correctness.
++        const float page_offset =
++            EmbeddedTopControlsOffset(*child_resolved_frame);
+         gfx::Rect accumulated_damage_in_child_space;
+ 
+         if (CanPotentiallyMergePass(*surface_quad)) {
+@@ -1782,6 +1811,9 @@ gfx::Rect SurfaceAggregator::PrewalkRenderPass(
+                 quad->shared_quad_state->quad_to_target_transform
+                     .GetCheckedInverse();
+             inverse.PostScale(SK_Scalar1 / x_scale, SK_Scalar1 / y_scale);
++            if (page_offset > 0.f) {
++              inverse.PostTranslate(0.f, -page_offset);
++            }
+             accumulated_damage_in_child_space =
+                 cc::MathUtil::ProjectEnclosingClippedRect(
+                     inverse, accumulated_damage_in_child_space);
+@@ -1790,6 +1822,14 @@ gfx::Rect SurfaceAggregator::PrewalkRenderPass(
+         gfx::Rect child_rect =
+             PrewalkSurface(*child_resolved_frame, &resolved_pass,
+                            accumulated_damage_in_child_space, result);
++        if (page_offset > 0.f && !child_rect.IsEmpty()) {
++          gfx::RectF shifted_damage(child_rect);
++          shifted_damage.Offset(0.f, page_offset);
++          shifted_damage.Scale(x_scale, y_scale);
++          quad_damage_rect.Union(gfx::ToEnclosingRect(shifted_damage));
++        }
++        // Also damage the unshifted footprint. cc sends full viewport damage
++        // when the band moves, including the pixels newly exposed above it.
+         child_rect = gfx::ScaleToEnclosingRect(child_rect, x_scale, y_scale);
+         quad_damage_rect.Union(child_rect);
+       }
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+index 58af94d026761fc06831af38a11c523de8f9e6b6..9363370c7d7a4ae1af9de5209ddc1f4569811acf 100644
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.cc
+@@ -5,6 +5,7 @@
+ #include "components/viz/service/frame_sinks/compositor_frame_sink_support.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <limits>
+ #include <string>
+ #include <utility>
+@@ -34,6 +35,9 @@
+ #include "components/viz/common/features.h"
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "components/viz/common/frame_sinks/begin_frame_source.h"
++#if BUILDFLAG(IS_IOS)
++#include "components/viz/common/frame_sinks/presented_top_controls_offset_ios.h"
++#endif
+ #include "components/viz/common/quads/compositor_frame.h"
+ #include "components/viz/common/quads/compositor_frame_metadata.h"
+ #include "components/viz/common/quads/compositor_render_pass.h"
+@@ -203,6 +207,10 @@ CompositorFrameSinkSupport::~CompositorFrameSinkSupport() {
+       bundle->RemoveFrameSink(this);
+     }
+   }
++
++#if BUILDFLAG(IS_IOS)
++  ClearPresentedTopControlsOffset(frame_sink_id_);
++#endif
+ }
+ 
+ FrameTimingDetailsMap CompositorFrameSinkSupport::TakeFrameTimingDetailsMap() {
+@@ -815,6 +823,22 @@ SubmitResult CompositorFrameSinkSupport::MaybeSubmitCompositorFrame(
+           now_time, frame.metadata.trees_in_viz_timing_details,
+           surface_manager_));
+ 
++#if BUILDFLAG(IS_IOS)
++  if (!is_root_) {
++    // [ios-blink-sideload] Mirror SurfaceAggregator, which embeds this frame
++    // at its own top-controls offset, so the presented offset matches pixels.
++    const float scale = frame.metadata.device_scale_factor;
++    const float offset =
++        frame.metadata.top_controls_visible_height.value_or(0.f);
++    pending_top_controls_offsets_[frame.metadata.frame_token] =
++        std::isfinite(offset) && scale > 0.f
++            ? std::clamp(offset, 0.f,
++                         static_cast<float>(frame.size_in_pixels().height())) /
++                  scale
++            : 0.f;
++  }
++#endif
++
+   // Override the has_damage flag (ignoring invalid data from clients).
+   frame.metadata.begin_frame_ack.has_damage = true;
+ 
+@@ -1139,6 +1163,18 @@ void CompositorFrameSinkSupport::DidPresentCompositorFrame(
+ 
+   pending_received_frame_times_.erase(received_frame_timestamp);
+ 
++#if BUILDFLAG(IS_IOS)
++  if (auto offset = pending_top_controls_offsets_.find(frame_token);
++      offset != pending_top_controls_offsets_.end()) {
++    // A failed frame never reached the screen; keep the previous offset.
++    if (!feedback.failed()) {
++      SetPresentedTopControlsOffset(frame_sink_id_,
++                                    {frame_token, offset->second});
++    }
++    pending_top_controls_offsets_.erase(offset);
++  }
++#endif
++
+   // We should only ever get one PresentationFeedback per frame_token.
+   CHECK(!frame_timing_details_.contains(frame_token));
+   frame_timing_details_.emplace(frame_token, details);
+diff --git a/components/viz/service/frame_sinks/compositor_frame_sink_support.h b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+index 78659653c9b8d0c1dbcaa93dfd8c42fd74744a5e..5282e73cd94bbad1bbbd3c07b3baf06b2bdbfbd5 100644
+--- a/components/viz/service/frame_sinks/compositor_frame_sink_support.h
++++ b/components/viz/service/frame_sinks/compositor_frame_sink_support.h
+@@ -12,12 +12,14 @@
+ #include <vector>
+ 
+ #include "base/containers/circular_deque.h"
++#include "base/containers/flat_map.h"
+ #include "base/containers/flat_set.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/read_only_shared_memory_region.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "components/viz/common/frame_sinks/begin_frame_source.h"
+ #include "components/viz/common/frame_timing_details_map.h"
+ #include "components/viz/common/quads/compositor_frame.h"
+@@ -528,6 +530,11 @@ class VIZ_SERVICE_EXPORT CompositorFrameSinkSupport
+   // in OnSurfacePresented() and stored in |frame_timing_details_|.
+   base::flat_map<uint32_t, std::unique_ptr<PendingFrameDetails>>
+       pending_received_frame_times_;
++#if BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] The top-controls offset, in DIPs, at which
++  // SurfaceAggregator embeds each pending frame. Published on presentation.
++  base::flat_map<uint32_t, float> pending_top_controls_offsets_;
++#endif
+   FrameTimingDetailsMap frame_timing_details_;
+   LocalSurfaceId last_evicted_local_surface_id_;
+ 
+diff --git a/content/browser/renderer_host/popup_menu_helper_ios.mm b/content/browser/renderer_host/popup_menu_helper_ios.mm
+index 706ad7f805fd8089fcab4ddc70762b985611e47c..76c959a1f1856a6b14035ec3ceb5a13665e576c2 100644
+--- a/content/browser/renderer_host/popup_menu_helper_ios.mm
++++ b/content/browser/renderer_host/popup_menu_helper_ios.mm
+@@ -56,8 +56,11 @@
+                                      fontSize:item_font_size
+                                  rightAligned:right_aligned];
+ 
+-  [menu_runner_ showMenuInView:GetRenderWidgetHostView()->GetNativeView().Get()
+-                    withBounds:bounds.ToCGRect()];
++  auto* view = GetRenderWidgetHostView();
++  [menu_runner_
++      showMenuInView:view->GetNativeView().Get()
++          withBounds:CGRectOffset(bounds.ToCGRect(), 0,
++                                  view->GetPresentedTopControlsOffset())];
+ }
+ 
+ void PopupMenuHelper::OnMenuItemSelected(int idx) {
+diff --git a/content/browser/renderer_host/render_widget_host_impl.cc b/content/browser/renderer_host/render_widget_host_impl.cc
+index de7d66f6a4e851d7c6791b7e294800889a1bdbeb..5120ee0ac466702665bc0388dfaf2d8e7ee09162 100644
+--- a/content/browser/renderer_host/render_widget_host_impl.cc
++++ b/content/browser/renderer_host/render_widget_host_impl.cc
+@@ -1186,6 +1186,14 @@ blink::VisualProperties RenderWidgetHostImpl::GetVisualProperties() {
+   visual_properties.browser_controls_params.bottom_controls_min_height =
+       rvh_delegate_view->GetBottomControlsMinHeight();
+ 
++#if BUILDFLAG(IS_IOS)
++  // Only the outer page has Curium's band. Child surfaces and popups inherit
++  // its position when embedded and must not translate themselves.
++  if (view_->IsRenderWidgetHostViewChildFrame() || !owner_delegate_) {
++    visual_properties.browser_controls_params = cc::BrowserControlsParams();
++  }
++#endif
++
+   visual_properties.auto_resize_enabled = auto_resize_enabled_;
+   visual_properties.min_size_for_auto_resize = min_size_for_auto_resize_;
+   visual_properties.max_size_for_auto_resize = max_size_for_auto_resize_;
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.h b/content/browser/renderer_host/render_widget_host_view_ios.h
+index 61d511daca0056f9bd24aec45692d15c1c9922b5..0b59f14655f6bf5f27659b88a0b29b7f92693f29 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.h
++++ b/content/browser/renderer_host/render_widget_host_view_ios.h
+@@ -71,6 +71,10 @@ class CONTENT_EXPORT RenderWidgetHostViewIOS
+   RenderWidgetHostViewIOS(const RenderWidgetHostViewIOS&) = delete;
+   RenderWidgetHostViewIOS& operator=(const RenderWidgetHostViewIOS&) = delete;
+ 
++  // The band offset of the page frame on screen, paired with that frame's
++  // presentation in viz. Native input and selection map through it.
++  float GetPresentedTopControlsOffset() const override;
++
+   // RenderWidgetHostView implementation.
+   void InitAsChild(gfx::NativeView parent_view) override;
+   void SetSize(const gfx::Size& size) override;
+@@ -281,6 +285,7 @@ class CONTENT_EXPORT RenderWidgetHostViewIOS
+   bool ShouldRouteEvents() const;
+ 
+   void SendGestureEvent(const blink::WebGestureEvent& event);
++  void OffsetTouchEventForTopControls(blink::WebTouchEvent& event) const;
+ 
+   bool ComputeIsViewOrSubviewFirstResponder() const;
+ 
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.mm b/content/browser/renderer_host/render_widget_host_view_ios.mm
+index fb5c1117216ae78d7f14a120d22e7ae221f7b358..e582d1ddd84a6e76bd3de981020f3b2d4599f985 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios.mm
+@@ -20,6 +20,7 @@
+ #include "components/input/switches.h"
+ #include "components/viz/common/features.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "components/viz/common/frame_sinks/presented_top_controls_offset_ios.h"
+ #include "components/viz/common/surfaces/frame_sink_id_allocator.h"
+ #include "content/browser/renderer_host/browser_compositor_ios.h"
+ #include "content/browser/renderer_host/frame_tree.h"
+@@ -750,6 +751,23 @@ bool IsTesting() {
+   return !!host()->GetInputEventRouter();
+ }
+ 
++float RenderWidgetHostViewIOS::GetPresentedTopControlsOffset() const {
++  return viz::GetPresentedTopControlsOffset(GetFrameSinkId()).offset_dips;
++}
++
++void RenderWidgetHostViewIOS::OffsetTouchEventForTopControls(
++    blink::WebTouchEvent& event) const {
++  const float offset = GetPresentedTopControlsOffset();
++  if (offset == 0.f) {
++    return;
++  }
++  for (unsigned i = 0; i < event.touches_length; ++i) {
++    auto& touch = event.touches[i];
++    touch.SetPositionInWidget(touch.PositionInWidget() -
++                              gfx::Vector2dF(0.f, offset));
++  }
++}
++
+ void RenderWidgetHostViewIOS::OnTouchEvent(blink::WebTouchEvent web_event) {
+   ScopedInputDispatchPin pin(this);
+   scoped_refptr<ui::FilteredGestureProvider> protector(gesture_provider_);
+@@ -760,6 +778,9 @@ bool IsTesting() {
+   }
+ 
+   web_event.moved_beyond_slop_region = result.moved_beyond_slop_region;
++  // Detect gestures in native coordinates so movement of the band is not
++  // mistaken for finger motion. Route the event in page coordinates.
++  OffsetTouchEventForTopControls(web_event);
+   ui::LatencyInfo latency_info;
+   latency_info.AddLatencyNumber(ui::INPUT_EVENT_LATENCY_UI_COMPONENT);
+   if (ShouldRouteEvents()) {
+@@ -836,13 +857,14 @@ bool IsTesting() {
+     return;
+   }
+ 
++  blink::WebTouchEvent touch_event(event);
++  OffsetTouchEventForTopControls(touch_event);
+   if (ShouldRouteEvents()) {
+-    blink::WebTouchEvent touch_event(event);
+     host()->GetInputEventRouter()->RouteTouchEvent(this, &touch_event,
+                                                    latency_info);
+   } else if (host()) {
+     host()->GetRenderInputRouter()->ForwardTouchEventWithLatencyInfo(
+-        event, latency_info);
++        touch_event, latency_info);
+   }
+ }
+ 
+@@ -853,13 +875,20 @@ bool IsTesting() {
+     return;
+   }
+   ScopedInputDispatchPin pin(this);
++  blink::WebGestureEvent gesture_event(event);
++  // Map gestures through the band on screen. A pinch stays native: cc
++  // anchors it with its live offset, and the router maps it for hit tests.
++  if (!blink::WebInputEvent::IsPinchGestureEventType(event.GetType())) {
++    gesture_event.SetPositionInWidget(
++        event.PositionInWidget() -
++        gfx::Vector2dF(0.f, GetPresentedTopControlsOffset()));
++  }
+   if (ShouldRouteEvents()) {
+-    blink::WebGestureEvent gesture_event(event);
+     host()->GetInputEventRouter()->RouteGestureEvent(this, &gesture_event,
+                                                      latency_info);
+   } else {
+     host()->GetRenderInputRouter()->ForwardGestureEventWithLatencyInfo(
+-        event, latency_info);
++        gesture_event, latency_info);
+   }
+ }
+ 
+@@ -869,12 +898,15 @@ bool IsTesting() {
+   if (!host()) {
+     return;
+   }
++  blink::WebMouseEvent mouse_event(web_mouse);
++  mouse_event.SetPositionInWidget(
++      web_mouse.PositionInWidget() -
++      gfx::Vector2dF(0.f, GetPresentedTopControlsOffset()));
+   if (ShouldRouteEvents()) {
+-    blink::WebMouseEvent mouse_event(web_mouse);
+     host()->GetInputEventRouter()->RouteMouseEvent(this, &mouse_event,
+                                                    latency_info);
+   } else {
+-    host()->ForwardMouseEventWithLatencyInfo(web_mouse, latency_info);
++    host()->ForwardMouseEventWithLatencyInfo(mouse_event, latency_info);
+   }
+ }
+ 
+@@ -884,12 +916,15 @@ bool IsTesting() {
+   if (!host()) {
+     return;
+   }
++  blink::WebMouseWheelEvent mouse_wheel_event(web_wheel);
++  mouse_wheel_event.SetPositionInWidget(
++      web_wheel.PositionInWidget() -
++      gfx::Vector2dF(0.f, GetPresentedTopControlsOffset()));
+   if (ShouldRouteEvents()) {
+-    blink::WebMouseWheelEvent mouse_wheel_event(web_wheel);
+     host()->GetInputEventRouter()->RouteMouseWheelEvent(
+         this, &mouse_wheel_event, latency_info);
+   } else {
+-    host()->ForwardWheelEventWithLatencyInfo(web_wheel, latency_info);
++    host()->ForwardWheelEventWithLatencyInfo(mouse_wheel_event, latency_info);
+   }
+ }
+ 
+@@ -1216,6 +1251,16 @@ bool IsTesting() {
+                    });
+   }
+ #endif  // !BUILDFLAG(IS_IOS_TVOS)
++
++  // The shell morphs its chrome from the ratio; input maps through the
++  // offset viz reports with each presented frame instead.
++  const auto& controls = metadata.browser_controls_metadata;
++  if (auto* delegate = host()->delegate()) {
++    delegate->SetTopControlsShownRatio(host(),
++                                       controls.top_controls_height > 0.f
++                                           ? controls.top_controls_shown_ratio
++                                           : 1.f);
++  }
+ }
+ 
+ void RenderWidgetHostViewIOS::ExtendSelectionAndDelete(int32_t before,
+@@ -1311,7 +1356,8 @@ bool IsTesting() {
+   if (!input_handler) {
+     return;
+   }
+-  input_handler->StartAutoscrollForSelectionToPoint(point);
++  input_handler->StartAutoscrollForSelectionToPoint(
++      point - gfx::Vector2dF(0.f, GetPresentedTopControlsOffset()));
+ }
+ 
+ void RenderWidgetHostViewIOS::StopAutoscroll() {
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index 29cd07c7ed069e0de1ec60951a0930dc5fc5c18f..991bb6d78542dc0046b376ead7531534ecc21869 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -742,6 +742,17 @@ - (void)unmarkText {
+   _markedText.clear();
+ }
+ 
++- (gfx::PointF)pagePointForWidgetPoint:(CGPoint)point {
++  return gfx::PointF(
++      point.x,
++      point.y - (_view ? _view->GetPresentedTopControlsOffset() : 0.f));
++}
++
++- (CGRect)widgetRectForPageRect:(CGRect)rect {
++  return CGRectOffset(rect, 0,
++                      _view ? _view->GetPresentedTopControlsOffset() : 0.f);
++}
++
+ - (CGRect)selectionClipRect {
+   auto rect = [self textControlBounds];
+   if (!rect) {
+@@ -752,7 +763,7 @@ - (CGRect)selectionClipRect {
+   }
+   // Need to get a more realistic rect here. If this clip is too small,
+   // selection handles won't draw correctly.
+-  return CGRectMake(rect->x(), rect->y(), rect->width(), rect->height());
++  return [self widgetRectForPageRect:rect->ToCGRect()];
+ }
+ 
+ - (id<BEExtendedTextInputTraits>)extendedTextInputTraits {
+@@ -1010,10 +1021,11 @@ - (CGRect)selectionPresentationRect {
+   if (!region) {
+     return CGRectNull;
+   }
+-  return region->bounding_box.IsEmpty()
+-             ? CGRectUnion(RectForBound(region->anchor),
+-                           RectForBound(region->focus))
+-             : region->bounding_box.ToCGRect();
++  const CGRect rect = region->bounding_box.IsEmpty()
++                          ? CGRectUnion(RectForBound(region->anchor),
++                                        RectForBound(region->focus))
++                          : region->bounding_box.ToCGRect();
++  return [self widgetRectForPageRect:rect];
+ }
+ 
+ // [ios-blink-sideload] The edit menu's Look Up, Translate and Share, as in
+@@ -1235,19 +1247,19 @@ - (void)requestTextRectsForString:(NSString*)input
+     return;
+   }
+ 
++  // The rect arrives in page space; map it with the band on screen when the
++  // reply lands. base::BindOnce binds ARC blocks, unlike capturing lambdas.
++  __weak RenderWidgetUIView* weakSelf = self;
+   _view->RectForEditFieldChars(
+-      gfx::Range(range),
+-      base::BindOnce(
+-          [](void (^completionHandler)(NSArray<UITextSelectionRect*>* rects),
+-             const gfx::Rect& rect) {
+-            if (rect.IsEmpty()) {
+-              completionHandler(@[]);
+-              return;
+-            }
+-            completionHandler(@[ [[BETextSelectionRect alloc]
+-                initWithCGRect:rect.ToCGRect()] ]);
+-          },
+-          completionHandler));
++      gfx::Range(range), base::BindOnce(^(const gfx::Rect& rect) {
++        RenderWidgetUIView* view = weakSelf;
++        if (!view || rect.IsEmpty()) {
++          completionHandler(@[]);
++          return;
++        }
++        completionHandler(@[ [[BETextSelectionRect alloc]
++            initWithCGRect:[view widgetRectForPageRect:rect.ToCGRect()]] ]);
++      }));
+ }
+ 
+ - (void)requestPreferredArrowDirectionForEditMenuWithCompletionHandler:
+@@ -1385,16 +1397,20 @@ - (void)longPressDidMoveToPoint:(CGPoint)point {
+   if (!_view) {
+     return;
+   }
+-  const gfx::Point extent = gfx::ToRoundedPoint(gfx::PointF(point.x, point.y));
++  const gfx::Point extent =
++      gfx::ToRoundedPoint([self pagePointForWidgetPoint:point]);
+   if ([self selectedText].length) {
+     _view->host()->delegate()->MoveRangeSelectionExtent(extent);
+   } else {
+     _view->host()->delegate()->MoveCaret(extent);
+   }
+   auto* region = [self selectionRegion];
+-  [_longPressLoupe moveToPoint:point
+-                 withCaretRect:region ? RectForBound(region->focus) : CGRectNull
+-                 trackingCaret:NO];
++  [_longPressLoupe
++        moveToPoint:point
++      withCaretRect:region ? [self widgetRectForPageRect:RectForBound(
++                                                             region->focus)]
++                           : CGRectNull
++      trackingCaret:NO];
+ }
+ 
+ - (void)longPressDidEndShowingMenu:(BOOL)showMenu {
+@@ -1456,7 +1472,7 @@ - (void)updateCurrentSelectionTo:(CGPoint)point
+     return;
+   }
+   _view->host()->delegate()->MoveRangeSelectionExtent(
+-      gfx::Point(point.x, point.y));
++      gfx::ToRoundedPoint([self pagePointForWidgetPoint:point]));
+ }
+ 
+ - (void)setSelectionFromPoint:(CGPoint)from
+@@ -1477,6 +1493,7 @@ - (void)adjustSelectionBoundaryToPoint:(CGPoint)point
+   // wandered once the handles crossed. Now it is taken once, when the drag
+   // starts, as the middle of its bound (the top can round into the line
+   // above).
++  const gfx::PointF page_point = [self pagePointForWidgetPoint:point];
+   if (touch == BESelectionTouchPhaseStarted) {
+     auto* region = [self selectionRegion];
+     if (!region || !region->focus.HasHandle()) {
+@@ -1495,16 +1512,16 @@ - (void)adjustSelectionBoundaryToPoint:(CGPoint)point
+     _selectionHandleDragged = YES;
+     [[self selectionFeedback] prepare];
+   } else {
+-    _view->host()->delegate()->SelectRange(
+-        _selectionDragBase, gfx::ToRoundedPoint(gfx::PointF(point.x, point.y)));
++    _view->host()->delegate()->SelectRange(_selectionDragBase,
++                                           gfx::ToRoundedPoint(page_point));
+     // Whether the moving handle has crossed the one that stays put, assuming
+     // left-to-right lines.
+-    BOOL before = point.y < _selectionDragBaseTop ||
+-                  (point.y < _selectionDragBaseBottom &&
+-                   point.x < _selectionDragBase.x());
+-    BOOL after = point.y > _selectionDragBaseBottom ||
+-                 (point.y > _selectionDragBaseTop &&
+-                  point.x > _selectionDragBase.x());
++    BOOL before = page_point.y() < _selectionDragBaseTop ||
++                  (page_point.y() < _selectionDragBaseBottom &&
++                   page_point.x() < _selectionDragBase.x());
++    BOOL after = page_point.y() > _selectionDragBaseBottom ||
++                 (page_point.y() > _selectionDragBaseTop &&
++                  page_point.x() > _selectionDragBase.x());
+     if (baseIsStart ? before : after) {
+       flags |= BESelectionFlipped;
+     }
+@@ -1545,7 +1562,7 @@ - (void)updateSelectionWithExtentPoint:(CGPoint)point
+     return;
+   }
+   _view->host()->delegate()->MoveRangeSelectionExtent(
+-      gfx::Point(point.x, point.y));
++      gfx::ToRoundedPoint([self pagePointForWidgetPoint:point]));
+   completionHandler(true);
+ }
+ 
+@@ -1556,11 +1573,11 @@ - (void)selectTextInGranularity:(UITextGranularity)granularity
+     completionHandler();
+     return;
+   }
+-  _view->host()->delegate()->MoveCaret(gfx::Point(point.x, point.y));
+-  _view->host()->delegate()->SelectRange(gfx::Point(point.x, point.y),
+-                                         gfx::Point(point.x, point.y));
+-  _view->host()->delegate()->SelectRange(gfx::Point(point.x, point.y),
+-                                         gfx::Point(point.x, point.y));
++  const gfx::Point page_point =
++      gfx::ToRoundedPoint([self pagePointForWidgetPoint:point]);
++  _view->host()->delegate()->MoveCaret(page_point);
++  _view->host()->delegate()->SelectRange(page_point, page_point);
++  _view->host()->delegate()->SelectRange(page_point, page_point);
+   _view->host()->delegate()->SelectAroundCaret(
+       blink::mojom::SelectionGranularity::kWord,
+       /*should_show_handle=*/true,
+@@ -1576,8 +1593,9 @@ - (void)selectPositionAtPoint:(CGPoint)point
+     return;
+   }
+ 
+-  CGFloat x = point.x;
+-  CGFloat y = point.y;
++  const gfx::PointF page_point = [self pagePointForWidgetPoint:point];
++  CGFloat x = page_point.x();
++  CGFloat y = page_point.y();
+   // Constrain point to bounds of focused element.
+   auto textControlBounds = [self textControlBounds];
+   if (textControlBounds.has_value()) {
+@@ -1794,10 +1812,14 @@ - (UITextRange*)selectedTextRange {
+     length = std::max<NSInteger>([self selectedText].length, 1);
+   }
+   return [[BETextRange alloc]
+-      initWithStart:[[BETextPosition alloc] initWithRect:RectForBound(*start)
+-                                                   offset:0]
+-                end:[[BETextPosition alloc] initWithRect:RectForBound(*end)
+-                                                  offset:length]];
++      initWithStart:[[BETextPosition alloc]
++                        initWithRect:[self widgetRectForPageRect:RectForBound(
++                                                                     *start)]
++                              offset:0]
++                end:[[BETextPosition alloc]
++                        initWithRect:[self widgetRectForPageRect:RectForBound(
++                                                                     *end)]
++                              offset:length]];
+ }
+ - (nullable NSString*)textInRange:(UITextRange*)range {
+   // [ios-blink-sideload] Only the selection's text is known.
+@@ -1948,10 +1970,10 @@ - (CGRect)caretRectForPosition:(UITextPosition*)position {
+   // [ios-blink-sideload] The LEFT bound is the start of the selection (see
+   // -selectedTextRange); this had them the other way round.
+   UITextSelectionRect* focus = [[BETextSelectionHandles alloc]
+-      initWithCGRect:RectForBound(region->focus)
++      initWithCGRect:[self widgetRectForPageRect:RectForBound(region->focus)]
+              atStart:region->focus.type() == gfx::SelectionBound::LEFT];
+   UITextSelectionRect* anchor = [[BETextSelectionHandles alloc]
+-      initWithCGRect:RectForBound(region->anchor)
++      initWithCGRect:[self widgetRectForPageRect:RectForBound(region->anchor)]
+              atStart:region->anchor.type() == gfx::SelectionBound::LEFT];
+   return @[ focus, anchor ];
+ }
+diff --git a/content/browser/web_contents/web_contents_view_ios.mm b/content/browser/web_contents/web_contents_view_ios.mm
+index a0adb815c6274b0bfc52bf52e6c29dd2091c1a06..19082e9fb2d2b32b53c5581c22dc94cb65297b86 100644
+--- a/content/browser/web_contents/web_contents_view_ios.mm
++++ b/content/browser/web_contents/web_contents_view_ios.mm
+@@ -337,9 +337,6 @@ - (void)updateVisibility:(BOOL)visible {
+           gfx::NativeView());
+     }
+   }
+-  web_contents_->UpdateBrowserControlsState(cc::BrowserControlsState::kBoth,
+-                                            cc::BrowserControlsState::kHidden,
+-                                            false, std::nullopt);
+ }
+ 
+ void WebContentsViewIOS::SetOverscrollControllerEnabled(bool enabled) {}
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 95c06ed07ee8ce552e837c8a5865a085a13737e9..590d74de65dcd7a46661139371658cdfd16795fc 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -80,6 +80,15 @@ __attribute__((visibility("default")))
+ - (void)enterPictureInPicture;
+ - (void)exitPictureInPicture;
+ - (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable image))completion;
++
++@optional
++@property(nonatomic) CGFloat topControlsHeight;
++@property(nonatomic, readonly) CGFloat topControlsShownRatio;
++@end
++
++@protocol CrIOSTabBrowserControlsV1 <CrIOSTabHostingV1>
++@property(nonatomic) CGFloat topControlsHeight;
++@property(nonatomic, readonly) CGFloat topControlsShownRatio;
+ @end
+ 
+ @protocol CrIOSDownloadTaskV1 <NSObject>
+diff --git a/ios/chrome/browser/curium/curium_tab_host.h b/ios/chrome/browser/curium/curium_tab_host.h
+index 1a1e74bb777a9e18f814a166ac4ac4e39c9b3a63..8b26812cc533152643bb5d13c690beba349c74de 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.h
++++ b/ios/chrome/browser/curium/curium_tab_host.h
+@@ -14,7 +14,7 @@ class WebState;
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
+-@interface CuriumTabHost : NSObject <CrIOSTabHostingV1>
++@interface CuriumTabHost : NSObject <CrIOSTabBrowserControlsV1>
+ 
+ - (instancetype)initWithWebState:(web::WebState*)webState
+                      browserHost:(CuriumBrowserHost*)browserHost
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+index 18337b450d2f57bc4ec14df7ded4aace9b0f160d..8ea4b7f544013e5af0045096c312d40db2b692a4 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.mm
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -54,6 +54,7 @@ - (void)tabHost:(CuriumTabHost*)tabHost
+ @interface CuriumTabHost () <FileUploadPanelCommands>
+ - (void)notifyUpdated;
+ - (void)handleNavigationCommitted;
++- (void)updateTopControlsShownRatio:(CGFloat)ratio;
+ - (void)handleWebStateDestroyed;
+ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info;
+ @end
+@@ -148,6 +149,7 @@ @implementation CuriumTabHost {
+   NSString* _tabID;
+   BOOL _prefersDesktopUserAgent;
+   std::optional<double> _zoomScale;
++  CGFloat _topControlsShownRatio;
+ }
+ 
+ - (instancetype)initWithWebState:(web::WebState*)webState
+@@ -160,6 +162,15 @@ - (instancetype)initWithWebState:(web::WebState*)webState
+     _tabID = [NSString
+         stringWithFormat:@"%d", webState->GetUniqueIdentifier().identifier()];
+     _observer = std::make_unique<CuriumWebStateObserver>(self, webState);
++    auto* contentWebState = static_cast<web::ContentWebState*>(webState);
++    _topControlsShownRatio = contentWebState->GetTopControlsShownRatio();
++    __weak CuriumTabHost* weakSelf = self;
++    contentWebState->SetTopControlsShownRatioObserver(^(CGFloat ratio) {
++      // A KVO observer can close the tab. Deliver outside the frame callback.
++      dispatch_async(dispatch_get_main_queue(), ^{
++        [weakSelf updateTopControlsShownRatio:ratio];
++      });
++    });
+     if (ChooseFileTabHelper* chooseFile =
+             ChooseFileTabHelper::FromWebState(webState)) {
+       chooseFile->SetFileUploadPanelHandler(self);
+@@ -174,6 +185,8 @@ - (void)dealloc {
+ 
+ - (void)detach {
+   if (_webState) {
++    static_cast<web::ContentWebState*>(_webState)
++        ->SetTopControlsShownRatioObserver(nil);
+     if (ChooseFileTabHelper* chooseFile =
+             ChooseFileTabHelper::FromWebState(_webState)) {
+       chooseFile->SetFileUploadPanelHandler(nil);
+@@ -220,6 +233,32 @@ - (nullable UIScrollView*)scrollView {
+       _webState->GetView().subviews.firstObject);
+ }
+ 
++- (CGFloat)topControlsHeight {
++  return _webState ? static_cast<web::ContentWebState*>(_webState)
++                         ->GetTopControlsHeightInPoints()
++                   : 0;
++}
++
++- (void)setTopControlsHeight:(CGFloat)height {
++  if (_webState) {
++    static_cast<web::ContentWebState*>(_webState)->SetTopControlsHeightInPoints(
++        height);
++  }
++}
++
++- (CGFloat)topControlsShownRatio {
++  return _topControlsShownRatio;
++}
++
++- (void)updateTopControlsShownRatio:(CGFloat)ratio {
++  if (!_webState || _topControlsShownRatio == ratio) {
++    return;
++  }
++  [self willChangeValueForKey:@"topControlsShownRatio"];
++  _topControlsShownRatio = ratio;
++  [self didChangeValueForKey:@"topControlsShownRatio"];
++}
++
+ - (nullable NSURL*)currentURL {
+   if (!_webState) {
+     return nil;
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+index a1c79dbffa1627391a7959d98cef7a6b19ee703e..3d284f4418ec7478e0ff8a6b72a65be613535728 100644
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -58,6 +58,7 @@ source_set("content") {
+     ":send_webkit_message_js",
+     "//base",
+     "//build:blink_buildflags",
++    "//cc",
+     "//extensions/buildflags",
+     "//components/download/public/common:public",
+     "//components/embedder_support:user_agent",
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index 37c310b2dc4c5f2feefd3e6697b704b10ab6d4da..01e5be676168cffd59b25c7242f95b5d4f2cd858 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -18,6 +18,7 @@ specific_include_rules = {
+     "+third_party/blink/public/common/permissions/permission_utils.h",
+   ],
+   "content_web_state\\.mm": [
++    "+cc/input/browser_controls_offset_tag_modifications.h",
+     "+components/embedder_support/ios/delegate/color_chooser/color_chooser_ios.h",
+     "+components/embedder_support/ios/delegate/file_chooser/file_select_helper_ios.h",
+     "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
+index 092233c2685bcf19e40d64c9179bff418a22c3f0..cef265384d168e6b41b4ad23b41dec7eabe36dee 100644
+--- a/ios/web/content/web_state/content_web_state.h
++++ b/ios/web/content/web_state/content_web_state.h
+@@ -79,6 +79,12 @@ class ContentWebState : public WebState,
+   // Returns the WebContents owned by this ContentWebState.
+   content::WebContents* GetWebContents();
+ 
++  // Curium's floating address bar. The embedder supplies the height in points.
++  CGFloat GetTopControlsHeightInPoints() const;
++  void SetTopControlsHeightInPoints(CGFloat height);
++  CGFloat GetTopControlsShownRatio() const;
++  void SetTopControlsShownRatioObserver(void (^observer)(CGFloat));
++
+   // Returns an invalid ID for WebContents that do not belong to an iOS tab.
+   static WebStateID GetUniqueIdentifierForWebContents(
+       const content::WebContents& web_contents);
+@@ -197,6 +203,7 @@ class ContentWebState : public WebState,
+   void DidFinishNavigation(
+       content::NavigationHandle* navigation_handle) override;
+   void PrimaryPageChanged(content::Page& page) override;
++  void RenderViewReady() override;
+   void DidStartLoading() override;
+   void DidStopLoading() override;
+   void DidFinishLoad(content::RenderFrameHost* render_frame_host,
+@@ -239,6 +246,19 @@ class ContentWebState : public WebState,
+       bool user_gesture,
+       bool* was_blocked) override;
+   void CloseContents(content::WebContents* source) override;
++  void EnterFullscreenModeForTab(
++      content::RenderFrameHost* requesting_frame,
++      const blink::mojom::FullscreenOptions& options) override;
++  void ExitFullscreenModeForTab(content::WebContents* web_contents) override;
++  bool IsFullscreenForTabOrPending(
++      const content::WebContents* web_contents) override;
++  int GetTopControlsHeight() override;
++  bool DoBrowserControlsShrinkRendererSize(
++      content::WebContents* web_contents) override;
++  bool ShouldAnimateBrowserControlsHeightChanges() override;
++  bool OnlyExpandTopControlsAtPageTop() override;
++  void SetTopControlsShownRatio(content::WebContents* web_contents,
++                                float ratio) override;
+   int GetVirtualKeyboardHeight(content::WebContents* web_contents) override;
+   std::unique_ptr<content::ColorChooser> OpenColorChooser(
+       content::WebContents* web_contents,
+@@ -281,6 +301,8 @@ class ContentWebState : public WebState,
+   void RegisterNotificationObservers();
+   void OnKeyboardShow(NSNotification* notification);
+   void OnKeyboardHide(NSNotification* notification);
++  void UpdateTopControlsConstraints();
++  void SynchronizeTopControlsVisualProperties();
+ 
+   raw_ptr<WebStateDelegate> delegate_ = nullptr;
+   CRCWebViewportContainerView* web_view_;
+@@ -313,6 +335,10 @@ class ContentWebState : public WebState,
+   id keyboard_showing_observer_;
+   id keyboard_hiding_observer_;
+   int keyboard_height_ = 0;
++  bool dom_fullscreen_ = false;
++  CGFloat top_controls_height_points_ = 0;
++  CGFloat top_controls_shown_ratio_ = 1;
++  void (^top_controls_shown_ratio_observer_)(CGFloat) = nil;
+ 
+   // The time that this ContentWebState was last made active. The initial value
+   // is the ContentWebState's creation time.
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index fee9cfef511bbe6d62a93f3428de35d9cab28d13..abc24655e511e24b57eb0e8138d5b8419e45df32 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -5,15 +5,18 @@
+ #import "ios/web/content/web_state/content_web_state.h"
+ 
+ #import <algorithm>
++#import <cmath>
+ #import <memory>
+ 
+ #import "base/apple/foundation_util.h"
+ #import "base/functional/bind.h"
+ #import "base/functional/callback_helpers.h"
+ #import "base/notimplemented.h"
++#import "base/numerics/safe_conversions.h"
+ #import "base/supports_user_data.h"
+ #import "base/strings/sys_string_conversions.h"
+ #import "base/strings/utf_string_conversions.h"
++#import "cc/input/browser_controls_offset_tag_modifications.h"
+ #import "components/embedder_support/ios/delegate/color_chooser/color_chooser_ios.h"
+ #import "components/embedder_support/ios/delegate/file_chooser/file_select_helper_ios.h"
+ #import "components/javascript_dialogs/tab_modal_dialog_manager.h"
+@@ -28,6 +31,7 @@
+ #import "content/public/browser/navigation_handle.h"
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/render_process_host.h"
++#import "content/public/browser/render_widget_host.h"
+ #import "content/public/browser/visibility.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/common/url_constants.h"
+@@ -286,6 +290,41 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   return web_contents_.get();
+ }
+ 
++CGFloat ContentWebState::GetTopControlsHeightInPoints() const {
++  return top_controls_height_points_;
++}
++
++void ContentWebState::SetTopControlsHeightInPoints(CGFloat height) {
++  if (!std::isfinite(height)) {
++    return;
++  }
++  height = std::max<CGFloat>(height, 0);
++  if (height == top_controls_height_points_) {
++    return;
++  }
++
++  const int old_height = GetTopControlsHeight();
++  top_controls_height_points_ = height;
++  const int new_height = GetTopControlsHeight();
++  if (old_height == new_height) {
++    return;
++  }
++
++  if (old_height == 0) {
++    UpdateTopControlsConstraints();
++  }
++  SynchronizeTopControlsVisualProperties();
++}
++
++CGFloat ContentWebState::GetTopControlsShownRatio() const {
++  return top_controls_shown_ratio_;
++}
++
++void ContentWebState::SetTopControlsShownRatioObserver(
++    void (^observer)(CGFloat)) {
++  top_controls_shown_ratio_observer_ = observer;
++}
++
+ // static
+ WebStateID ContentWebState::GetUniqueIdentifierForWebContents(
+     const content::WebContents& web_contents) {
+@@ -838,6 +877,12 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   if (!navigation_handle->IsInPrimaryMainFrame()) {
+     return;
+   }
++  if (navigation_handle->HasCommitted() &&
++      !navigation_handle->IsSameDocument()) {
++    UpdateTopControlsConstraints();
++    // Speculative views can start with geometry from the previous widget.
++    SynchronizeTopControlsVisualProperties();
++  }
+   // [ios-blink-sideload] As WebStateImpl does: drop the WebUI if the
+   // navigation didn't commit, or committed a page that isn't Chrome's.
+   if (web_ui_ &&
+@@ -857,6 +902,12 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   microphone_allowed_.reset();
+ }
+ 
++void ContentWebState::RenderViewReady() {
++  // The height may have been set before the renderer could receive state.
++  UpdateTopControlsConstraints();
++  SynchronizeTopControlsVisualProperties();
++}
++
+ void ContentWebState::DidStartLoading() {
+   for (auto& observer : observers_) {
+     observer.DidStartLoading(this);
+@@ -988,6 +1039,86 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   CloseWebState();
+ }
+ 
++void ContentWebState::UpdateTopControlsConstraints() {
++  if (GetTopControlsHeight() > 0) {
++    // Reapply the unlocked state to new renderers without disturbing the
++    // current offset of a restored page.
++    web_contents_->UpdateBrowserControlsState(cc::BrowserControlsState::kBoth,
++                                              cc::BrowserControlsState::kBoth,
++                                              /*animate=*/false, std::nullopt);
++  }
++}
++
++void ContentWebState::SynchronizeTopControlsVisualProperties() {
++  if (auto* frame = web_contents_->GetPrimaryMainFrame()) {
++    frame->GetRenderWidgetHost()->SynchronizeVisualProperties();
++  }
++}
++
++void ContentWebState::EnterFullscreenModeForTab(
++    content::RenderFrameHost* requesting_frame,
++    const blink::mojom::FullscreenOptions& options) {
++  dom_fullscreen_ = true;
++  SynchronizeTopControlsVisualProperties();
++}
++
++void ContentWebState::ExitFullscreenModeForTab(
++    content::WebContents* web_contents) {
++  dom_fullscreen_ = false;
++  SynchronizeTopControlsVisualProperties();
++}
++
++bool ContentWebState::IsFullscreenForTabOrPending(
++    const content::WebContents* web_contents) {
++  return dom_fullscreen_;
++}
++
++int ContentWebState::GetTopControlsHeight() {
++  if (dom_fullscreen_ || !top_controls_height_points_) {
++    return 0;
++  }
++  // Resolve the scale when visual properties are collected so a display
++  // change also refreshes the pixel height without a new shell layout.
++  if (auto* frame = web_contents_->GetPrimaryMainFrame()) {
++    const auto scale = frame->GetRenderWidgetHost()->GetDeviceScaleFactor();
++    return base::ClampRound(top_controls_height_points_ * scale);
++  }
++  return 0;
++}
++
++bool ContentWebState::DoBrowserControlsShrinkRendererSize(
++    content::WebContents* web_contents) {
++  // The widget is already full size. Blink keeps the smaller initial
++  // containing block and adjusts the visual viewport as the controls scroll.
++  return false;
++}
++
++bool ContentWebState::ShouldAnimateBrowserControlsHeightChanges() {
++  // Scene layout supplies a new band height along with the viewport size.
++  // Only scrolling animates the controls' visible fraction.
++  return false;
++}
++
++bool ContentWebState::OnlyExpandTopControlsAtPageTop() {
++  return GetTopControlsHeight() > 0;
++}
++
++void ContentWebState::SetTopControlsShownRatio(
++    content::WebContents* web_contents,
++    float ratio) {
++  if (!std::isfinite(ratio)) {
++    return;
++  }
++  ratio = std::clamp(ratio, 0.f, 1.f);
++  if (top_controls_shown_ratio_ == ratio) {
++    return;
++  }
++  top_controls_shown_ratio_ = ratio;
++  if (top_controls_shown_ratio_observer_) {
++    top_controls_shown_ratio_observer_(ratio);
++  }
++}
++
+ int ContentWebState::GetVirtualKeyboardHeight(
+     content::WebContents* web_contents) {
+   return keyboard_height_;
+diff --git a/third_party/blink/renderer/core/dom/document.cc b/third_party/blink/renderer/core/dom/document.cc
+index 95d9ed9011f786243963d6e1ba7ca27c949ddc68..7269eda2368d632148d145a5cdeaaf347cb95614 100644
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -47,6 +47,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "build/build_config.h"
+ #include "cc/animation/animation_host.h"
+ #include "cc/animation/animation_timeline.h"
+ #include "cc/input/overscroll_behavior.h"
+@@ -3122,6 +3123,20 @@ void Document::ApplyScrollRestorationLogic() {
+   if (root_frame_scroller != layout_scroller)
+     root_frame_scroller->ApplyPendingHistoryRestoreScrollOffset();
+ 
++#if BUILDFLAG(IS_IOS)
++  if (should_restore_scroll && frame->IsOutermostMainFrame()) {
++    // Commit the controls with the scroll position that actually fit the
++    // restored document, including its visual viewport at the restored scale.
++    // This runs once, when Blink applies the restore; a declined restore
++    // returns above and leaves the live controls alone.
++    if (WebLocalFrameImpl* web_frame = WebLocalFrameImpl::FromFrame(frame)) {
++      if (WebViewImpl* web_view = web_frame->ViewImpl()) {
++        const bool below_top = root_frame_scroller->GetScrollOffset().y() > 0.f;
++        web_view->ResetBrowserControlsShownRatio(below_top ? 0.f : 1.f);
++      }
++    }
++  }
++#endif
+   document_loader->GetInitialScrollState().did_restore_from_history = true;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/exported/web_view_impl.cc b/third_party/blink/renderer/core/exported/web_view_impl.cc
+index 8cb7ab88e5c140e6b078fd660716553994ac64db..70070acb8db236dcaad2d9d1c82f8bbc7cd9ed9f 100644
+--- a/third_party/blink/renderer/core/exported/web_view_impl.cc
++++ b/third_party/blink/renderer/core/exported/web_view_impl.cc
+@@ -1432,6 +1432,23 @@ void WebViewImpl::DidUpdateMaxSafeAreaInsets(
+   widget->SetMaxSafeAreaInsets(max_safe_area_insets);
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++void WebViewImpl::ResetBrowserControlsShownRatio(float top_ratio) {
++  BrowserControls& controls = GetBrowserControls();
++  controls.SetShownRatio(top_ratio, controls.BottomShownRatio());
++  WebLocalFrameImpl* main_frame = MainFrameImpl();
++  if (!does_composite_ || !main_frame || !main_frame->IsOutermostMainFrame()) {
++    return;
++  }
++  // A reused widget may still be animating, or may hold scroll deltas made
++  // against the previous document. Both must yield to this ratio.
++  if (WebFrameWidgetImpl* widget = main_frame->LocalRootFrameWidget()) {
++    widget->ResetBrowserControlsShownRatio(controls.TopShownRatio(),
++                                           controls.BottomShownRatio());
++  }
++}
++#endif
++
+ BrowserControls& WebViewImpl::GetBrowserControls() {
+   return GetPage()->GetBrowserControls();
+ }
+@@ -2450,6 +2467,13 @@ void WebViewImpl::ComputeScaleAndScrollForEditableElementRects(
+   }
+ 
+   gfx::SizeF target_viewport_size(visual_viewport.Size());
++#if BUILDFLAG(IS_IOS)
++  // The keyboard reduces Size(); the visible browser controls further
++  // reduce the area that can contain the caret.
++  target_viewport_size.set_height(
++      std::max(0.f, target_viewport_size.height() +
++                        visual_viewport.BrowserControlsAdjustment()));
++#endif
+   target_viewport_size.Scale(1 / new_scale);
+ 
+   // TODO(bokan): The logic below is all tailored assuming LTR writing mode.
+@@ -4077,6 +4101,11 @@ void WebViewImpl::DidCommitLoad(bool is_new_navigation,
+     if (is_new_navigation) {
+       GetPageScaleConstraintsSet().SetNeedsReset(true);
+     }
++#if BUILDFLAG(IS_IOS)
++    // Start a fresh document at page top. History restoration updates the
++    // ratio with the restored scroll, including before a height is supplied.
++    ResetBrowserControlsShownRatio(1.f);
++#endif
+   }
+ 
+   // Give the visual viewport's scroll layer its initial size.
+diff --git a/third_party/blink/renderer/core/exported/web_view_impl.h b/third_party/blink/renderer/core/exported/web_view_impl.h
+index ae1ddb17ca0c412e1f5fbe69780a89c8a13d82a6..a78ea53c573bcd3e2161501b5310e8126d7f7f20 100644
+--- a/third_party/blink/renderer/core/exported/web_view_impl.h
++++ b/third_party/blink/renderer/core/exported/web_view_impl.h
+@@ -510,6 +510,11 @@ class CORE_EXPORT WebViewImpl final : public WebView,
+   // Called anytime browser controls layout height or content offset have
+   // changed.
+   void DidUpdateBrowserControls();
++#if BUILDFLAG(IS_IOS)
++  // [ios-blink-sideload] Sets the top controls ratio for a new or restored
++  // document. The compositor commits it in place of its own running state.
++  void ResetBrowserControlsShownRatio(float top_ratio);
++#endif
+ 
+   void DidUpdateMaxSafeAreaInsets(const gfx::InsetsF& max_safe_area_insets);
+ 
+diff --git a/third_party/blink/renderer/core/frame/browser_controls.cc b/third_party/blink/renderer/core/frame/browser_controls.cc
+index 875f2764e60c1689003c6ca7fa61f1a73f3ce20c..0033a89e20671010ef61cc95227ee78642bcb5f9 100644
+--- a/third_party/blink/renderer/core/frame/browser_controls.cc
++++ b/third_party/blink/renderer/core/frame/browser_controls.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>  // for std::min and std::max
+ 
++#include "build/build_config.h"
+ #include "third_party/blink/renderer/core/frame/frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
+@@ -15,7 +16,11 @@ namespace blink {
+ 
+ BrowserControls::BrowserControls(Page& page)
+     : page_(&page),
++#if BUILDFLAG(IS_IOS)
++      top_shown_ratio_(1),
++#else
+       top_shown_ratio_(0),
++#endif
+       bottom_shown_ratio_(0),
+       baseline_top_content_offset_(0),
+       baseline_bottom_content_offset_(0),
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+index 1f02eebaef31c50bfddaa12d38a108f0ec5ce8a9..af4bc00e9edad65316dbb90cdaa0f7c846d834ef 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.cc
+@@ -2518,6 +2518,12 @@ void WebFrameWidgetImpl::SetBrowserControlsShownRatio(float top_ratio,
+                                                               bottom_ratio);
+ }
+ 
++void WebFrameWidgetImpl::ResetBrowserControlsShownRatio(float top_ratio,
++                                                        float bottom_ratio) {
++  widget_base_->LayerTreeHost()->ResetBrowserControlsShownRatio(top_ratio,
++                                                                bottom_ratio);
++}
++
+ void WebFrameWidgetImpl::SetBrowserControlsParams(
+     cc::BrowserControlsParams params) {
+   widget_base_->LayerTreeHost()->SetBrowserControlsParams(params);
+diff --git a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+index 65132fcd521c6d359c2457ff8a7eaaf3c4458d9b..0c05db4be3835fa405854ab33e318fa3a3d8f783 100644
+--- a/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
++++ b/third_party/blink/renderer/core/frame/web_frame_widget_impl.h
+@@ -682,6 +682,9 @@ class CORE_EXPORT WebFrameWidgetImpl
+   // Sets the amount that the top and bottom browser controls are showing, from
+   // 0 (hidden) to 1 (fully shown).
+   void SetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
++  // Like SetBrowserControlsShownRatio(), but the compositor drops its own
++  // deltas and animations when the ratio commits.
++  void ResetBrowserControlsShownRatio(float top_ratio, float bottom_ratio);
+ 
+   // Set browser controls params. These params consist of top and bottom
+   // heights, min-heights, browser_controls_shrink_blink_size, and
+diff --git a/third_party/blink/renderer/core/loader/frame_loader.cc b/third_party/blink/renderer/core/loader/frame_loader.cc
+index f7dbc4cc69b75dfa234348fba7672c6814ec1158..8c5499733197179ae2689f75d7d671ed665bab74 100644
+--- a/third_party/blink/renderer/core/loader/frame_loader.cc
++++ b/third_party/blink/renderer/core/loader/frame_loader.cc
+@@ -45,6 +45,7 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "base/unguessable_token.h"
++#include "build/build_config.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "services/metrics/public/cpp/metrics_utils.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+@@ -75,6 +76,7 @@
+ #include "third_party/blink/renderer/core/dom/ignore_opens_during_unload_count_incrementer.h"
+ #include "third_party/blink/renderer/core/events/page_transition_event.h"
+ #include "third_party/blink/renderer/core/exported/web_plugin_container_impl.h"
++#include "third_party/blink/renderer/core/exported/web_view_impl.h"
+ #include "third_party/blink/renderer/core/fetch/fetch_later_util.h"
+ #include "third_party/blink/renderer/core/fragment_directive/fragment_directive.h"
+ #include "third_party/blink/renderer/core/fragment_directive/text_directive.h"
+@@ -163,6 +165,37 @@ void LogJavaScriptUrlHistogram(LocalDOMWindow* origin_window,
+   }
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++// [ios-blink-sideload] Curium's top controls show only at page top. Seed them
++// from the saved scroll once, when a history load commits, so the first frame
++// of a page reopening mid-way has no band. Document applies the final ratio
++// only if Blink goes on to restore the scroll.
++void SeedBrowserControlsForHistoryRestore(LocalFrame& frame,
++                                          DocumentLoader* loader) {
++  if (!frame.GetPage() || !frame.IsOutermostMainFrame() || !loader ||
++      !loader->NavigationScrollAllowed() ||
++      !FrameLoader::NeedsHistoryItemRestore(loader->LoadType()) ||
++      frame.GetDocument()->IsInitialEmptyDocument()) {
++    return;
++  }
++  HistoryItem* item = loader->GetHistoryItem();
++  if (!item || !item->GetViewState() ||
++      item->ScrollRestorationType() ==
++          mojom::blink::ScrollRestorationType::kManual) {
++    return;
++  }
++  WebLocalFrameImpl* web_frame = WebLocalFrameImpl::FromFrame(frame);
++  WebViewImpl* web_view = web_frame ? web_frame->ViewImpl() : nullptr;
++  if (!web_view) {
++    return;
++  }
++  const HistoryItem::ViewState& view_state = *item->GetViewState();
++  const bool below_top = view_state.scroll_offset_.y() > 0.f ||
++                         view_state.visual_viewport_scroll_offset_.y() > 0.f;
++  web_view->ResetBrowserControlsShownRatio(below_top ? 0.f : 1.f);
++}
++#endif
++
+ }  // namespace
+ 
+ bool IsBackForwardLoadType(WebFrameLoadType type) {
+@@ -1366,6 +1399,11 @@ void FrameLoader::CommitNavigation(
+       ScopedOldDocumentInfoForCommitCapturer::CurrentInfo()->history_item.Get(),
+       commit_reason);
+ 
++#if BUILDFLAG(IS_IOS)
++  // Not in RestoreScrollPositionAndViewState(): its load-finish retry must not
++  // replace a ratio the user has since changed by scrolling.
++  SeedBrowserControlsForHistoryRestore(*frame_, GetDocumentLoader());
++#endif
+   RestoreScrollPositionAndViewState();
+ 
+   if (!frame_->IsDetached() && frame_->IsOutermostMainFrame()) {
