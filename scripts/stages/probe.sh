@@ -146,6 +146,13 @@ obj/ios/web/js_features/window_error/error_reporting/web_js_error_report_process
 obj/third_party/blink/renderer/core/core/web_frame_widget_impl.o
 obj/third_party/blink/renderer/core/core/frame_loader.o
 obj/components/viz/common/common/presented_top_controls_offset_ios.o
+obj/components/embedder_support/user_agent/user_agent_utils.o
+obj/components/favicon/ios/ios/web_favicon_driver.o
+obj/ios/chrome/browser/net/model/model/ios_chrome_http_user_agent_settings.o
+obj/ios/web/content/content/content_browser_context.o
+obj/ios/web/content/content/content_navigation_manager.o
+obj/ios/web/content/init/init/ios_main_delegate.o
+obj/third_party/blink/renderer/core/core/navigator_base.o
 EOF
   python3 - <<'PY'
 import os

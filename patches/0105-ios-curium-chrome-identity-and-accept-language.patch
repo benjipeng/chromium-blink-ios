@@ -1,0 +1,1088 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: authentic Chrome dual identity, Client Hints delegate, Accept-Language, and Blink favicon routing
+
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index af6d2b2..0f414ba 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -19,6 +19,7 @@
+ #include "base/no_destructor.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/system/sys_info.h"
+@@ -153,6 +154,80 @@ const std::string& GetWindowsPlatformVersion() {
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
++#if BUILDFLAG(IS_IOS)
++bool IsValidClientHintToken(const std::string& value) {
++  return !value.empty() && net::HttpUtil::IsValidHeaderValue(value) &&
++         value.find('"') == std::string::npos &&
++         value.find('\\') == std::string::npos &&
++         value.find(';') == std::string::npos;
++}
++
++const base::CommandLine* CurrentCommandLine() {
++  return base::CommandLine::InitializedForCurrentProcess()
++             ? base::CommandLine::ForCurrentProcess()
++             : nullptr;
++}
++
++// [ios-blink-sideload] Default mobile identity on Blink-for-iOS is Android
++// Chrome so UA, Client Hints, BoringSSL TLS, V8, touch, and plugin signals stay
++// self-consistent. Pass --curium-mobile-ua=ios to restore the iOS 18_7 UA.
++bool UseAndroidMobileIdentity() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-mobile-ua")) {
++    const std::string mode =
++        base::ToLowerASCII(cmd->GetSwitchValueASCII("curium-mobile-ua"));
++    if (mode == "ios") {
++      return false;
++    }
++  }
++  return true;
++}
++
++// [ios-blink-sideload] Emit the standard 3-brand Chrome Client Hints list
++// ("Google Chrome", "Chromium", GREASE) unless overridden via
++// --curium-ua-brand=chromium (or another valid brand token).
++std::optional<std::string> GetCuriumBrand() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-ua-brand")) {
++    const std::string raw = cmd->GetSwitchValueASCII("curium-ua-brand");
++    const std::string lowered = base::ToLowerASCII(raw);
++    if (lowered.empty() || lowered == "chromium" || lowered == "none") {
++      return std::nullopt;
++    }
++    if (lowered == "chrome" || lowered == "google chrome") {
++      return std::string("Google Chrome");
++    }
++    if (IsValidClientHintToken(raw)) {
++      return raw;
++    }
++  }
++  return std::string("Google Chrome");
++}
++
++std::string GetCuriumMobilePlatformVersion() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-mobile-platform-version")) {
++    const std::string ver =
++        cmd->GetSwitchValueASCII("curium-mobile-platform-version");
++    if (IsValidClientHintToken(ver)) {
++      return ver;
++    }
++  }
++  return "15.0.0";
++}
++
++std::string GetCuriumMobileModel() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-mobile-model")) {
++    const std::string model = cmd->GetSwitchValueASCII("curium-mobile-model");
++    if (IsValidClientHintToken(model)) {
++      return model;
++    }
++  }
++  return std::string();
++}
++#endif  // BUILDFLAG(IS_IOS)
++
+ const blink::UserAgentBrandList GetUserAgentBrandList(
+     const std::string& major_version,
+     const std::string& full_version,
+@@ -162,7 +237,9 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   bool parse_result = base::StringToInt(major_version, &major_version_number);
+   DCHECK(parse_result);
+   std::optional<std::string> brand;
+-#if !BUILDFLAG(CHROMIUM_BRANDING)
++#if BUILDFLAG(IS_IOS)
++  brand = GetCuriumBrand();
++#elif !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
+ #endif
+ 
+@@ -306,9 +383,12 @@ std::string GetUnifiedPlatform() {
+ #elif BUILDFLAG(IS_LINUX)
+   return "X11; Linux x86_64";
+ #elif BUILDFLAG(IS_IOS)
+-  // [ios-blink-sideload] Frozen at 18_7 like Safari on iOS 27 (upstream says
+-  // 14_0). Sites treat iOS 14 as outdated: google.com serves its basic HTML
+-  // page to it, but the full page to the same UA with 18_7.
++  // [ios-blink-sideload] Default mobile identity uses Android Chrome's unified
++  // platform so Blink + BoringSSL + V8 + Sec-CH-UA stay self-consistent; pass
++  // --curium-mobile-ua=ios to keep the frozen iOS 18_7 platform string.
++  if (UseAndroidMobileIdentity()) {
++    return "Linux; Android 10; K";
++  }
+   if (ui::GetDeviceFormFactor() == ui::DEVICE_FORM_FACTOR_TABLET) {
+     return "iPad; CPU iPad OS 18_7 like Mac OS X";
+   }
+@@ -598,6 +678,13 @@ std::string GetPlatformVersion() {
+   return GetWindowsPlatformVersion();
+ #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_FUCHSIA)
+   return std::string();
++#elif BUILDFLAG(IS_IOS)
++  if (UseAndroidMobileIdentity()) {
++    return GetCuriumMobilePlatformVersion();
++  }
++  int32_t major = 0, minor = 0, bugfix = 0;
++  base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
++  return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
+ #else
+ 
+   int32_t major, minor, bugfix = 0;
+@@ -624,6 +711,9 @@ std::string GetPlatformForUAMetadata() {
+   // TODO(crbug.com/40704421): This can be removed/re-refactored once we use
+   // "macOS" by default
+   return "macOS";
++#elif BUILDFLAG(IS_IOS)
++  return UseAndroidMobileIdentity() ? "Android"
++                                    : std::string(version_info::GetOSType());
+ #elif BUILDFLAG(IS_CHROMEOS)
+   // TODO(crbug.com/40846294): The branding change to remove the space caused a
+   // regression that's solved here. Ideally, we would just use the new OS name
+@@ -728,7 +818,7 @@ std::string GetCpuArchitecture() {
+     return "arm";
+   }
+ #elif BUILDFLAG(IS_IOS)
+-  return "arm";
++  return UseAndroidMobileIdentity() ? std::string() : "arm";
+ #elif BUILDFLAG(IS_ANDROID)
+   if (base::android::device_info::is_desktop() ||
+       base::android::device_info::is_xr()) {
+@@ -759,7 +849,9 @@ std::string GetCpuBitness() {
+           base::win::OSInfo::X86_ARCHITECTURE)
+              ? "32"
+              : "64";
+-#elif BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_FUCHSIA)
++#elif BUILDFLAG(IS_IOS)
++  return UseAndroidMobileIdentity() ? std::string() : "64";
++#elif BUILDFLAG(IS_MAC) || BUILDFLAG(IS_FUCHSIA)
+   return "64";
+ #elif BUILDFLAG(IS_ANDROID)
+   if (base::android::device_info::is_desktop() ||
+@@ -837,6 +929,10 @@ std::string BuildModelInfo() {
+   if (base::SysInfo::GetAndroidBuildCodename() == "REL") {
+     return base::SysInfo::HardwareModelName();
+   }
++#elif BUILDFLAG(IS_IOS)
++  if (UseAndroidMobileIdentity()) {
++    return GetCuriumMobileModel();
++  }
+ #endif
+ 
+   return std::string();
+@@ -915,4 +1011,53 @@ bool IsWoW64() {
+ #endif
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++void EnsureCuriumMobileUserAgentSwitch() {
++  if (!base::CommandLine::InitializedForCurrentProcess()) {
++    return;
++  }
++  base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++  if (cmd->HasSwitch(kUseMobileUserAgent)) {
++    return;
++  }
++  if (UseAndroidMobileIdentity() ||
++      ui::GetDeviceFormFactor() != ui::DEVICE_FORM_FACTOR_TABLET) {
++    cmd->AppendSwitch(kUseMobileUserAgent);
++  }
++}
++
++std::string GetCuriumAcceptLanguages() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-accept-lang")) {
++    const std::string raw = cmd->GetSwitchValueASCII("curium-accept-lang");
++    if (!raw.empty() && net::HttpUtil::IsValidHeaderValue(raw)) {
++      std::vector<std::string> sanitized;
++      for (std::string_view part :
++           base::SplitStringPiece(raw, ",", base::TRIM_WHITESPACE,
++                                  base::SPLIT_WANT_NONEMPTY)) {
++        // Strip any ";q=..." quality weight so ExpandLanguageList /
++        // GenerateAcceptLanguageHeader and navigator.languages never get
++        // duplicate or malformed quality parameters.
++        if (const size_t semi = part.find(';'); semi != std::string_view::npos) {
++          part = base::TrimWhitespaceASCII(part.substr(0, semi),
++                                           base::TRIM_ALL);
++        }
++        if (part.empty()) {
++          continue;
++        }
++        std::string token(part);
++        base::ReplaceChars(token, "_", "-", &token);
++        if (net::HttpUtil::IsValidHeaderValue(token)) {
++          sanitized.push_back(std::move(token));
++        }
++      }
++      if (!sanitized.empty()) {
++        return base::JoinString(sanitized, ",");
++      }
++    }
++  }
++  return "en-US,en";
++}
++#endif  // BUILDFLAG(IS_IOS)
++
+ }  // namespace embedder_support
+diff --git a/components/embedder_support/user_agent_utils.h b/components/embedder_support/user_agent_utils.h
+index 969d223..d78974c 100644
+--- a/components/embedder_support/user_agent_utils.h
++++ b/components/embedder_support/user_agent_utils.h
+@@ -149,6 +149,16 @@ std::string BuildUserAgentFromOSAndProduct(const std::string& os_info,
+ // Windows; returns false otherwise.
+ bool IsWoW64();
+ 
++#if BUILDFLAG(IS_IOS)
++// [ios-blink-sideload] Ensures --use-mobile-user-agent is set early in startup
++// when the mobile identity expects a phone UA/Client Hints profile.
++void EnsureCuriumMobileUserAgentSwitch();
++
++// [ios-blink-sideload] Returns the sanitized Accept-Language list configured
++// for Curium (--curium-accept-lang when valid, defaulting to "en-US,en").
++std::string GetCuriumAcceptLanguages();
++#endif  // BUILDFLAG(IS_IOS)
++
+ }  // namespace embedder_support
+ 
+ #endif  // COMPONENTS_EMBEDDER_SUPPORT_USER_AGENT_UTILS_H_
+diff --git a/components/embedder_support/user_agent_utils_unittest.cc b/components/embedder_support/user_agent_utils_unittest.cc
+index 23cbff0..1230aef 100644
+--- a/components/embedder_support/user_agent_utils_unittest.cc
++++ b/components/embedder_support/user_agent_utils_unittest.cc
+@@ -166,9 +166,7 @@ class UserAgentUtilsTest : public testing::Test {
+ #elif BUILDFLAG(IS_ANDROID)
+         "Linux; Android 10; K";
+ #elif BUILDFLAG(IS_IOS)
+-        ui::GetDeviceFormFactor() == ui::DEVICE_FORM_FACTOR_TABLET
+-            ? "iPad; CPU iPad OS 18_7 like Mac OS X"
+-            : "iPhone; CPU iPhone OS 18_7 like Mac OS X";
++        "Linux; Android 10; K";
+ #else
+ #error Unsupported platform
+ #endif
+@@ -314,8 +312,13 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+ 
+   const blink::UserAgentBrandVersion chromium_brand_version = {"Chromium",
+                                                                major_version};
++#if BUILDFLAG(IS_IOS)
++  const blink::UserAgentBrandVersion product_brand_version = {"Google Chrome",
++                                                              major_version};
++#else
+   const blink::UserAgentBrandVersion product_brand_version = {
+       std::string(version_info::GetProductName()), major_version};
++#endif
+ 
+   EXPECT_TRUE(ContainsBrandVersion(metadata.brand_version_list,
+                                    chromium_brand_version));
+@@ -325,8 +328,13 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+   // verify full version list
+   const blink::UserAgentBrandVersion chromium_brand_full_version = {
+       "Chromium", full_version};
++#if BUILDFLAG(IS_IOS)
++  const blink::UserAgentBrandVersion product_brand_full_version = {
++      "Google Chrome", full_version};
++#else
+   const blink::UserAgentBrandVersion product_brand_full_version = {
+       std::string(version_info::GetProductName()), full_version};
++#endif
+ 
+   EXPECT_TRUE(ContainsBrandVersion(metadata.brand_full_version_list,
+                                    chromium_brand_full_version));
+@@ -338,6 +346,8 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+   VerifyWinPlatformVersion(metadata.platform_version);
+ #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_FUCHSIA)
+   EXPECT_EQ(metadata.platform_version, "");
++#elif BUILDFLAG(IS_IOS)
++  EXPECT_EQ(metadata.platform_version, "15.0.0");
+ #else
+   int32_t major, minor, bugfix = 0;
+   base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
+@@ -352,7 +362,7 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+ #if BUILDFLAG(IS_WIN)
+   EXPECT_EQ(metadata.platform, "Windows");
+ #elif BUILDFLAG(IS_IOS)
+-  EXPECT_EQ(metadata.platform, "iOS");
++  EXPECT_EQ(metadata.platform, "Android");
+ #elif BUILDFLAG(IS_MAC)
+   EXPECT_EQ(metadata.platform, "macOS");
+ #elif BUILDFLAG(IS_CHROMEOS)
+diff --git a/components/favicon/ios/BUILD.gn b/components/favicon/ios/BUILD.gn
+index 15b9696..19a12cc 100644
+--- a/components/favicon/ios/BUILD.gn
++++ b/components/favicon/ios/BUILD.gn
+@@ -2,6 +2,8 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//build/config/features.gni")
++
+ source_set("ios") {
+   sources = [
+     "favicon_url_util.cc",
+@@ -11,10 +13,17 @@ source_set("ios") {
+   ]
+   deps = [
+     "//base",
++    "//build:blink_buildflags",
+     "//components/favicon/core",
+     "//components/favicon_base",
+     "//components/image_fetcher/ios",
+     "//ui/gfx",
+   ]
++  if (use_blink) {
++    deps += [
++      "//content/public/browser",
++      "//ios/web/content",
++    ]
++  }
+   public_deps = [ "//ios/web/public" ]
+ }
+diff --git a/components/favicon/ios/DEPS b/components/favicon/ios/DEPS
+index 2c09495..a34f152 100644
+--- a/components/favicon/ios/DEPS
++++ b/components/favicon/ios/DEPS
+@@ -1,5 +1,8 @@
+ include_rules = [
++  "+build/blink_buildflags.h",
+   "+components/image_fetcher/ios",
++  "+content/public/browser/web_contents.h",
++  "+ios/web/content/web_state/content_web_state.h",
+   "+ios/web/public",
+   "+services/network/public/cpp",
+ 
+diff --git a/components/favicon/ios/web_favicon_driver.mm b/components/favicon/ios/web_favicon_driver.mm
+index 2652bb5..de527a9 100644
+--- a/components/favicon/ios/web_favicon_driver.mm
++++ b/components/favicon/ios/web_favicon_driver.mm
+@@ -4,10 +4,17 @@
+ 
+ #include "components/favicon/ios/web_favicon_driver.h"
+ 
++#include <algorithm>
++
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
++#include "build/blink_buildflags.h"
+ #include "components/favicon/core/favicon_url.h"
+ #include "components/favicon/ios/favicon_url_util.h"
++#if BUILDFLAG(USE_BLINK)
++#include "content/public/browser/web_contents.h"
++#include "ios/web/content/web_state/content_web_state.h"
++#endif
+ #include "ios/web/public/browser_state.h"
+ #include "ios/web/public/favicon/favicon_status.h"
+ #include "ios/web/public/navigation/navigation_context.h"
+@@ -36,6 +43,21 @@
+ int WebFaviconDriver::DownloadImage(const GURL& url,
+                                     int max_image_size,
+                                     ImageDownloadCallback callback) {
++#if BUILDFLAG(USE_BLINK)
++  // [ios-blink-sideload] Route favicon fetches through the tab's Blink
++  // WebContents (matching ContentFaviconDriver) so /favicon.ico shares the
++  // tab's exact User-Agent, Client Hints, Accept-Language, and cookies.
++  if (web_state_) {
++    if (content::WebContents* web_contents =
++            static_cast<web::ContentWebState*>(web_state_)->GetWebContents()) {
++      const int clamped_size = std::max(0, max_image_size);
++      return web_contents->DownloadImage(
++          url, /*is_favicon=*/true, gfx::Size(clamped_size, clamped_size),
++          static_cast<uint32_t>(clamped_size), /*bypass_cache=*/false,
++          std::move(callback));
++    }
++  }
++#endif
+   static int downloaded_image_count = 0;
+   int local_download_id = ++downloaded_image_count;
+ 
+@@ -116,6 +138,9 @@
+ void WebFaviconDriver::DidFinishNavigation(
+     web::WebState* web_state,
+     web::NavigationContext* navigation_context) {
++  if (!navigation_context->HasCommitted()) {
++    return;
++  }
+   FetchFavicon(web_state->GetLastCommittedURL(),
+                navigation_context->IsSameDocument());
+ }
+@@ -144,7 +169,7 @@
+   // On iOS, the active URL can change between calls to FetchFavicon(). For
+   // instance, FetchFavicon() is not synchronously called when the active URL
+   // changes as a result of CRWSessionController::goToEntry().
+-  if (web_state_->GetLastCommittedURL() != page_url)
++  if (!web_state_ || web_state_->GetLastCommittedURL() != page_url)
+     return;
+ 
+   web_state_->SetFaviconStatus(favicon_status);
+diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.mm b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+index ec15a58..1bf1dac 100644
+--- a/ios/chrome/browser/curium/curium_web_state_delegate.mm
++++ b/ios/chrome/browser/curium/curium_web_state_delegate.mm
+@@ -16,6 +16,10 @@
+ #import "ios/chrome/browser/shared/model/web_state_list/web_state_list.h"
+ #import "ios/chrome/browser/shared/model/web_state_list/web_state_opener.h"
+ #import "ios/web/public/navigation/navigation_manager.h"
++#if BUILDFLAG(USE_BLINK)
++#import "ios/web/content/navigation/content_navigation_manager.h"
++#import "ios/web/content/web_state/content_web_state.h"
++#endif
+ #import "ios/web/public/permissions/permissions.h"
+ #import "ios/web/public/ui/context_menu_params.h"
+ #import "ios/web/public/ui/crw_web_view_proxy.h"
+@@ -111,6 +115,15 @@ - (nullable CuriumTabHost*)tabHostForWebState:(web::WebState*)webState;
+       std::unique_ptr<web::WebState> child =
+           web::WebState::Create(create_params);
+       web::WebState* raw_child = child.get();
++#if BUILDFLAG(USE_BLINK)
++      if ([host_ tabHostForWebState:source].usesDesktopUserAgent) {
++        if (content::WebContents* wc =
++                static_cast<web::ContentWebState*>(raw_child)
++                    ->GetWebContents()) {
++          web::SetDesktopUserAgentOverride(wc);
++        }
++      }
++#endif
+       raw_child->GetNavigationManager()->LoadURLWithParams(load_params);
+       const bool activate =
+           params.disposition !=
+diff --git a/ios/chrome/browser/net/model/BUILD.gn b/ios/chrome/browser/net/model/BUILD.gn
+index 718a6d1..5d38d36 100644
+--- a/ios/chrome/browser/net/model/BUILD.gn
++++ b/ios/chrome/browser/net/model/BUILD.gn
+@@ -19,8 +19,10 @@ source_set("model") {
+   ]
+   deps = [
+     "//base",
++    "//build:blink_buildflags",
+     "//components/component_updater",
+     "//components/content_settings/core/browser",
++    "//components/embedder_support:user_agent",
+     "//components/language/core/browser",
+     "//components/pref_registry",
+     "//components/prefs",
+diff --git a/ios/chrome/browser/net/model/ios_chrome_http_user_agent_settings.mm b/ios/chrome/browser/net/model/ios_chrome_http_user_agent_settings.mm
+index 3645ab7..4b2ce9f 100644
+--- a/ios/chrome/browser/net/model/ios_chrome_http_user_agent_settings.mm
++++ b/ios/chrome/browser/net/model/ios_chrome_http_user_agent_settings.mm
+@@ -5,6 +5,11 @@
+ #import "ios/chrome/browser/net/model/ios_chrome_http_user_agent_settings.h"
+ 
+ #import "base/check.h"
++#import "build/blink_buildflags.h"
++#if BUILDFLAG(USE_BLINK)
++#import "components/embedder_support/user_agent_utils.h"
++#import "net/http/http_util.h"
++#endif
+ #import "ios/web/public/thread/web_task_traits.h"
+ #import "ios/web/public/thread/web_thread.h"
+ #import "ios/web/public/web_client.h"
+@@ -22,6 +27,14 @@
+ 
+ std::string IOSChromeHttpUserAgentSettings::GetAcceptLanguage() const {
+   DCHECK_CURRENTLY_ON(web::WebThread::IO);
++#if BUILDFLAG(USE_BLINK)
++  std::string header = net::HttpUtil::GenerateAcceptLanguageHeader(
++      net::HttpUtil::ExpandLanguageList(
++          embedder_support::GetCuriumAcceptLanguages()));
++  if (!header.empty()) {
++    return header;
++  }
++#endif
+   return accept_language_handle_->GetAcceptLanguageHeader();
+ }
+ 
+diff --git a/ios/chrome/browser/web/model/BUILD.gn b/ios/chrome/browser/web/model/BUILD.gn
+index 573e47c..df5f16c 100644
+--- a/ios/chrome/browser/web/model/BUILD.gn
++++ b/ios/chrome/browser/web/model/BUILD.gn
+@@ -278,6 +278,7 @@ source_set("web_internal") {
+     "//components/autofill/ios/form_util:programmatic_form_submission_handler_feature",
+     "//components/content_settings/core/browser",
+     "//components/crash/core/common",
++    "//components/embedder_support:user_agent",
+     "//components/enterprise/connectors/core",
+     "//components/enterprise/net/core",
+     "//components/google/core/common",
+diff --git a/ios/chrome/browser/web/model/DEPS b/ios/chrome/browser/web/model/DEPS
+index f48bcf9..78fb327 100644
+--- a/ios/chrome/browser/web/model/DEPS
++++ b/ios/chrome/browser/web/model/DEPS
+@@ -86,6 +86,7 @@ specific_include_rules = {
+   ],
+   # TODO(crbug.com/40820398): Remove these dependencies.
+   "^chrome_web_client.mm": [
++    "+components/embedder_support/user_agent_utils.h",
+     "+ios/chrome/browser/shared/ui/elements/windowed_container_view.h",
+   ],
+   "^sad_tab_tab_helper.mm": [
+diff --git a/ios/chrome/browser/web/model/chrome_web_client.mm b/ios/chrome/browser/web/model/chrome_web_client.mm
+index 36e0800..69e1dd8 100644
+--- a/ios/chrome/browser/web/model/chrome_web_client.mm
++++ b/ios/chrome/browser/web/model/chrome_web_client.mm
+@@ -146,6 +146,9 @@
+ #import "ios/web/public/navigation/navigation_manager.h"
+ #import "net/base/net_errors.h"
+ #import "net/http/http_util.h"
++#if BUILDFLAG(USE_BLINK)
++#import "components/embedder_support/user_agent_utils.h"
++#endif
+ #import "services/metrics/public/cpp/ukm_source_id.h"
+ #import "ui/base/device_form_factor.h"
+ #import "ui/base/l10n/l10n_util.h"
+@@ -155,8 +158,10 @@
+ #import "url/url_constants.h"
+ 
+ namespace {
++#if !BUILDFLAG(USE_BLINK)
+ // The tag describing the product name with a placeholder for the version.
+ const char kProductTagWithPlaceholder[] = "CriOS/%s";
++#endif
+ 
+ // Returns the consumer or Enterprise safe browsing error page HTML.
+ NSString* GetSafeBrowsingErrorPageHTML(web::WebState* web_state,
+@@ -294,6 +299,7 @@
+   return base::SysUTF8ToNSString(error_page_content);
+ }
+ 
++#if !BUILDFLAG(USE_BLINK)
+ // Returns a string describing the product name and version, of the
+ // form "productname/version". Used as part of the user agent string.
+ std::string GetMobileProduct() {
+@@ -310,6 +316,7 @@
+   return base::StringPrintf(kProductTagWithPlaceholder,
+                             version_info::GetMajorVersionNumber().c_str());
+ }
++#endif
+ 
+ // Filter javascript: URLs and replace them by about:blank.
+ bool WillHandleWebBrowserJavascriptURLs(GURL* url, web::BrowserState*) {
+@@ -381,10 +388,21 @@ bool WillHandleWebBrowserJavascriptURLs(GURL* url, web::BrowserState*) {
+     LOG(WARNING) << "Ignored invalid value for flag --" << switches::kUserAgent;
+   }
+ 
++#if BUILDFLAG(USE_BLINK)
++  // [ios-blink-sideload] Keep iOS web-client fetchers aligned with Blink's
++  // Chrome User-Agent instead of emitting WebKit CriOS alongside Blink.
++  if (type == web::UserAgentType::DESKTOP) {
++    return embedder_support::BuildUserAgentFromOSAndProduct(
++        "Macintosh; Intel Mac OS X 10_15_7",
++        embedder_support::GetProductAndVersion());
++  }
++  return embedder_support::GetUserAgent();
++#else
+   if (type == web::UserAgentType::DESKTOP) {
+     return web::BuildDesktopUserAgent(GetDesktopProduct());
+   }
+   return web::BuildMobileUserAgent(GetMobileProduct());
++#endif
+ }
+ 
+ std::string ChromeWebClient::GetMainThreadName() const {
+diff --git a/ios/web/content/BUILD.gn b/ios/web/content/BUILD.gn
+index 3d284f4..b29556a 100644
+--- a/ios/web/content/BUILD.gn
++++ b/ios/web/content/BUILD.gn
+@@ -89,6 +89,7 @@ source_set("content") {
+     "//ios/web/util",
+     "//ios/web/webui",
+     "//net",
++    "//services/network/public/cpp",
+     "//third_party/abseil-cpp:absl",
+     "//third_party/blink/public/common",
+     "//media",
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index 01e5be6..753dd15 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -13,6 +13,12 @@ include_rules = [
+   # keep-sorted end
+ ]
+ specific_include_rules = {
++  "content_browser_context\\.mm": [
++    "+components/embedder_support/user_agent_utils.h",
++    "+services/network/public/cpp/is_potentially_trustworthy.h",
++    "+third_party/blink/public/common/client_hints/enabled_client_hints.h",
++    "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
++  ],
+   "content_permission_manager\\.mm": [
+     "+components/strings/grit/components_strings.h",
+     "+third_party/blink/public/common/permissions/permission_utils.h",
+@@ -21,6 +27,9 @@ specific_include_rules = {
+     "+cc/input/browser_controls_offset_tag_modifications.h",
+     "+components/embedder_support/ios/delegate/color_chooser/color_chooser_ios.h",
+     "+components/embedder_support/ios/delegate/file_chooser/file_select_helper_ios.h",
++    "+components/embedder_support/user_agent_utils.h",
++    "+net/http/http_util.h",
++    "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+     "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+     "+third_party/blink/public/mojom/favicon/favicon_url.mojom.h",
+     "+third_party/blink/public/mojom/page/page_visibility_state.mojom.h",
+diff --git a/ios/web/content/content_browser_context.h b/ios/web/content/content_browser_context.h
+index 615f252..245aaae 100644
+--- a/ios/web/content/content_browser_context.h
++++ b/ios/web/content/content_browser_context.h
+@@ -23,6 +23,7 @@ class BrowserContext;
+ namespace web {
+ 
+ class BrowserContextHolder;
++class ContentClientHintsControllerDelegate;
+ class ContentDownloadManagerDelegate;
+ class ContentPermissionManager;
+ 
+@@ -80,6 +81,9 @@ class ContentBrowserContext : public content::BrowserContext {
+   std::unique_ptr<ContentDownloadManagerDelegate> download_manager_delegate_;
+   // [ios-blink-sideload] Site permissions (see ContentPermissionManager).
+   std::unique_ptr<ContentPermissionManager> permission_manager_;
++  // [ios-blink-sideload] Client hints controller delegate so HTTPS navigations
++  // emit Sec-CH-UA* headers and persist Accept-CH / Critical-CH opt-ins.
++  std::unique_ptr<ContentClientHintsControllerDelegate> client_hints_delegate_;
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/content_browser_context.mm b/ios/web/content/content_browser_context.mm
+index a473fed..00639cd 100644
+--- a/ios/web/content/content_browser_context.mm
++++ b/ios/web/content/content_browser_context.mm
+@@ -6,14 +6,122 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++#import <map>
++#import <utility>
++#import <vector>
++
+ #import "base/strings/sys_string_conversions.h"
++#import "components/embedder_support/user_agent_utils.h"
++#import "content/public/browser/client_hints_controller_delegate.h"
+ #import "ios/web/content/content_permission_manager.h"
+ #import "ios/web/content/download/content_download_manager_delegate.h"
+ #import "ios/web/public/thread/web_task_traits.h"
+ #import "ios/web/public/thread/web_thread.h"
++#import "services/network/public/cpp/is_potentially_trustworthy.h"
++#import "third_party/blink/public/common/client_hints/enabled_client_hints.h"
++#import "third_party/blink/public/common/user_agent/user_agent_metadata.h"
++#import "ui/gfx/geometry/size.h"
++#import "url/origin.h"
+ 
+ namespace web {
+ 
++namespace {
++
++constexpr size_t kMaxPersistedClientHintOrigins = 1024;
++
++}  // namespace
++
++// [ios-blink-sideload] Lightweight in-memory ClientHintsControllerDelegate so
++// content's NavigationRequest sends Sec-CH-UA* low-entropy headers on HTTPS
++// navigations and persists Accept-CH / Critical-CH high-entropy opt-ins per
++// trustworthy origin.
++class ContentClientHintsControllerDelegate final
++    : public content::ClientHintsControllerDelegate {
++ public:
++  ContentClientHintsControllerDelegate() = default;
++  ~ContentClientHintsControllerDelegate() override = default;
++
++  network::NetworkQualityTracker* GetNetworkQualityTracker() override {
++    return nullptr;
++  }
++
++  void GetAllowedClientHintsFromSource(
++      const url::Origin& origin,
++      blink::EnabledClientHints* client_hints) override {
++    if (!client_hints) {
++      return;
++    }
++    if (network::IsOriginPotentiallyTrustworthy(origin)) {
++      if (auto it = origin_hints_.find(origin); it != origin_hints_.end()) {
++        for (const auto hint : it->second.GetEnabledHints()) {
++          client_hints->SetIsEnabled(hint, true);
++        }
++      }
++    }
++    for (const auto hint : additional_hints_) {
++      client_hints->SetIsEnabled(hint, true);
++    }
++  }
++
++  bool IsJavaScriptAllowed(const GURL& url,
++                           content::RenderFrameHost* parent_rfh) override {
++    return true;
++  }
++
++  blink::UserAgentMetadata GetUserAgentMetadata() override {
++    return embedder_support::GetUserAgentMetadata();
++  }
++
++  void PersistClientHints(
++      const url::Origin& primary_origin,
++      content::RenderFrameHost* parent_rfh,
++      const std::vector<network::mojom::WebClientHintsType>& client_hints)
++      override {
++    if (!network::IsOriginPotentiallyTrustworthy(primary_origin)) {
++      return;
++    }
++    if (client_hints.empty()) {
++      origin_hints_.erase(primary_origin);
++      return;
++    }
++    if (origin_hints_.size() >= kMaxPersistedClientHintOrigins &&
++        !origin_hints_.contains(primary_origin)) {
++      origin_hints_.clear();
++    }
++    blink::EnabledClientHints enabled;
++    for (const auto hint : client_hints) {
++      enabled.SetIsEnabled(hint, true);
++    }
++    origin_hints_[primary_origin] = std::move(enabled);
++  }
++
++  void ResetForTesting() override {
++    origin_hints_.clear();
++    additional_hints_.clear();
++  }
++
++  void SetAdditionalClientHints(
++      const std::vector<network::mojom::WebClientHintsType>& hints) override {
++    additional_hints_ = hints;
++  }
++
++  void ClearAdditionalClientHints() override { additional_hints_.clear(); }
++
++  void SetMostRecentMainFrameViewportSize(
++      const gfx::Size& viewport_size) override {
++    viewport_size_ = viewport_size;
++  }
++
++  gfx::Size GetMostRecentMainFrameViewportSize() override {
++    return viewport_size_;
++  }
++
++ private:
++  std::map<url::Origin, blink::EnabledClientHints> origin_hints_;
++  std::vector<network::mojom::WebClientHintsType> additional_hints_;
++  gfx::Size viewport_size_;
++};
++
+ const char kBrowserContextDataKey[] = "browser_context";
+ 
+ class BrowserContextHolder : public base::SupportsUserData::Data {
+@@ -129,7 +237,11 @@
+ 
+ content::ClientHintsControllerDelegate*
+ ContentBrowserContext::GetClientHintsControllerDelegate() {
+-  return nullptr;
++  if (!client_hints_delegate_) {
++    client_hints_delegate_ =
++        std::make_unique<ContentClientHintsControllerDelegate>();
++  }
++  return client_hints_delegate_.get();
+ }
+ 
+ content::BackgroundFetchDelegate*
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+index 4da6bfd..74e723f 100644
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -18,10 +18,12 @@ include_rules = [
+   "+net/base/ip_address.h",
+   "+net/base/ip_endpoint.h",
+   "+net/base/net_errors.h",
++  "+net/http/http_util.h",
+   "+net/log/net_log_source.h",
+   "+net/socket/tcp_server_socket.h",
+   "+services/device/public/cpp/geolocation",
+   "+services/service_manager/public/cpp",
++  "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+   "+third_party/blink/public/common/switches.h",
+   "+third_party/blink/public/common/web_preferences/web_preferences.h",
+   "+third_party/blink/public/platform/web_url_error.h",
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index 112a985..5fb7d79 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -58,11 +58,13 @@
+ #import "ios/web/content/picture_in_picture/ios_video_overlay_window.h"
+ #import "ios/web/content/ui/web_contents_view_delegate_impl.h"
+ #import "ios/web/public/browser_state.h"
++#import "net/http/http_util.h"
+ #import "services/network/public/cpp/resource_request.h"
+ #import "services/network/public/cpp/self_deleting_url_loader_factory.h"
+ #import "services/network/public/cpp/shared_url_loader_factory.h"
+ #import "services/network/public/mojom/network_context.mojom.h"
+ #import "services/network/public/mojom/url_loader.mojom.h"
++#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+ #include "ui/native_theme/native_theme.h"
+@@ -214,7 +216,16 @@ IOSContentBrowserClient::CreateBrowserMainParts(bool is_integration_test) {
+ 
+ std::string IOSContentBrowserClient::GetAcceptLangs(
+     content::BrowserContext* context) {
+-  return "en-us,en";
++  return embedder_support::GetCuriumAcceptLanguages();
++}
++
++void IOSContentBrowserClient::UpdateRendererPreferencesForWorker(
++    content::BrowserContext* browser_context,
++    blink::RendererPreferences* out_prefs) {
++  if (out_prefs) {
++    out_prefs->accept_languages =
++        net::HttpUtil::ExpandLanguageList(GetAcceptLangs(browser_context));
++  }
+ }
+ 
+ std::string IOSContentBrowserClient::GetProduct() {
+@@ -296,6 +307,13 @@ void IOSContentBrowserClient::ConfigureNetworkContextParams(
+     network::mojom::NetworkContextParams* network_context_params,
+     cert_verifier::mojom::CertVerifierCreationParams*
+         cert_verifier_creation_params) {
++  // [ios-blink-sideload] Populate User-Agent and Accept-Language on every
++  // Blink NetworkContext; without accept_language, navigation and fetch
++  // requests omit the Accept-Language header completely.
++  network_context_params->user_agent = GetUserAgent();
++  network_context_params->accept_language =
++      net::HttpUtil::GenerateAcceptLanguageHeader(
++          net::HttpUtil::ExpandLanguageList(GetAcceptLangs(context)));
+   if (!in_memory) {
+     network_context_params->file_paths =
+         network::mojom::NetworkContextFilePaths::New();
+diff --git a/ios/web/content/init/ios_content_browser_client.h b/ios/web/content/init/ios_content_browser_client.h
+index c7b5f69..a17571a 100644
+--- a/ios/web/content/init/ios_content_browser_client.h
++++ b/ios/web/content/init/ios_content_browser_client.h
+@@ -22,6 +22,9 @@ class IOSContentBrowserClient : public content::ContentBrowserClient {
+   std::unique_ptr<content::BrowserMainParts> CreateBrowserMainParts(
+       bool is_integration_test) override;
+   std::string GetAcceptLangs(content::BrowserContext* context) override;
++  void UpdateRendererPreferencesForWorker(
++      content::BrowserContext* browser_context,
++      blink::RendererPreferences* out_prefs) override;
+   std::string GetProduct() override;
+   std::string GetUserAgent() override;
+   blink::UserAgentMetadata GetUserAgentMetadata() override;
+diff --git a/ios/web/content/init/ios_main_delegate.mm b/ios/web/content/init/ios_main_delegate.mm
+index 338c45e..e555bf1 100644
+--- a/ios/web/content/init/ios_main_delegate.mm
++++ b/ios/web/content/init/ios_main_delegate.mm
+@@ -6,6 +6,7 @@
+ 
+ #import <variant>
+ 
++#import "components/embedder_support/user_agent_utils.h"
+ #import "content/public/app/initialize_mojo_core.h"
+ #import "content/public/renderer/content_renderer_client.h"
+ #import "ios/web/content/init/ios_content_browser_client.h"
+@@ -37,6 +38,10 @@
+ std::optional<int> IOSMainDelegate::PostEarlyInitialization(
+     InvokedIn invoked_in) {
+ #if BUILDFLAG(USE_BLINK)
++  // [ios-blink-sideload] Ensure --use-mobile-user-agent is set before
++  // BrowserMain / NetworkContext initialization so Mobile UA and Client Hints
++  // include "Mobile", Sec-CH-UA-Mobile: ?1, and Form-Factors: "Mobile".
++  embedder_support::EnsureCuriumMobileUserAgentSwitch();
+   web::GetWebClient()->InitializeFieldTrialAndFeatureList();
+   content::InitializeMojoCore();
+ #endif
+diff --git a/ios/web/content/navigation/content_navigation_manager.mm b/ios/web/content/navigation/content_navigation_manager.mm
+index edba81f..1dedd74 100644
+--- a/ios/web/content/navigation/content_navigation_manager.mm
++++ b/ios/web/content/navigation/content_navigation_manager.mm
+@@ -9,8 +9,11 @@
+ #import <sstream>
+ 
+ #import "base/apple/foundation_util.h"
++#import "base/command_line.h"
+ #import "base/notimplemented.h"
++#import "base/strings/stringprintf.h"
+ #import "base/strings/sys_string_conversions.h"
++#import "base/system/sys_info.h"
+ #import "components/embedder_support/user_agent_utils.h"
+ #import "content/public/browser/navigation_controller.h"
+ #import "content/public/browser/navigation_entry.h"
+@@ -55,6 +58,28 @@
+   }
+ }
+ 
++std::string DesktopMacPlatformVersion() {
++  if (base::CommandLine::InitializedForCurrentProcess()) {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("curium-desktop-platform-version")) {
++      const std::string ver =
++          cmd->GetSwitchValueASCII("curium-desktop-platform-version");
++      if (!ver.empty() && net::HttpUtil::IsValidHeaderValue(ver) &&
++          ver.find('"') == std::string::npos &&
++          ver.find('\\') == std::string::npos &&
++          ver.find(';') == std::string::npos) {
++        return ver;
++      }
++    }
++  }
++  int32_t major = 0, minor = 0, bugfix = 0;
++  base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
++  if (major >= 26) {
++    return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
++  }
++  return "15.5.0";
++}
++
+ // [ios-blink-sideload] Chrome on the Mac's user agent, for Request Desktop
+ // Site (Chrome on Android uses Linux's), with client hints to match.
+ blink::UserAgentOverride DesktopUserAgentOverride() {
+@@ -67,7 +92,8 @@
+           embedder_support::GetProductAndVersion());
+   ua_override.ua_metadata_override = metadata;
+   ua_override.ua_metadata_override->platform = "macOS";
+-  ua_override.ua_metadata_override->platform_version = std::string();
++  ua_override.ua_metadata_override->platform_version =
++      DesktopMacPlatformVersion();
+   ua_override.ua_metadata_override->model = std::string();
+   ua_override.ua_metadata_override->mobile = false;
+   ua_override.ua_metadata_override->form_factors =
+@@ -83,7 +109,7 @@
+ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
+   if (web_contents->GetUserAgentOverride().ua_string_override.empty()) {
+     web_contents->SetUserAgentOverride(DesktopUserAgentOverride(),
+-                                       /*override_in_new_tabs=*/false);
++                                       /*override_in_new_tabs=*/true);
+   }
+ }
+ 
+@@ -151,6 +177,14 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
+         base::apple::NSDataToSpan(web_params.post_data));
+   }
+ 
++  if (!controller_->GetLastCommittedEntry() &&
++      !web_state_->GetWebContents()
++           ->GetUserAgentOverride()
++           .ua_string_override.empty()) {
++    params.override_user_agent =
++        content::NavigationController::UA_OVERRIDE_TRUE;
++  }
++
+   // We are not setting the virtual URL for data URL here.
+   controller_->LoadURLWithParams(params);
+ }
+@@ -204,14 +238,26 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
+ }
+ 
+ void ContentNavigationManager::GoBack() {
++  if (content::NavigationEntry* target = controller_->GetEntryAtOffset(-1);
++      target && target->GetIsOverridingUserAgent()) {
++    SetDesktopUserAgentOverride(web_state_->GetWebContents());
++  }
+   controller_->GoBack();
+ }
+ 
+ void ContentNavigationManager::GoForward() {
++  if (content::NavigationEntry* target = controller_->GetEntryAtOffset(1);
++      target && target->GetIsOverridingUserAgent()) {
++    SetDesktopUserAgentOverride(web_state_->GetWebContents());
++  }
+   controller_->GoForward();
+ }
+ 
+ void ContentNavigationManager::GoToIndex(int index) {
++  if (content::NavigationEntry* target = controller_->GetEntryAtIndex(index);
++      target && target->GetIsOverridingUserAgent()) {
++    SetDesktopUserAgentOverride(web_state_->GetWebContents());
++  }
+   controller_->GoToIndex(index);
+ }
+ 
+@@ -238,6 +284,9 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
+   content::WebContents* web_contents = web_state_->GetWebContents();
+   if (desktop) {
+     SetDesktopUserAgentOverride(web_contents);
++  } else {
++    web_contents->SetUserAgentOverride(blink::UserAgentOverride(),
++                                       /*override_in_new_tabs=*/false);
+   }
+   entry->SetIsOverridingUserAgent(desktop);
+   // Recompute the page's preferences, as Android does
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index abc2465..c52780d 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -19,6 +19,7 @@
+ #import "cc/input/browser_controls_offset_tag_modifications.h"
+ #import "components/embedder_support/ios/delegate/color_chooser/color_chooser_ios.h"
+ #import "components/embedder_support/ios/delegate/file_chooser/file_select_helper_ios.h"
++#import "components/embedder_support/user_agent_utils.h"
+ #import "components/javascript_dialogs/tab_modal_dialog_manager.h"
+ #import "content/public/browser/child_process_security_policy.h"
+ #import "content/public/browser/file_select_listener.h"
+@@ -43,6 +44,7 @@
+ #endif
+ #import "ios/web/content/content_browser_context.h"
+ #import "ios/web/content/navigation/content_navigation_context.h"
++#import "ios/web/content/navigation/content_navigation_manager.h"
+ #import "ios/web/content/web_state/content_web_state_builder.h"
+ #import "ios/web/content/web_state/crc_find_in_page_controller.h"
+ #import "ios/web/content/web_state/crc_web_view_proxy_impl.h"
+@@ -66,9 +68,11 @@
+ #import "ios/web/webui/web_ui_ios_impl.h"
+ #import "net/cert/x509_util.h"
+ #import "net/cert/x509_util_apple.h"
++#import "net/http/http_util.h"
+ #import "services/network/public/mojom/referrer_policy.mojom-shared.h"
+ #import "skia/ext/skia_utils_ios.h"
+ #import "third_party/blink/public/common/mediastream/media_stream_request.h"
++#import "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #import "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #import "third_party/blink/public/mojom/favicon/favicon_url.mojom.h"
+ #import "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+@@ -207,12 +211,25 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+         static_cast<ContentWebState*>(params.opener_web_state);
+     DCHECK(opener_web_state->child_web_contents_);
+     web_contents_ = std::move(opener_web_state->child_web_contents_);
++    if (NavigationManager* opener_nav =
++            opener_web_state->GetNavigationManager()) {
++      if (NavigationItem* visible = opener_nav->GetVisibleItem();
++          visible && visible->GetUserAgentType() == UserAgentType::DESKTOP) {
++        SetDesktopUserAgentOverride(web_contents_.get());
++      }
++    }
+   } else {
+     web_contents_ = content::WebContents::Create(createParams);
+   }
+   web_contents_->SetUserData(
+       &kContentTabIdentityKey,
+       std::make_unique<ContentTabIdentity>(unique_identifier_));
++  // [ios-blink-sideload] Sync Blink renderer accept_languages so
++  // navigator.languages matches the NetworkContext Accept-Language header.
++  web_contents_->GetMutableRendererPrefs()->accept_languages =
++      net::HttpUtil::ExpandLanguageList(
++          embedder_support::GetCuriumAcceptLanguages());
++  web_contents_->SyncRendererPrefs();
+   web_contents_->SetDelegate(this);
+   WebContentsObserver::Observe(web_contents_.get());
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index c3385b9..08211f7 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -75,11 +75,15 @@ String NavigatorBase::platform() const {
+   }
+ #endif
+ #if BUILDFLAG(IS_IOS)
+-  // [ios-blink-sideload] Request Desktop Site gives the page a Mac's user agent
+-  // and client hints; say Mac here too, as Safari does.
+-  if (GetUserAgentMetadata().platform == "macOS") {
++  // [ios-blink-sideload] Keep navigator.platform aligned with the active
++  // User-Agent Client Hints platform (macOS Desktop, Android Mobile, or iOS).
++  const std::string& ua_platform = GetUserAgentMetadata().platform;
++  if (ua_platform == "macOS") {
+     return "MacIntel";
+   }
++  if (ua_platform == "Android") {
++    return "Linux armv81";
++  }
+ #endif
+   return GetReducedNavigatorPlatform();
+ }

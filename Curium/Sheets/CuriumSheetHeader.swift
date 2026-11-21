@@ -36,11 +36,39 @@ enum CuriumJitPreference: String, CaseIterable, Identifiable {
     }
 }
 
+enum CuriumUABrandPreference: String, CaseIterable, Identifiable {
+    case chrome
+    case chromium
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .chrome: return "Google Chrome"
+        case .chromium: return "Chromium"
+        }
+    }
+}
+
+enum CuriumMobileUAPreference: String, CaseIterable, Identifiable {
+    case android
+    case ios
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .android: return "Android Chrome"
+        case .ios: return "iOS Blink"
+        }
+    }
+}
+
 struct CuriumSettingsSheet: View {
     @Binding var palette: CuriumPalette
     @Binding var siteMode: CuriumSiteMode
     @Bindable var library: CuriumLibrary
     @AppStorage("curium.jitMode") private var jitPreference: CuriumJitPreference = .automatic
+    @AppStorage("curium.uaBrand") private var uaBrandPreference: CuriumUABrandPreference = .chrome
+    @AppStorage("curium.mobileUA") private var mobileUAPreference: CuriumMobileUAPreference = .android
     let engineReady: Bool
 
     @State private var showingDiagnostics = false
@@ -140,6 +168,23 @@ struct CuriumSettingsSheet: View {
                     Text("JavaScript Engine (V8)")
                 } footer: {
                     Text("Applies on next launch. Under LiveContainer on iOS 26/27, enable Launch with JIT with StikDebug's universal.js script; otherwise Curium runs safely in Jitless mode.")
+                }
+
+                Section {
+                    Picker("Browser Brand", selection: $uaBrandPreference) {
+                        ForEach(CuriumUABrandPreference.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    Picker("Mobile Profile", selection: $mobileUAPreference) {
+                        ForEach(CuriumMobileUAPreference.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                } header: {
+                    Text("Browser Identity")
+                } footer: {
+                    Text("Applies on next launch. Desktop tabs identify as macOS arm64 Chrome; Mobile tabs use the selected profile with system Accept-Language headers.")
                 }
 
                 Section("Browser") {

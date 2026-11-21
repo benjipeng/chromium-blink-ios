@@ -10,8 +10,8 @@ the pinned engine first, translate to `patches/` once proven.
 - **Engine:** build 37, `Kernel.lock` → `b25e8e3` (run `44875353052`, Chromium
   160.0.8171.0), patches through `0104` + `fb14c22`, with separate 83.4 MB
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`).
-- **On `ac_duo`:** `Curium-0.1.10-b14-arm64.ipa` (on Build 35); Build 37 app
-  `0.1.11 (15)` ready after Simulator verification and Sire's approval.
+- **On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (hot-swapped into LiveContainer
+  `com.appautomaton.curium.app` and copied to LiveContainer `Documents/`).
 
 ## App (on the pinned engine)
 
@@ -194,6 +194,18 @@ All five matching runtime hooks have been retired from `Curium/Engine/`.
   Moved the 0.15 s settle + 0.6 s readiness gate and single 0.25 s failure retry
   into `CuriumPiPBridge` (and added an auto-skip guard in `CuriumPictureInPictureHooks.m`).
   Retires `CuriumPictureInPictureHooks.m` once `Kernel.lock` repins.
+- [ ] **Authentic Chrome dual identity, Client Hints delegate & `Accept-Language` (`0105-ios-curium-chrome-identity-and-accept-language.patch`).**
+  Fixes DataDome / Cloudflare / `wsj.com` bot rejections caused by missing
+  `Accept-Language` headers on Blink requests, `nullptr`
+  `ClientHintsControllerDelegate` (zero `Sec-CH-UA*` on HTTPS navigations and
+  dead `Accept-CH` / `Critical-CH`), unbranded 2-brand `Chromium` Client Hints,
+  impossible `iPhone OS 18_7 + Chrome/ + Sec-CH-UA-Platform: "iOS"` mobile UA,
+  empty macOS Desktop `platform_version`, `/favicon.ico` dual-UA `CriOS` split,
+  and lost Desktop override on `window.open` / `target="_blank"`. Configurable
+  via Swift-owned launch switches (`--curium-ua-brand`, `--curium-mobile-ua`,
+  `--curium-accept-lang`, `--curium-mobile-platform-version`,
+  `--curium-mobile-model`, `--curium-desktop-platform-version`) persisted in
+  Curium Settings.
 - [ ] **Drop `helpers/extensions_ui` from packaging.** It hooks Chrome's Settings
   screen, which Curium never shows, and `scripts/sync_curium_engine.py` does not
   carry it into `Vendor/CuriumEngine/`. Retire the extension steps in

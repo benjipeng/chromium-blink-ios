@@ -88,6 +88,60 @@ static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
     return YES;
 }
 
+// Adds `--name=value` only if neither `--name` nor `--name=...` is already set
+// on the process command line (so explicit launch overrides always win).
+static BOOL CuriumSetDefaultSwitchValue(NSMutableArray<NSString *> *args,
+                                        NSString *name,
+                                        NSString *_Nullable value) {
+    if (value.length == 0) {
+        return NO;
+    }
+    NSString *prefix = [name stringByAppendingString:@"="];
+    for (NSString *arg in args) {
+        if ([arg isEqualToString:name] || [arg hasPrefix:prefix]) {
+            return NO;
+        }
+    }
+    [args addObject:[prefix stringByAppendingString:value]];
+    return YES;
+}
+
+// Normalizes iOS preferredLanguages (e.g. "zh-Hans-CN", "en-US") into Chrome-
+// style BCP-47 tags suitable for --curium-accept-lang.
+static NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferred) {
+    NSMutableArray<NSString *> *tags = [NSMutableArray arrayWithCapacity:4];
+    for (NSString *raw in preferred) {
+        if (tags.count >= 4) {
+            break;
+        }
+        NSString *cleaned = [[raw stringByTrimmingCharactersInSet:
+                              [NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                             stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+        if (cleaned.length == 0) {
+            continue;
+        }
+        NSArray<NSString *> *parts = [cleaned componentsSeparatedByString:@"-"];
+        NSString *normalized = cleaned;
+        if (parts.count >= 3 && parts[1].length == 4) {
+            // Collapse script subtags like zh-Hans-CN -> zh-CN, zh-Hant-TW -> zh-TW.
+            normalized = [NSString stringWithFormat:@"%@-%@", parts[0], parts[2]];
+        } else if (parts.count == 2 && parts[1].length == 4) {
+            if ([parts[0].lowercaseString isEqualToString:@"zh"]) {
+                normalized = [parts[1].lowercaseString isEqualToString:@"hant"] ? @"zh-TW" : @"zh-CN";
+            } else {
+                normalized = parts[0];
+            }
+        }
+        if (normalized.length > 0 && ![tags containsObject:normalized]) {
+            [tags addObject:normalized];
+        }
+    }
+    if (tags.count == 0) {
+        return @"en-US,en";
+    }
+    return [tags componentsJoinedByString:@","];
+}
+
 // Appends |items| to a list-valued switch such as --disable-features. Chromium
 // keeps only the last occurrence of a switch, so a second copy would silently
 // drop the first one's items.
@@ -112,7 +166,11 @@ static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *na
 // NSArgumentDomain can never re-enter a dispatch_once lock on the main thread.
 static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL supportsDisableSync,
-                                                 NSString *_Nullable jitPref) {
+                                                 NSString *_Nullable jitPref,
+                                                 NSString *_Nullable uaBrandPref,
+                                                 NSString *_Nullable mobileUAPref,
+                                                 NSString *_Nullable acceptLangPref,
+                                                 NSString *_Nullable mobileModelPref) {
     NSMutableArray<NSString *> *args = [base mutableCopy];
     BOOL changed = NO;
 
@@ -142,6 +200,13 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumAddSwitch(args, @"--curium-enable-jit");
     }
 
+    // Browser identity & Accept-Language switches (consumed natively by patch 0105;
+    // safely ignored on older engines).
+    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-ua-brand", uaBrandPref);
+    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-ua", mobileUAPref);
+    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-accept-lang", acceptLangPref);
+    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-model", mobileModelPref);
+
     return changed ? [args copy] : base;
 }
 
@@ -160,9 +225,18 @@ static void CuriumInstallCommandLineGuard(void) {
         NSArray<NSString *> *base = [processInfo arguments] ?: @[];
         BOOL supportsDisableSync =
             [[NSBundle mainBundle].infoDictionary[@"CuriumEngineSupportsDisableSync"] boolValue];
-        NSString *jitPref =
-            [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
-        gCuriumAugmentedArguments = CuriumBuildArguments(base, supportsDisableSync, jitPref);
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSString *jitPref = [[defaults stringForKey:@"curium.jitMode"] copy];
+        NSString *uaBrandPref = [[defaults stringForKey:@"curium.uaBrand"] copy];
+        NSString *mobileUAPref = [[defaults stringForKey:@"curium.mobileUA"] copy];
+        NSString *customAcceptLang = [[defaults stringForKey:@"curium.acceptLang"] copy];
+        NSString *acceptLangPref = customAcceptLang.length > 0
+            ? customAcceptLang
+            : CuriumNormalizedAcceptLanguages([NSLocale preferredLanguages]);
+        NSString *mobileModelPref = [[defaults stringForKey:@"curium.mobileModel"] copy];
+        gCuriumAugmentedArguments = CuriumBuildArguments(
+            base, supportsDisableSync, jitPref, uaBrandPref, mobileUAPref,
+            acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
         SEL sel = @selector(arguments);
@@ -176,10 +250,14 @@ static void CuriumInstallCommandLineGuard(void) {
                              method_getTypeEncoding(method))) {
             method_setImplementation(method, (IMP)CuriumAugmentedProcessArguments);
         }
-        NSString *detail = [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@)",
+        NSString *detail = [NSString stringWithFormat:
+                            @"%lu args (disable-sync=%d, jit=%@, brand=%@, mobile=%@, lang=%@)",
                             (unsigned long)gCuriumAugmentedArguments.count,
                             supportsDisableSync ? 1 : 0,
-                            jitPref.length > 0 ? jitPref : @"automatic"];
+                            jitPref.length > 0 ? jitPref : @"automatic",
+                            uaBrandPref.length > 0 ? uaBrandPref : @"chrome",
+                            mobileUAPref.length > 0 ? mobileUAPref : @"android",
+                            acceptLangPref];
         CuriumRecordHookStatus(@"Command-Line Guard", @"active", detail);
     });
 }
