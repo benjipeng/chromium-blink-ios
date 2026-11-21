@@ -1,0 +1,226 @@
+name: Build & Release Curium IPA
+run-name: Curium · ${{ github.ref_name }} · #${{ github.run_number }}
+
+# Pipeline 2: builds the Swift Curium browser app (Curium.xcodeproj + Curium/)
+# against the prebuilt Chromium Blink engine pinned in Kernel.lock (produced by
+# Pipeline 1: build-ipa.yml), verifies iOS 27.2 SDK linkage and inside-out
+# ad-hoc code signing, and publishes the packaged arm64 IPA to GitHub Releases.
+#
+# Runs independently of build-ipa.yml and never rebuilds Chromium.
+
+on:
+  push:
+    tags:
+      - "curium-v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create or update a GitHub Release with the built Curium IPA"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Optional GitHub Release tag override (defaults to curium-v<MARKETING_VERSION>)"
+        type: string
+        default: ""
+      release_notes:
+        description: "Optional extra notes prepended to the GitHub Release description"
+        type: string
+        default: ""
+      engine_release_tag:
+        description: "Optional GitHub Release tag for the pinned engine IPA (fallback if the 30-day Actions artifact expired)"
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      publish_release:
+        type: boolean
+        default: false
+      prerelease:
+        type: boolean
+        default: false
+      release_tag:
+        type: string
+        default: ""
+      engine_release_tag:
+        type: string
+        default: ""
+
+concurrency:
+  group: curium-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-curium:
+    name: Build Curium IPA (Xcode 27.2)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Read Version.xcconfig and Kernel.lock
+        id: meta
+        run: |
+          set -euo pipefail
+          read_var() {
+            awk -F'=' -v k="$1" '
+              $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+                sub(/^[^=]*=/, "", $0)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+                print $0
+                exit
+              }
+            ' "$2"
+          }
+          version="$(read_var MARKETING_VERSION Version.xcconfig)"
+          build_num="$(read_var CURRENT_PROJECT_VERSION Version.xcconfig)"
+          kernel_sha="$(read_var KERNEL_IPA_SHA256 Kernel.lock)"
+          kernel_run="$(read_var KERNEL_RUN_ID Kernel.lock)"
+          kernel_ver="$(read_var KERNEL_CHROMIUM_VERSION Kernel.lock)"
+          kernel_commit="$(read_var KERNEL_COMMIT Kernel.lock)"
+          {
+            echo "version=$version"
+            echo "build_number=$build_num"
+            echo "kernel_ipa_sha256=$kernel_sha"
+            echo "kernel_run_id=$kernel_run"
+            echo "kernel_chromium_version=$kernel_ver"
+            echo "kernel_commit=$kernel_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cache verified Chromium engine IPA
+        uses: actions/cache@v4
+        with:
+          path: .curium-ci-cache/engine-ipa
+          key: curium-engine-ipa-${{ steps.meta.outputs.kernel_ipa_sha256 }}
+
+      - name: Build, verify, and package Curium IPA
+        id: build
+        env:
+          ENGINE_RELEASE_TAG: ${{ inputs.engine_release_tag }}
+        run: |
+          set -euo pipefail
+          args=(
+            --xcode /Applications/Xcode_27.2.app
+            --configuration Release
+            --output-dir dist
+            --ipa-cache .curium-ci-cache/engine-ipa
+          )
+          if [ -n "$ENGINE_RELEASE_TAG" ]; then
+            args+=(--release-tag "$ENGINE_RELEASE_TAG")
+          fi
+          ./scripts/build_curium_ipa.sh "${args[@]}"
+
+      - name: Upload Curium IPA artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Curium-${{ steps.build.outputs.version }}-b${{ steps.build.outputs.build_number }}-arm64
+          path: |
+            dist/*.ipa
+            dist/*.ipa.sha256
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' || inputs.publish_release == true
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_RELEASE_NOTES: ${{ inputs.release_notes }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          CURIUM_VERSION: ${{ steps.build.outputs.version }}
+          CURIUM_BUILD: ${{ steps.build.outputs.build_number }}
+          IPA_PATH: ${{ steps.build.outputs.ipa_path }}
+          SHA_PATH: ${{ steps.build.outputs.sha256_path }}
+          IPA_NAME: ${{ steps.build.outputs.ipa_name }}
+          IPA_SHA256: ${{ steps.build.outputs.ipa_sha256 }}
+          IPA_SIZE: ${{ steps.build.outputs.ipa_size }}
+          SDK_VERSION: ${{ steps.build.outputs.sdk_version }}
+          CHROMIUM_VERSION: ${{ steps.build.outputs.chromium_version }}
+          KERNEL_COMMIT: ${{ steps.build.outputs.kernel_commit }}
+          KERNEL_RUN_ID: ${{ steps.build.outputs.kernel_run_id }}
+          KERNEL_IPA_SHA256: ${{ steps.build.outputs.kernel_ipa_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [ -n "$INPUT_RELEASE_TAG" ]; then
+            tag="$INPUT_RELEASE_TAG"
+          else
+            tag="curium-v${CURIUM_VERSION}"
+          fi
+
+          notes_file="$RUNNER_TEMP/curium-release-notes.md"
+          {
+            if [ -n "$INPUT_RELEASE_NOTES" ]; then
+              printf '%s\n\n' "$INPUT_RELEASE_NOTES"
+            fi
+            cat <<EOF
+          ### Curium ${CURIUM_VERSION} (${CURIUM_BUILD})
+
+          Ad-hoc signed \`arm64\` iOS IPA built with Xcode ${SDK_VERSION} (iOS ${SDK_VERSION} SDK) for LiveContainer and sideloading.
+
+          | Field | Value |
+          | --- | --- |
+          | **Artifact** | \`${IPA_NAME}\` (${IPA_SIZE}) |
+          | **Curium IPA SHA-256** | \`${IPA_SHA256}\` |
+          | **iOS SDK** | \`${SDK_VERSION}\` (\`arm64\`) |
+          | **Chromium Blink Engine** | \`${CHROMIUM_VERSION}\` (commit \`${KERNEL_COMMIT:0:7}\`, run \`${KERNEL_RUN_ID}\`) |
+          | **Engine IPA SHA-256** | \`${KERNEL_IPA_SHA256}\` |
+          | **Source Commit** | \`${GITHUB_SHA:0:7}\` |
+          EOF
+          } > "$notes_file"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --title "Curium ${CURIUM_VERSION} (${CURIUM_BUILD})" \
+              --notes-file "$notes_file"
+            gh release upload "$tag" "$IPA_PATH" "$SHA_PATH" --clobber
+          else
+            extra_flags=()
+            if [ "$INPUT_PRERELEASE" = "true" ]; then
+              extra_flags+=(--prerelease)
+            fi
+            gh release create "$tag" \
+              "$IPA_PATH" "$SHA_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "Curium ${CURIUM_VERSION} (${CURIUM_BUILD})" \
+              --notes-file "$notes_file" \
+              --generate-notes \
+              ${extra_flags[@]+"${extra_flags[@]}"}
+          fi
+          echo "Published GitHub Release: $tag"
+
+      - name: Write job summary
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Curium ${CURIUM_VERSION} (${CURIUM_BUILD})
+
+          | Metric | Value |
+          | --- | --- |
+          | **IPA** | \`${IPA_NAME}\` (${IPA_SIZE}) |
+          | **SHA-256** | \`${IPA_SHA256}\` |
+          | **SDK** | iPhoneOS \`${SDK_VERSION}\` (\`arm64\`) |
+          | **Engine** | Chromium \`${CHROMIUM_VERSION}\` (run \`${KERNEL_RUN_ID}\`, commit \`${KERNEL_COMMIT:0:7}\`) |
+          | **Release published** | \`${PUBLISHED}\` |
+          EOF
+        env:
+          CURIUM_VERSION: ${{ steps.build.outputs.version }}
+          CURIUM_BUILD: ${{ steps.build.outputs.build_number }}
+          IPA_NAME: ${{ steps.build.outputs.ipa_name }}
+          IPA_SIZE: ${{ steps.build.outputs.ipa_size }}
+          IPA_SHA256: ${{ steps.build.outputs.ipa_sha256 }}
+          SDK_VERSION: ${{ steps.build.outputs.sdk_version }}
+          CHROMIUM_VERSION: ${{ steps.build.outputs.chromium_version }}
+          KERNEL_RUN_ID: ${{ steps.build.outputs.kernel_run_id }}
+          KERNEL_COMMIT: ${{ steps.build.outputs.kernel_commit }}
+          PUBLISHED: ${{ github.event_name == 'push' || inputs.publish_release == true }}

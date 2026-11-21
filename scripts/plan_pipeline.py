@@ -58,6 +58,7 @@ STAGE_FILES = {
 NON_OUTPUT = {
     "ci/ccache.env",
     "ci/epochs.json",  # read per stage below
+    "scripts/build_curium_ipa.sh",
     "scripts/check_inputs.py",
     "scripts/check_remote_patches.py",
     "scripts/compare_graphs.py",

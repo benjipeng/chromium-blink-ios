@@ -66,11 +66,37 @@ def run(*args: str | Path, capture: bool = False) -> str:
                           text=True).stdout or ""
 
 
-def download(lock: dict[str, str], directory: Path) -> Path:
+def download(lock: dict[str, str], directory: Path,
+             release_tag: str | None = None,
+             ipa_cache: Path | None = None) -> Path:
     name = lock["KERNEL_ARTIFACT_NAME"]
-    run("gh", "run", "download", lock["KERNEL_RUN_ID"], "--repo", lock["KERNEL_REPO"],
-        "--name", name, "--dir", directory)
-    return directory / f"{name}.ipa"
+    expected_sha = lock["KERNEL_IPA_SHA256"]
+    cached_path = (ipa_cache / f"{name}.ipa") if ipa_cache is not None else None
+    if cached_path is not None and cached_path.is_file():
+        sha = hashlib.sha256()
+        with cached_path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                sha.update(chunk)
+        if sha.hexdigest() == expected_sha:
+            print(f"Using cached engine IPA: {cached_path}")
+            return cached_path
+        print(f"Cached engine IPA digest mismatch ({cached_path}); re-downloading...", file=sys.stderr)
+
+    effective_tag = release_tag or lock.get("KERNEL_RELEASE_TAG")
+    target = directory / f"{name}.ipa"
+    if effective_tag:
+        run("gh", "release", "download", effective_tag, "--repo", lock["KERNEL_REPO"],
+            "--pattern", f"{name}.ipa", "--dir", directory, "--clobber")
+    else:
+        run("gh", "run", "download", lock["KERNEL_RUN_ID"], "--repo", lock["KERNEL_REPO"],
+            "--name", name, "--dir", directory)
+
+    if cached_path is not None and target.is_file():
+        ipa_cache.mkdir(parents=True, exist_ok=True)
+        tmp_cache = cached_path.with_suffix(".ipa.tmp")
+        shutil.copy2(target, tmp_cache)
+        tmp_cache.replace(cached_path)
+    return target
 
 
 def is_resource(path: PurePosixPath) -> bool:
@@ -218,11 +244,12 @@ def timestamp() -> str:
     return now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def sync(ipa: Path | None, skip_sha256: bool, lock: dict[str, str]) -> None:
-    source_type = "local" if ipa is not None else "github-actions"
+def sync(ipa: Path | None, skip_sha256: bool, lock: dict[str, str],
+         release_tag: str | None = None, ipa_cache: Path | None = None) -> None:
+    source_type = "local" if ipa is not None else ("github-release" if (release_tag or lock.get("KERNEL_RELEASE_TAG")) else "github-actions")
     with tempfile.TemporaryDirectory(prefix="curium-ipa-") as directory:
         if ipa is None:
-            ipa = download(lock, Path(directory))
+            ipa = download(lock, Path(directory), release_tag=release_tag, ipa_cache=ipa_cache)
         with ipa.open("rb") as source:
             sha = hashlib.sha256()
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -308,6 +335,8 @@ def main() -> int:
     mode.add_argument("--ipa", type=Path, help="Use a local IPA instead of downloading the pinned artifact")
     mode.add_argument("--status", action="store_true", help="Check the installed engine offline")
     parser.add_argument("--skip-sha256", action="store_true", help="Allow an unverified IPA with --ipa only")
+    parser.add_argument("--release-tag", help="Download the pinned engine IPA from this GitHub Release tag instead of the Actions run")
+    parser.add_argument("--ipa-cache", type=Path, help="Cache directory for storing and reusing the verified engine IPA")
     args = parser.parse_args()
     if args.skip_sha256 and args.ipa is None:
         parser.error("--skip-sha256 requires --ipa")
@@ -315,7 +344,7 @@ def main() -> int:
         lock = read_lock()
         if args.status:
             return status(lock)
-        sync(args.ipa, args.skip_sha256, lock)
+        sync(args.ipa, args.skip_sha256, lock, release_tag=args.release_tag, ipa_cache=args.ipa_cache)
     except (OSError, ValueError, KeyError, BadZipFile, plistlib.InvalidFileException,
             subprocess.CalledProcessError) as error:
         print(f"Curium engine: {error}", file=sys.stderr)
