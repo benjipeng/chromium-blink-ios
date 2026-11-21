@@ -1,5 +1,5 @@
 name: Build & Release Curium IPA
-run-name: Curium · ${{ github.ref_name }} · #${{ github.run_number }}
+run-name: "Curium · ${{ github.ref_name }} · #${{ github.run_number }}"
 
 # Pipeline 2: builds the Swift Curium browser app (Curium.xcodeproj + Curium/)
 # against the prebuilt Chromium Blink engine pinned in Kernel.lock (produced by
@@ -99,7 +99,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Cache verified Chromium engine IPA
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .curium-ci-cache/engine-ipa
           key: curium-engine-ipa-${{ steps.meta.outputs.kernel_ipa_sha256 }}

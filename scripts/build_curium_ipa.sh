@@ -149,8 +149,8 @@ xcodebuild \
   -configuration "$CONFIGURATION" \
   -sdk iphoneos \
   -destination 'generic/platform=iOS' \
-  -arch arm64 \
   -derivedDataPath "$DERIVED_DATA" \
+  ARCHS=arm64 \
   CURIUM_USE_ENGINE_XCFRAMEWORK=YES \
   CODE_SIGN_IDENTITY="" \
   CODE_SIGNING_REQUIRED=NO \
