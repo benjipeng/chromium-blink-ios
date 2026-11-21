@@ -424,4 +424,22 @@ struct CuriumDiagnosticsAndLayoutTests {
         ]
         #expect(CuriumDiagnostics.summarizeHooks(withFailed) == ("1 failed · 1/2 active", true))
     }
+
+    @Test("Accept-Language normalization preserves BCP-47 scripts, deduplicates, validates, and caps at 4")
+    func acceptLanguageNormalization() {
+        #expect(
+            CuriumNormalizedAcceptLanguages(["zh-Hant-HK", "zh_hans_cn", "en-US", "es-419", "fr-FR"])
+                == "zh-Hant-HK,zh-Hans-CN,en-US,es-419"
+        )
+        #expect(
+            CuriumNormalizedAcceptLanguages(["en-us", "EN_US", " zh-Hant-TW ", "zh-hant-tw"])
+                == "en-US,zh-Hant-TW"
+        )
+        #expect(
+            CuriumNormalizedAcceptLanguages(["", "en--US", "en;q=0.9", "123-US", "en-u", "sr-Latn-RS"])
+                == "sr-Latn-RS"
+        )
+        #expect(CuriumNormalizedAcceptLanguages(nil) == "en-US,en")
+        #expect(CuriumNormalizedAcceptLanguages(["bad;header"]) == "en-US,en")
+    }
 }

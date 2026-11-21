@@ -106,33 +106,85 @@ static BOOL CuriumSetDefaultSwitchValue(NSMutableArray<NSString *> *args,
     return YES;
 }
 
-// Normalizes iOS preferredLanguages (e.g. "zh-Hans-CN", "en-US") into Chrome-
-// style BCP-47 tags suitable for --curium-accept-lang.
-static NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferred) {
+// Validates and canonicalizes a BCP-47 language tag (e.g. "zh-Hant-HK",
+// "en-US", "es-419") while preserving script subtags so Chromium's
+// ExpandLanguageList can derive fallbacks (e.g. "zh-Hant-HK,zh-Hant,zh").
+static NSString *_Nullable CuriumCanonicalBCP47Tag(NSString *raw) {
+    NSString *cleaned = [[raw stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                         stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+    if (cleaned.length == 0 || cleaned.length > 35) {
+        return nil;
+    }
+    NSArray<NSString *> *parts = [cleaned componentsSeparatedByString:@"-"];
+    if (parts.count == 0 || parts.count > 6) {
+        return nil;
+    }
+    NSMutableArray<NSString *> *canonical = [NSMutableArray arrayWithCapacity:parts.count];
+    BOOL seenSingleton = NO;
+    for (NSUInteger i = 0; i < parts.count; i++) {
+        NSString *subtag = parts[i];
+        NSUInteger len = subtag.length;
+        if (len == 0 || len > 8) {
+            return nil;
+        }
+        BOOL allLetters = YES;
+        for (NSUInteger j = 0; j < len; j++) {
+            unichar c = [subtag characterAtIndex:j];
+            BOOL isLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            BOOL isDigit = (c >= '0' && c <= '9');
+            if (!isLetter && !isDigit) {
+                return nil;
+            }
+            if (!isLetter) {
+                allLetters = NO;
+            }
+        }
+        if (i == 0) {
+            if (!allLetters || len < 2) {
+                return nil;
+            }
+            [canonical addObject:subtag.lowercaseString];
+            continue;
+        }
+        if (seenSingleton) {
+            [canonical addObject:subtag.lowercaseString];
+        } else if (len == 1) {
+            if (i + 1 == parts.count) {
+                return nil;
+            }
+            seenSingleton = YES;
+            [canonical addObject:subtag.lowercaseString];
+        } else if (len == 4 && allLetters) {
+            NSString *lower = subtag.lowercaseString;
+            NSString *titled = [[[lower substringToIndex:1] uppercaseString]
+                                stringByAppendingString:[lower substringFromIndex:1]];
+            [canonical addObject:titled];
+        } else if (len == 2 && allLetters) {
+            [canonical addObject:subtag.uppercaseString];
+        } else {
+            [canonical addObject:subtag.lowercaseString];
+        }
+    }
+    return [canonical componentsJoinedByString:@"-"];
+}
+
+// Validates, deduplicates, and caps preferred BCP-47 language tags for
+// --curium-accept-lang. Chromium's ExpandLanguageList appends base fallbacks.
+NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferred) {
     NSMutableArray<NSString *> *tags = [NSMutableArray arrayWithCapacity:4];
+    NSMutableSet<NSString *> *seen = [NSMutableSet setWithCapacity:4];
     for (NSString *raw in preferred) {
         if (tags.count >= 4) {
             break;
         }
-        NSString *cleaned = [[raw stringByTrimmingCharactersInSet:
-                              [NSCharacterSet whitespaceAndNewlineCharacterSet]]
-                             stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
-        if (cleaned.length == 0) {
+        NSString *normalized = CuriumCanonicalBCP47Tag(raw);
+        if (!normalized) {
             continue;
         }
-        NSArray<NSString *> *parts = [cleaned componentsSeparatedByString:@"-"];
-        NSString *normalized = cleaned;
-        if (parts.count >= 3 && parts[1].length == 4) {
-            // Collapse script subtags like zh-Hans-CN -> zh-CN, zh-Hant-TW -> zh-TW.
-            normalized = [NSString stringWithFormat:@"%@-%@", parts[0], parts[2]];
-        } else if (parts.count == 2 && parts[1].length == 4) {
-            if ([parts[0].lowercaseString isEqualToString:@"zh"]) {
-                normalized = [parts[1].lowercaseString isEqualToString:@"hant"] ? @"zh-TW" : @"zh-CN";
-            } else {
-                normalized = parts[0];
-            }
-        }
-        if (normalized.length > 0 && ![tags containsObject:normalized]) {
+        NSString *key = normalized.lowercaseString;
+        if (![seen containsObject:key]) {
+            [seen addObject:key];
             [tags addObject:normalized];
         }
     }

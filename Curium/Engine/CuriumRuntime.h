@@ -9,6 +9,7 @@ uint64_t CuriumAvailableMemoryBytes(void);
 // 0 = Jitless, 1 = BrowserEngineCore, 2 = Native MAP_JIT, 3 = TXM Split-W^X.
 NSInteger CuriumActiveV8JitMode(void);
 NSArray<NSDictionary<NSString *, NSString *> *> *CuriumRuntimeHookStatuses(void);
+NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferred);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

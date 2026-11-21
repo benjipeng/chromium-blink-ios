@@ -421,7 +421,7 @@ index 2652bb5..de527a9 100644
  
    web_state_->SetFaviconStatus(favicon_status);
 diff --git a/ios/chrome/browser/curium/curium_web_state_delegate.mm b/ios/chrome/browser/curium/curium_web_state_delegate.mm
-index ec15a58..1bf1dac 100644
+index ec15a58..2b9cf7d 100644
 --- a/ios/chrome/browser/curium/curium_web_state_delegate.mm
 +++ b/ios/chrome/browser/curium/curium_web_state_delegate.mm
 @@ -16,6 +16,10 @@
@@ -444,7 +444,7 @@ index ec15a58..1bf1dac 100644
 +        if (content::WebContents* wc =
 +                static_cast<web::ContentWebState*>(raw_child)
 +                    ->GetWebContents()) {
-+          web::SetDesktopUserAgentOverride(wc);
++          web::EnableDesktopUserAgentForInitialNavigation(wc);
 +        }
 +      }
 +#endif
@@ -889,8 +889,25 @@ index 338c45e..e555bf1 100644
    web::GetWebClient()->InitializeFieldTrialAndFeatureList();
    content::InitializeMojoCore();
  #endif
+diff --git a/ios/web/content/navigation/content_navigation_manager.h b/ios/web/content/navigation/content_navigation_manager.h
+index 6c5eeda..9e93754 100644
+--- a/ios/web/content/navigation/content_navigation_manager.h
++++ b/ios/web/content/navigation/content_navigation_manager.h
+@@ -27,6 +27,12 @@ class ContentWebState;
+ // already. Only entries that override the user agent use it.
+ void SetDesktopUserAgentOverride(content::WebContents* web_contents);
+ 
++// [ios-blink-sideload] Prepares a freshly created `web_contents` (still on its
++// initial NavigationEntry) to inherit the desktop user agent on its first
++// navigation across context-menu tabs, window.open(), and target="_blank".
++void EnableDesktopUserAgentForInitialNavigation(
++    content::WebContents* web_contents);
++
+ // ContentNavigationManager is a NavigationManager implementation that
+ // is built on top of //content's NavigationController.
+ class ContentNavigationManager : public NavigationManager {
 diff --git a/ios/web/content/navigation/content_navigation_manager.mm b/ios/web/content/navigation/content_navigation_manager.mm
-index edba81f..1dedd74 100644
+index edba81f..6f855f5 100644
 --- a/ios/web/content/navigation/content_navigation_manager.mm
 +++ b/ios/web/content/navigation/content_navigation_manager.mm
 @@ -9,8 +9,11 @@
@@ -944,69 +961,47 @@ index edba81f..1dedd74 100644
    ua_override.ua_metadata_override->model = std::string();
    ua_override.ua_metadata_override->mobile = false;
    ua_override.ua_metadata_override->form_factors =
-@@ -83,7 +109,7 @@
- void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
-   if (web_contents->GetUserAgentOverride().ua_string_override.empty()) {
-     web_contents->SetUserAgentOverride(DesktopUserAgentOverride(),
--                                       /*override_in_new_tabs=*/false);
+@@ -87,6 +113,22 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
+   }
+ }
+ 
++void EnableDesktopUserAgentForInitialNavigation(
++    content::WebContents* web_contents) {
++  if (!web_contents) {
++    return;
++  }
++  if (web_contents->GetUserAgentOverride().ua_string_override.empty()) {
++    web_contents->SetUserAgentOverride(DesktopUserAgentOverride(),
 +                                       /*override_in_new_tabs=*/true);
-   }
- }
- 
-@@ -151,6 +177,14 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
-         base::apple::NSDataToSpan(web_params.post_data));
-   }
- 
-+  if (!controller_->GetLastCommittedEntry() &&
-+      !web_state_->GetWebContents()
-+           ->GetUserAgentOverride()
-+           .ua_string_override.empty()) {
-+    params.override_user_agent =
-+        content::NavigationController::UA_OVERRIDE_TRUE;
 +  }
++  if (content::NavigationEntry* entry =
++          web_contents->GetController().GetLastCommittedEntry();
++      entry && entry->IsInitialEntry()) {
++    entry->SetIsOverridingUserAgent(true);
++  }
++}
 +
-   // We are not setting the virtual URL for data URL here.
-   controller_->LoadURLWithParams(params);
- }
-@@ -204,14 +238,26 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
- }
+ ContentNavigationManager::ContentNavigationManager(
+     ContentWebState* web_state,
+     BrowserState* browser_state,
+diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
+index cef2653..6a32f4c 100644
+--- a/ios/web/content/web_state/content_web_state.h
++++ b/ios/web/content/web_state/content_web_state.h
+@@ -237,6 +237,11 @@ class ContentWebState : public WebState,
+                            bool final_update) override;
  
- void ContentNavigationManager::GoBack() {
-+  if (content::NavigationEntry* target = controller_->GetEntryAtOffset(-1);
-+      target && target->GetIsOverridingUserAgent()) {
-+    SetDesktopUserAgentOverride(web_state_->GetWebContents());
-+  }
-   controller_->GoBack();
- }
- 
- void ContentNavigationManager::GoForward() {
-+  if (content::NavigationEntry* target = controller_->GetEntryAtOffset(1);
-+      target && target->GetIsOverridingUserAgent()) {
-+    SetDesktopUserAgentOverride(web_state_->GetWebContents());
-+  }
-   controller_->GoForward();
- }
- 
- void ContentNavigationManager::GoToIndex(int index) {
-+  if (content::NavigationEntry* target = controller_->GetEntryAtIndex(index);
-+      target && target->GetIsOverridingUserAgent()) {
-+    SetDesktopUserAgentOverride(web_state_->GetWebContents());
-+  }
-   controller_->GoToIndex(index);
- }
- 
-@@ -238,6 +284,9 @@ void SetDesktopUserAgentOverride(content::WebContents* web_contents) {
-   content::WebContents* web_contents = web_state_->GetWebContents();
-   if (desktop) {
-     SetDesktopUserAgentOverride(web_contents);
-+  } else {
-+    web_contents->SetUserAgentOverride(blink::UserAgentOverride(),
-+                                       /*override_in_new_tabs=*/false);
-   }
-   entry->SetIsOverridingUserAgent(desktop);
-   // Recompute the page's preferences, as Android does
+   // WebContentsDelegate
++  void WebContentsCreated(content::WebContents* source_contents,
++                          const content::GlobalRenderFrameHostId& opener_id,
++                          const std::string& frame_name,
++                          const GURL& target_url,
++                          content::WebContents* new_contents) override;
+   content::WebContents* AddNewContents(
+       content::WebContents* source,
+       std::unique_ptr<content::WebContents> new_contents,
 diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
-index abc2465..c52780d 100644
+index abc2465..6fe50c1 100644
 --- a/ios/web/content/web_state/content_web_state.mm
 +++ b/ios/web/content/web_state/content_web_state.mm
 @@ -19,6 +19,7 @@
@@ -1045,7 +1040,7 @@ index abc2465..c52780d 100644
 +            opener_web_state->GetNavigationManager()) {
 +      if (NavigationItem* visible = opener_nav->GetVisibleItem();
 +          visible && visible->GetUserAgentType() == UserAgentType::DESKTOP) {
-+        SetDesktopUserAgentOverride(web_contents_.get());
++        EnableDesktopUserAgentForInitialNavigation(web_contents_.get());
 +      }
 +    }
    } else {
@@ -1063,6 +1058,29 @@ index abc2465..c52780d 100644
    web_contents_->SetDelegate(this);
    WebContentsObserver::Observe(web_contents_.get());
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+@@ -1014,6 +1031,22 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   }
+ }
+ 
++void ContentWebState::WebContentsCreated(
++    content::WebContents* source_contents,
++    const content::GlobalRenderFrameHostId& opener_id,
++    const std::string& frame_name,
++    const GURL& target_url,
++    content::WebContents* new_contents) {
++  if (!source_contents || !new_contents) {
++    return;
++  }
++  if (content::NavigationEntry* source_entry =
++          source_contents->GetController().GetVisibleEntry();
++      source_entry && source_entry->GetIsOverridingUserAgent()) {
++    EnableDesktopUserAgentForInitialNavigation(new_contents);
++  }
++}
++
+ content::WebContents* ContentWebState::AddNewContents(
+     content::WebContents* source,
+     std::unique_ptr<content::WebContents> new_contents,
 diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
 index c3385b9..08211f7 100644
 --- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
