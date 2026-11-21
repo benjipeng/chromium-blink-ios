@@ -1,5 +1,5 @@
 name: Build Chromium Blink iOS IPA
-run-name: IPA · ${{ github.ref_name }} · build ${{ github.run_number }}
+run-name: ${{ inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ github.ref_name }} · build ${{ github.run_number }}
 
 # Orchestration only: every stage runs scripts/stage.sh, and its checkpoint key
 # comes from scripts/plan_pipeline.py (inputs by content, never this YAML).
@@ -34,6 +34,10 @@ on:
         description: "Rescue: build only these compile shards (e.g. 15 or 3,15), beside a running build; stops before link"
         type: string
         default: ""
+      verify_only:
+        description: "Stop after Stage 2 + Swift-dependent object gate (skip compile shards, link, and package)"
+        type: boolean
+        default: false
 
 # Every workflow that writes GHCR checkpoints shares this group. A shard rescue
 # writes only its own shards' tags, so it runs in a group of its own.
@@ -187,10 +191,29 @@ jobs:
           --checkpoint "$APPLE_REF" --key "${APPLE_REF##*:}" --outcome "${{ steps.build.outcome }}"
           --start-epoch "${JOB_START:-0}" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
+  verify_apple_objects:
+    name: 2.5 Verify Swift-dependent objects (Linux)
+    needs: [plan, codegen, apple]
+    if: ${{ !failure() && !cancelled() && (needs.plan.outputs.run_compile == 'true' || inputs.verify_only == true) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      JOB_TIMEOUT_MIN: 45
+      PERSIST_RESERVE_MIN: 5
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      STUB_REF: ${{ needs.plan.outputs.stub_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile Swift-dependent ObjC++ gate objects
+        run: ./scripts/stage.sh probe apple-objects
+
   compile:
     name: 3 Compile shard ${{ matrix.shard }} (Linux)
-    needs: [plan, codegen, apple]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_compile == 'true' }}
+    needs: [plan, codegen, apple, verify_apple_objects]
+    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_compile == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 185
     strategy:
@@ -244,7 +267,7 @@ jobs:
   link:
     name: 4 Link (Linux)
     needs: [plan, codegen, apple, compile]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_link == 'true' }}
+    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_link == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -295,7 +318,7 @@ jobs:
   package:
     name: 5 Package IPA (Mac)
     needs: [plan, link]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_package == 'true' }}
     runs-on: xcode-27
     timeout-minutes: 45
     env:

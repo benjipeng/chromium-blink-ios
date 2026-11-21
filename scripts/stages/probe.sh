@@ -250,3 +250,38 @@ PY
   fi
   return "$rc"
 }
+
+# Pre-compile gate (Linux): restores Stage 1 codegen + Stage 2 Apple outputs and
+# compiles patched ObjC++ objects that depend on Swift-generated headers before
+# fanning out the 18 compile shards.
+probe_apple_objects() {
+  init_linux
+  prepare_linux compile
+  ccache_env
+  export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
+  export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
+  cat > "$STATE/apple_object_targets.txt" <<'EOF'
+obj/ios/chrome/browser/web/model/web_internal/chrome_web_client.o
+EOF
+  python3 - "$STATE/apple_object_targets.txt" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, "scripts")
+from ninja_graph import Graph
+
+graph = Graph(Path("/tmp/cb_work/src/out/Release"))
+targets = [line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+missing = [target for target in targets if target not in graph.producer]
+if missing:
+    sys.exit(f"Missing Swift/Apple-dependent probe targets: {missing}")
+print(f"Verified {len(targets)} Apple-dependent device object target(s) in pruned graph")
+PY
+  dry_run_summary "$STATE/apple_object_targets.txt" > "$STATE/apple_object_plan.txt"
+  cat "$STATE/apple_object_plan.txt"
+  ccache -z >/dev/null
+  local rc=0
+  build_targets "$STATE/apple_object_targets.txt" || rc=$?
+  ccache -s || true
+  [ "$rc" -ne 124 ] || fail "Apple-dependent object gate exceeded its build budget"
+  [ "$rc" -eq 0 ] || fail "Apple-dependent object gate failed (see FAILED blocks above)"
+}
