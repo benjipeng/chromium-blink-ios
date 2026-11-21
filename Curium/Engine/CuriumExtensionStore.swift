@@ -2,7 +2,7 @@ import CuriumEngineContract
 import Observation
 import UIKit
 
-struct CuriumExtension: Identifiable, Equatable {
+struct CuriumExtension: Identifiable, Equatable, Sendable {
     let id: String
     let name: String
     let version: String
@@ -63,7 +63,7 @@ struct CuriumExtension: Identifiable, Equatable {
     }
 }
 
-struct CuriumExtensionReview: Identifiable {
+struct CuriumExtensionReview: Identifiable, Sendable {
     let id: String
     let name: String
     let version: String
@@ -80,17 +80,38 @@ struct CuriumExtensionReview: Identifiable {
     }
 }
 
+/// Ensures CrIOSActionPresentationObserverToken always releases on the main thread
+/// (its Obj-C -dealloc mutates an unsynchronized global NSHashTable in chrome_framework).
+private final class MainThreadObservationBox: @unchecked Sendable {
+    private var token: (any NSObjectProtocol)?
+
+    init(_ token: (any NSObjectProtocol)?) {
+        self.token = token
+    }
+
+    deinit {
+        guard let token = self.token else { return }
+        self.token = nil
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { _ = token }
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class CuriumExtensionStore {
     private static let windows = NSHashTable<CuriumExtensionStore>.weakObjects()
+    private static let actionRefreshDebounce: Duration = .milliseconds(120)
 
     private let manager: (any CrIOSExtensionManagingV1)?
-    @ObservationIgnored private var observation: (any NSObjectProtocol)?
+    @ObservationIgnored private var observationBox: MainThreadObservationBox?
     @ObservationIgnored private var installGeneration = 0
     @ObservationIgnored private var contextGeneration = 0
-    @ObservationIgnored private var installedRefreshScheduled = false
     @ObservationIgnored private var hasLoadedInstalled = false
+    @ObservationIgnored private var pendingFullRefresh = false
+    @ObservationIgnored private var pendingActionIDs: Set<String> = []
+    @ObservationIgnored private var coalescedRefreshTask: Task<Void, Never>?
     private var tabID: Int32 = -1
     private(set) var installed: [CuriumExtension] = []
     private(set) var badge: String?
@@ -111,10 +132,10 @@ final class CuriumExtensionStore {
         self.manager = manager
         if let manager {
             Self.windows.add(self)
-            observation = manager.observeActionPresentationChanges?(handler: { [weak self] _ in
-                // V1 uses the same notification for registry and action changes.
-                self?.invalidateInstalled()
+            let token = manager.observeActionPresentationChanges?(handler: { [weak self] extensionID in
+                self?.handleActionPresentationChange(extensionID: extensionID)
             })
+            observationBox = MainThreadObservationBox(token)
         }
     }
 
@@ -135,21 +156,50 @@ final class CuriumExtensionStore {
         }
     }
 
+    private func handleActionPresentationChange(extensionID: String?) {
+        if let extensionID, !extensionID.isEmpty, hasLoadedInstalled,
+           installed.contains(where: { $0.id == extensionID }) {
+            pendingActionIDs.insert(extensionID)
+        } else {
+            hasLoadedInstalled = false
+            pendingFullRefresh = true
+        }
+        scheduleCoalescedRefresh()
+    }
+
     private func invalidateInstalled() {
         hasLoadedInstalled = false
-        guard !installedRefreshScheduled else { return }
-        installedRefreshScheduled = true
-        Task { @MainActor [weak self] in
-            await Task.yield()
+        pendingFullRefresh = true
+        scheduleCoalescedRefresh()
+    }
+
+    private func scheduleCoalescedRefresh() {
+        guard coalescedRefreshTask == nil else { return }
+        coalescedRefreshTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: Self.actionRefreshDebounce)
+            } catch {
+                return
+            }
             guard let self else { return }
-            self.installedRefreshScheduled = false
-            if !self.hasLoadedInstalled {
+            self.coalescedRefreshTask = nil
+            let full = self.pendingFullRefresh || !self.hasLoadedInstalled
+            let ids = self.pendingActionIDs
+            self.pendingFullRefresh = false
+            self.pendingActionIDs.removeAll()
+            if full {
                 self.refresh(tabID: self.tabID, includeBlockedCounts: false)
+            } else if !ids.isEmpty {
+                self.refreshActions(for: ids, tabID: self.tabID)
             }
         }
     }
 
     private func didMutateInstalled() {
+        coalescedRefreshTask?.cancel()
+        coalescedRefreshTask = nil
+        pendingFullRefresh = false
+        pendingActionIDs.removeAll()
         // The registry is shared, and V1 may not notify peers after install or removal.
         for window in Self.windows.allObjects where window !== self {
             window.invalidateInstalled()
@@ -164,6 +214,22 @@ final class CuriumExtensionStore {
         let badges = next.filter(\.isEnabled).compactMap(\.badge)
         let nextBadge = badges.count > 1 ? String(badges.count) : badges.first
         if badge != nextBadge { badge = nextBadge }
+    }
+
+    private func refreshActions(for ids: Set<String>, tabID: Int32) {
+        guard let manager, !installed.isEmpty else { return }
+        self.tabID = tabID
+        var updated = installed
+        var touched = false
+        for index in updated.indices where ids.contains(updated[index].id) {
+            let item = updated[index]
+            let action = (tabID >= 0 && item.isEnabled) ? CuriumExtensionAction(manager, item.id, tabID) : nil
+            updated[index] = item.updating(action: action, blockedCount: item.blockedCount)
+            touched = true
+        }
+        if touched {
+            publishInstalled(updated)
+        }
     }
 
     private func refreshActionsOnly(tabID: Int32) {
@@ -181,7 +247,10 @@ final class CuriumExtensionStore {
     func refresh(tabID: Int32, includeBlockedCounts: Bool = true) {
         guard let manager else { return }
         self.tabID = tabID
-        let existingCounts = Dictionary(uniqueKeysWithValues: installed.map { ($0.id, $0.blockedCount) })
+        let existingCounts = Dictionary(
+            installed.map { ($0.id, $0.blockedCount) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         do {
             let next: [CuriumExtension] = try manager.extensions().compactMap { entry in
                 guard let id = entry["id"] as? String else { return nil }
@@ -231,9 +300,11 @@ final class CuriumExtensionStore {
     }
 
     func remove(_ item: CuriumExtension) {
-        guard let manager, item.isRemovable else { return }
+        guard let manager, item.isRemovable, !isWorking else { return }
+        isWorking = true
         CuriumRemoveExtension(manager, item.id) { [weak self] removed, error in
             guard let self else { return }
+            self.isWorking = false
             if removed {
                 self.didMutateInstalled()
             } else {
@@ -283,7 +354,7 @@ final class CuriumExtensionStore {
             operationError = "Choose a signed CRX file."
             return
         }
-        prepare(source: url.path(), isStore: false, scopedURL: url)
+        prepare(source: url.path(percentEncoded: false), isStore: false, scopedURL: url)
     }
 
     private func prepare(source: String, isStore: Bool, scopedURL: URL? = nil) {

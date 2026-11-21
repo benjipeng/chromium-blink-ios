@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct CuriumSheetHeader: View {
     let title: String
@@ -42,14 +43,15 @@ struct CuriumSettingsSheet: View {
     @AppStorage("curium.jitMode") private var jitPreference: CuriumJitPreference = .automatic
     let engineReady: Bool
 
+    @State private var showingDiagnostics = false
+    @State private var availableMemoryText = ""
+    @State private var hooksSummary = ""
+    @State private var hasHookFailure = false
+    @State private var diagnosticLineCount = 0
+
     private var activeV8RuntimeLabel: String {
         guard engineReady else { return "Standby" }
-        switch CuriumActiveV8JitMode() {
-        case 1: return "JIT · BrowserEngineCore"
-        case 2: return "JIT · Native MAP_JIT"
-        case 3: return "JIT · TXM Split-W^X"
-        default: return "Jitless · DrumBrake Wasm"
-        }
+        return CuriumDiagnostics.jitModeLabel(CuriumActiveV8JitMode())
     }
 
     var body: some View {
@@ -143,6 +145,27 @@ struct CuriumSettingsSheet: View {
                 Section("Browser") {
                     LabeledContent("Engine", value: engineReady ? "Blink · Single-Process" : "Blink · Standby")
                     LabeledContent("V8 Runtime", value: activeV8RuntimeLabel)
+                    LabeledContent("Available Memory", value: availableMemoryText)
+                    LabeledContent("Engine Hooks") {
+                        Text(hooksSummary)
+                            .foregroundStyle(hasHookFailure ? .red : .secondary)
+                    }
+                    Button {
+                        showingDiagnostics = true
+                    } label: {
+                        LabeledContent("Diagnostics Log") {
+                            HStack(spacing: 6) {
+                                Text("\(diagnosticLineCount) lines")
+                                    .foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                    }
+                    .foregroundStyle(.primary)
+                    .accessibilityIdentifier("curium.settings.diagnostics")
                     LabeledContent("Extensions", value: "Manifest V3")
                     LabeledContent("Element", value: "96 Cm")
                 }
@@ -150,5 +173,134 @@ struct CuriumSettingsSheet: View {
             .listStyle(.insetGrouped)
         }
         .background(Color(uiColor: .systemGroupedBackground))
+        .onAppear { refreshDiagnosticsSummary() }
+        .sheet(isPresented: $showingDiagnostics, onDismiss: { refreshDiagnosticsSummary() }) {
+            CuriumDiagnosticsSheet(engineReady: engineReady)
+        }
+    }
+
+    private func refreshDiagnosticsSummary() {
+        let diag = CuriumDiagnostics.shared
+        availableMemoryText = ByteCountFormatter.string(
+            fromByteCount: Int64(CuriumAvailableMemoryBytes()),
+            countStyle: .memory
+        )
+        let summary = CuriumDiagnostics.summarizeHooks(diag.hookStatuses())
+        hooksSummary = summary.summary
+        hasHookFailure = summary.hasFailure
+        diagnosticLineCount = diag.currentLines().count
+    }
+}
+
+private struct CuriumDiagnosticsSheet: View {
+    let engineReady: Bool
+
+    @State private var hookStatuses: [CuriumDiagnostics.HookStatus] = []
+    @State private var lines: [String] = []
+    @State private var reportText = ""
+    @State private var availableMemoryText = ""
+    @State private var logFileSummary = "Memory only"
+    @State private var copied = false
+
+    private var environmentLabel: String {
+        ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil
+            ? "LiveContainer Guest"
+            : "Standalone / Simulator"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            CuriumSheetHeader(title: "Diagnostics")
+            List {
+                Section("Actions") {
+                    Button {
+                        UIPasteboard.general.string = reportText
+                        copied = true
+                    } label: {
+                        Label(copied ? "Copied to Clipboard" : "Copy Diagnostics",
+                              systemImage: copied ? "checkmark.circle" : "doc.on.doc")
+                    }
+                    ShareLink(item: reportText) {
+                        Label("Share Diagnostics Report", systemImage: "square.and.arrow.up")
+                    }
+                    Button {
+                        CuriumDiagnostics.shared.flushAsync()
+                        reload()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+
+                Section("Runtime") {
+                    LabeledContent("Environment", value: environmentLabel)
+                    LabeledContent("V8 Runtime", value: engineReady ? CuriumDiagnostics.jitModeLabel(CuriumActiveV8JitMode()) : "Standby")
+                    LabeledContent("Available Memory", value: availableMemoryText)
+                    LabeledContent("Log File", value: logFileSummary)
+                }
+
+                Section("Engine Hooks") {
+                    ForEach(hookStatuses) { hook in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(hook.name)
+                                    .font(.subheadline.weight(.medium))
+                                Spacer()
+                                Text(hook.status)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(statusColor(for: hook))
+                            }
+                            if !hook.detail.isEmpty {
+                                Text(hook.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+
+                Section("Rolling Log (\(lines.count))") {
+                    if lines.isEmpty {
+                        Text("No diagnostic events recorded yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(lines.joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        let diag = CuriumDiagnostics.shared
+        let hooks = diag.hookStatuses()
+        let current = diag.currentLines()
+        hookStatuses = hooks
+        lines = current
+        reportText = diag.formattedReport(hooks: hooks, lines: current)
+        availableMemoryText = ByteCountFormatter.string(
+            fromByteCount: Int64(CuriumAvailableMemoryBytes()),
+            countStyle: .memory
+        )
+        if let url = diag.logFileURL {
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let formattedSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+            logFileSummary = "\(url.lastPathComponent) (\(formattedSize))"
+        } else {
+            logFileSummary = "Memory only"
+        }
+        copied = false
+    }
+
+    private func statusColor(for hook: CuriumDiagnostics.HookStatus) -> Color {
+        if hook.isActive { return .green }
+        if hook.isFailed { return .red }
+        return .secondary
     }
 }

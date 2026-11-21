@@ -25,6 +25,7 @@ struct CuriumOcclusionReader: UIViewRepresentable {
     final class Reader: UIView {
         var onChange: (([CGRect]) -> Void)?
         private var published: [CGRect]?
+        private var lastBoundsSize: CGSize = .zero
 
         init() {
             super.init(frame: .zero)
@@ -38,11 +39,14 @@ struct CuriumOcclusionReader: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
+            lastBoundsSize = bounds.size
             setNeedsUpdateConstraints()
         }
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            guard bounds.size != lastBoundsSize else { return }
+            lastBoundsSize = bounds.size
             setNeedsUpdateConstraints() // Size or posture changed.
         }
 
@@ -63,7 +67,9 @@ struct CuriumOcclusionReader: UIViewRepresentable {
             let described = regions.map {
                 "\(NSCoder.string(for: $0.frame)) margins \(NSCoder.string(for: $0.margins))"
             }
-            Self.log.notice("occlusion: \(described.joined(separator: "; "), privacy: .public)")
+            let summary = described.isEmpty ? "none" : described.joined(separator: "; ")
+            Self.log.notice("occlusion: \(summary, privacy: .public)")
+            CuriumDiagnostics.shared.record("layout", "occlusion: \(summary)")
             Task { @MainActor [weak self] in
                 guard let self, self.published == frames else { return }
                 self.onChange?(frames)

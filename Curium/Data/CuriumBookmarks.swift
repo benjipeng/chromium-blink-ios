@@ -5,8 +5,16 @@ struct CuriumBookmark: Identifiable, Hashable, Sendable {
     let parentID: Int64?
     let url: URL
     let title: String
+    let host: String
 
-    var host: String { url.host() ?? url.absoluteString }
+    init(id: Int64, parentID: Int64?, url: URL, title: String) {
+        self.id = id
+        self.parentID = parentID
+        self.url = url
+        self.title = title
+        self.host = url.host() ?? url.absoluteString
+    }
+
     var displayTitle: String { title.isEmpty ? host : title }
 }
 

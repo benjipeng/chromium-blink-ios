@@ -14,6 +14,13 @@ struct CuriumExtensionsSheet: View {
 
     private var store: CuriumExtensionStore { browser.extensions }
 
+    private struct BlockedPollKey: Equatable {
+        let active: Bool
+        let tabID: Int32
+        let isLoading: Bool
+        let url: URL?
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             CuriumSheetHeader(title: "Extensions")
@@ -28,13 +35,39 @@ struct CuriumExtensionsSheet: View {
         .onAppear {
             store.refresh(tabID: browser.activeTab?.extensionTabID ?? -1, includeBlockedCounts: true)
         }
-        .task(id: scenePhase == .active && store.hasEnabledExtensions && (browser.activeTab?.extensionTabID ?? -1) >= 0) {
+        .task(id: BlockedPollKey(
+            active: scenePhase == .active && popup == nil && store.hasEnabledExtensions
+                && (browser.activeTab?.extensionTabID ?? -1) >= 0,
+            tabID: browser.activeTab?.extensionTabID ?? -1,
+            isLoading: browser.activeTab?.isLoading == true,
+            url: browser.activeTab?.url
+        )) {
+            let initialTabID = browser.activeTab?.extensionTabID ?? -1
             guard scenePhase == .active,
+                  popup == nil,
                   store.hasEnabledExtensions,
-                  (browser.activeTab?.extensionTabID ?? -1) >= 0 else { return }
+                  initialTabID >= 0 else { return }
+            var intervalSeconds = 2
+            var unchangedPolls = 0
+            var lastTotal = store.blockedCount
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(2)) } catch { break }
-                store.refreshBlockedCounts(tabID: browser.activeTab?.extensionTabID ?? -1)
+                do { try await Task.sleep(for: .seconds(intervalSeconds)) } catch { break }
+                guard scenePhase == .active, popup == nil else { break }
+                let currentTabID = browser.activeTab?.extensionTabID ?? -1
+                guard currentTabID >= 0 else { break }
+                store.refreshBlockedCounts(tabID: currentTabID)
+                let nextTotal = store.blockedCount
+                if nextTotal == lastTotal {
+                    unchangedPolls += 1
+                    if browser.activeTab?.isLoading != true {
+                        if unchangedPolls >= 3 { break }
+                        intervalSeconds = min(8, intervalSeconds * 2)
+                    }
+                } else {
+                    lastTotal = nextTotal
+                    unchangedPolls = 0
+                    intervalSeconds = 2
+                }
             }
         }
         .onChange(of: browser.backgroundEpoch) { _, _ in
@@ -170,7 +203,19 @@ struct CuriumExtensionsSheet: View {
             Button {
                 if let host = store.popup(for: item) {
                     let presentation = CuriumPopup(host: host, name: item.name)
-                    host.onRequestClose = { setPopup(nil) }
+                    let closeIfCurrent: @MainActor () -> Void = { [weak presentation] in
+                        guard let presentation, popup === presentation else { return }
+                        setPopup(nil)
+                    }
+                    host.onRequestClose = {
+                        // Defer out of WebContentsImpl::Close / CloseWebState so host.close()
+                        // does not synchronously destroy WebState and its delegate mid-callback.
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated {
+                                closeIfCurrent()
+                            }
+                        }
+                    }
                     setPopup(presentation)
                 }
             } label: {
@@ -232,6 +277,7 @@ private final class CuriumPopup: Identifiable {
     let host: any CrIOSExtensionPopupHostingV1
     let view: UIView
     let name: String
+    private var isClosed = false
 
     init(host: any CrIOSExtensionPopupHostingV1, name: String) {
         self.host = host
@@ -240,6 +286,8 @@ private final class CuriumPopup: Identifiable {
     }
 
     func close() {
+        guard !isClosed else { return }
+        isClosed = true
         host.onRequestClose = nil
         view.removeFromSuperview()
         host.close()

@@ -5,6 +5,7 @@ import SwiftUI
 
 struct CuriumDownloadsSheet: View {
     let store: CuriumBrowserStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var preview: Preview?
 
     private struct Preview: Identifiable {
@@ -36,8 +37,8 @@ struct CuriumDownloadsSheet: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .task(id: hasActiveDownloads) {
-            guard hasActiveDownloads else { return }
+        .task(id: scenePhase == .active && hasActiveDownloads) {
+            guard scenePhase == .active, hasActiveDownloads else { return }
             while !Task.isCancelled {
                 for item in store.downloads where item.isActive {
                     item.refresh()

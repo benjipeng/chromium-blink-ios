@@ -32,6 +32,7 @@ actor CuriumDatabase {
     }
 
     private struct DatabaseUnavailable: Error {}
+    private struct AdoptionFailed: Error {}
 
     /// The library could not be opened, so nothing is saved this session.
     static func isUnavailable(_ error: any Error) -> Bool { error is DatabaseUnavailable }
@@ -44,7 +45,9 @@ actor CuriumDatabase {
 
     private static func defaultURL() throws -> URL {
         let resolution = try CuriumLibraryLocation.resolve()
-        CuriumLibraryLocation.adoptLegacyIfNeeded(resolution)
+        guard CuriumLibraryLocation.adoptLegacyIfNeeded(resolution) else {
+            throw AdoptionFailed()
+        }
         log.notice("library at \(resolution.database.path, privacy: .public)")
         return resolution.database
     }
@@ -91,6 +94,8 @@ actor CuriumDatabase {
             : "matched_sites s CROSS JOIN visits v ON v.site_id = s.id"
         var days: [CuriumHistoryDay] = []
         var day: Date?
+        var dayStart = TimeInterval.infinity
+        var dayEnd = -TimeInterval.infinity
         var entries: [CuriumHistoryEntry] = []
         var indices: [Int64: Int] = [:]
         var count = 0
@@ -102,19 +107,24 @@ actor CuriumDatabase {
             FROM \(source)
             ORDER BY v.visited_at DESC, v.id DESC
             """, query.isEmpty ? [] : [.text("%" + Self.likeLiteral(query) + "%")]) { row in
-            let time = Date(timeIntervalSince1970: sqlite3_column_double(row, 3))
-            let localDay = calendar.startOfDay(for: time)
-            if day != localDay {
-                if let day, !entries.isEmpty {
-                    days.append(CuriumHistoryDay(day: day, entries: entries))
+            let timestamp = sqlite3_column_double(row, 3)
+            let time = Date(timeIntervalSince1970: timestamp)
+            if timestamp < dayStart || timestamp >= dayEnd {
+                let localDay = calendar.startOfDay(for: time)
+                if day != localDay {
+                    if let day, !entries.isEmpty {
+                        days.append(CuriumHistoryDay(day: day, entries: entries))
+                    }
+                    if count == limit {
+                        entries.removeAll()
+                        return false
+                    }
+                    day = localDay
+                    entries.removeAll(keepingCapacity: true)
+                    indices.removeAll(keepingCapacity: true)
                 }
-                if count == limit {
-                    entries.removeAll()
-                    return false
-                }
-                day = localDay
-                entries.removeAll(keepingCapacity: true)
-                indices.removeAll(keepingCapacity: true)
+                dayStart = localDay.timeIntervalSince1970
+                dayEnd = calendar.date(byAdding: .day, value: 1, to: localDay)?.timeIntervalSince1970 ?? (dayStart + 86_400)
             }
             let id = sqlite3_column_int64(row, 0)
             if let index = indices[id] {
@@ -351,6 +361,93 @@ actor CuriumDatabase {
         return matches
     }
 
+    /// History-only address match query used when bookmarks are already matched in memory.
+    /// Avoids the correlated `bookmark_items` subquery and lets callers deduplicate in Swift.
+    func historyAddressMatches(
+        for input: String,
+        excludingURLs excludedURLs: Set<String>,
+        limit: Int,
+        now: Date
+    ) throws -> [CuriumAddressMatch] {
+        try Task.checkCancellation()
+        var needle = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let scheme = needle.range(of: "://"), !needle[..<scheme.lowerBound].contains(where: \.isWhitespace) {
+            needle = String(needle[scheme.upperBound...])
+        }
+        if needle.prefix(4).lowercased() == "www." { needle.removeFirst(4) }
+        guard !needle.isEmpty, limit > 0 else { return [] }
+        let db = try database()
+        let literal = Self.likeLiteral(needle)
+        let contains = CuriumSQLite.Value.text("%" + literal + "%")
+        let normalized = Self.normalizedURL("s")
+        let rank = """
+            ORDER BY s.visit_count / (1.0 + MAX(0, ?2 - s.last_visit) / 604800.0) DESC,
+                     s.last_visit DESC, s.id DESC LIMIT ?3
+            """
+        let canMatchHost = !needle.contains { "/:?#".contains($0) }
+        let prefix = CuriumSQLite.Value.text(literal + "%")
+        let time = CuriumSQLite.Value.real(now.timeIntervalSince1970)
+        let extraRows = min(excludedURLs.count, 64)
+
+        var matches: [CuriumAddressMatch] = []
+        matches.reserveCapacity(limit)
+        if canMatchHost {
+            let remaining = limit - matches.count
+            let fetchLimit = Int64(remaining + extraRows)
+            matches += try readHistoryMatches(
+                db,
+                sql: """
+                    SELECT s.url, s.title FROM sites s
+                    WHERE \(normalized) LIKE ?1 ESCAPE '\\'
+                    \(rank)
+                    """,
+                values: [prefix, time, .integer(fetchLimit)],
+                excludingURLs: excludedURLs,
+                maxCount: remaining
+            )
+        }
+        if matches.count < limit {
+            let remaining = limit - matches.count
+            let fetchLimit = Int64(remaining + extraRows)
+            let tail = canMatchHost ? "AND \(normalized) NOT LIKE ?4 ESCAPE '\\'" : ""
+            var bindings: [CuriumSQLite.Value] = [contains, time, .integer(fetchLimit)]
+            if canMatchHost { bindings.append(prefix) }
+            matches += try readHistoryMatches(
+                db,
+                sql: """
+                    SELECT s.url, s.title FROM sites s
+                    WHERE (\(Self.contains("s"))) \(tail)
+                    \(rank)
+                    """,
+                values: bindings,
+                excludingURLs: excludedURLs,
+                maxCount: remaining
+            )
+        }
+        return matches
+    }
+
+    private func readHistoryMatches(
+        _ db: CuriumSQLite,
+        sql: String,
+        values: [CuriumSQLite.Value],
+        excludingURLs excludedURLs: Set<String>,
+        maxCount: Int
+    ) throws -> [CuriumAddressMatch] {
+        guard maxCount > 0 else { return [] }
+        var matches: [CuriumAddressMatch] = []
+        matches.reserveCapacity(maxCount)
+        try db.cancellableRows(sql, values) { row in
+            let rawURL = CuriumSQLite.text(row, 0)
+            guard !excludedURLs.contains(rawURL) else { return true }
+            if let url = URL(string: rawURL) {
+                matches.append(CuriumAddressMatch(kind: .history, url: url, title: CuriumSQLite.text(row, 1)))
+            }
+            return matches.count < maxCount
+        }
+        return matches
+    }
+
     private func readMatches(_ db: CuriumSQLite, kind: CuriumAddressMatch.Kind, sql: String,
                              values: [CuriumSQLite.Value]) throws -> [CuriumAddressMatch] {
         var matches: [CuriumAddressMatch] = []
@@ -395,12 +492,15 @@ actor CuriumDatabase {
             .replacingOccurrences(of: "_", with: "\\_")
     }
 
+    fileprivate static let posixLocale = Locale(identifier: "en_US_POSIX")
+
     fileprivate static func fold(_ text: String) -> String {
-        text.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+        text.folding(options: .caseInsensitive, locale: Self.posixLocale)
     }
 
     func checkpoint() throws {
-        try database().checkpoint()
+        guard let connection else { return }
+        try connection.checkpoint()
     }
 }
 
@@ -465,6 +565,8 @@ private final class CuriumSQLite {
     private let handle: OpaquePointer
     private let url: URL
     private var needsPostWriteProtection = true
+    private var hasUncheckpointedWrites = false
+    private var statementCache: [String: OpaquePointer] = [:]
     var changes: Int32 { sqlite3_changes(handle) }
 
     init(url: URL) throws {
@@ -486,7 +588,7 @@ private final class CuriumSQLite {
         applySuspendProtection()
         try check(sqlite3_busy_timeout(handle, 1_000))
         var mode = ""
-        try rows("PRAGMA journal_mode = WAL") { row in
+        try rows("PRAGMA journal_mode = WAL", cache: false) { row in
             mode = Self.text(row, 0)
             return true
         }
@@ -509,11 +611,16 @@ private final class CuriumSQLite {
         try migrate(backup: wasNonempty)
     }
 
-    deinit { sqlite3_close(handle) }
+    deinit {
+        for statement in statementCache.values {
+            sqlite3_finalize(statement)
+        }
+        sqlite3_close_v2(handle)
+    }
 
     private func migrate(backup: Bool) throws {
         var version = 0
-        try rows("PRAGMA user_version") { row in
+        try rows("PRAGMA user_version", cache: false) { row in
             version = Int(sqlite3_column_int(row, 0))
             return true
         }
@@ -539,7 +646,7 @@ private final class CuriumSQLite {
         defer {
             if files.fileExists(atPath: scratch.path) { try? files.removeItem(at: scratch) }
         }
-        try run("VACUUM INTO ?", [.text(scratch.path)])
+        try rows("VACUUM INTO ?", [.text(scratch.path)], cache: false) { _ in true }
         // Install the complete snapshot before pruning any older backup.
         guard rename(scratch.path, backup.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -558,6 +665,7 @@ private final class CuriumSQLite {
         do {
             let result = try body()
             try execute("COMMIT")
+            hasUncheckpointedWrites = true
             if needsPostWriteProtection {
                 applySuspendProtection()
                 needsPostWriteProtection = false
@@ -570,7 +678,37 @@ private final class CuriumSQLite {
     }
 
     func checkpoint() throws {
-        try check(sqlite3_wal_checkpoint_v2(handle, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil))
+        guard hasUncheckpointedWrites else {
+            if needsPostWriteProtection {
+                applySuspendProtection()
+                needsPostWriteProtection = false
+            }
+            return
+        }
+        applySuspendProtection()
+        var logFrames: Int32 = 0
+        var checkpointedFrames: Int32 = 0
+        let code = sqlite3_wal_checkpoint_v2(
+            handle, nil, SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointedFrames
+        )
+        if code == SQLITE_BUSY || code == SQLITE_LOCKED {
+            let passive = sqlite3_wal_checkpoint_v2(
+                handle, nil, SQLITE_CHECKPOINT_PASSIVE, &logFrames, &checkpointedFrames
+            )
+            if passive != SQLITE_OK && passive != SQLITE_BUSY && passive != SQLITE_LOCKED {
+                try check(passive)
+            }
+            if passive == SQLITE_OK && logFrames == 0 {
+                hasUncheckpointedWrites = false
+            }
+        } else {
+            try check(code)
+            if logFrames == 0 {
+                hasUncheckpointedWrites = false
+            }
+        }
+        applySuspendProtection()
+        needsPostWriteProtection = false
     }
 
     private func applySuspendProtection() {
@@ -611,11 +749,25 @@ private final class CuriumSQLite {
         try Task.checkCancellation()
     }
 
-    func rows(_ sql: String, _ values: [Value] = [], _ consume: (OpaquePointer) -> Bool) throws {
-        var pointer: OpaquePointer?
-        try check(sqlite3_prepare_v2(handle, sql, -1, &pointer, nil))
-        guard let statement = pointer else { throw Failure(code: SQLITE_ERROR, message: "Empty statement") }
-        defer { sqlite3_finalize(statement) }
+    func rows(_ sql: String, _ values: [Value] = [], cache: Bool = true, _ consume: (OpaquePointer) -> Bool) throws {
+        let statement: OpaquePointer
+        if cache, let cached = statementCache.removeValue(forKey: sql) {
+            statement = cached
+        } else {
+            var pointer: OpaquePointer?
+            try check(sqlite3_prepare_v2(handle, sql, -1, &pointer, nil))
+            guard let prepared = pointer else { throw Failure(code: SQLITE_ERROR, message: "Empty statement") }
+            statement = prepared
+        }
+        defer {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            if cache, statementCache[sql] == nil, statementCache.count < 64 {
+                statementCache[sql] = statement
+            } else {
+                sqlite3_finalize(statement)
+            }
+        }
         for (offset, value) in values.enumerated() {
             let index = Int32(offset + 1)
             switch value {

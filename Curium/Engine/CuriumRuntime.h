@@ -8,6 +8,7 @@ void CuriumSetPageZoom(id<CrIOSTabHostingV1> tab, CGFloat scale);
 uint64_t CuriumAvailableMemoryBytes(void);
 // 0 = Jitless, 1 = BrowserEngineCore, 2 = Native MAP_JIT, 3 = TXM Split-W^X.
 NSInteger CuriumActiveV8JitMode(void);
+NSArray<NSDictionary<NSString *, NSString *> *> *CuriumRuntimeHookStatuses(void);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

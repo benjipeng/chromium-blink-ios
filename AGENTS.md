@@ -31,7 +31,7 @@ The upstream tree is far too large for this machine. Never run `fetch`, `gclient
 
 - `Kernel.lock` pins the engine artifact. `scripts/sync_curium_engine.py` assembles it into the untracked `Vendor/CuriumEngine/`; `--status` checks it offline. Reserve `--skip-sha256` for an explicit local test IPA.
 - CI compiles the engine with Xcode 27.1 (`version.lock`), as intended. The app must link against SDK 27.2: `vtool -show-build` on the Curium binary reports `sdk 27.2`.
-- Each Release build delivered to `ac_duo` bumps `Version.xcconfig`: `MARKETING_VERSION` by 0.0.1 and `CURRENT_PROJECT_VERSION` by 1. Name the IPA `Curium-<version>-engine<build>-<yyyyMMdd-HHmm>.ipa`.
+- Each Release build bumps `CURRENT_PROJECT_VERSION` by `+1` in `Version.xcconfig` while holding `MARKETING_VERSION` steady across iterations within a cycle (bump `MARKETING_VERSION` only for version milestones). Release tags and artifacts use `curium-v<version>-b<build>` and `Curium-<version>-b<build>-arm64.ipa`.
 
 ## Read before
 

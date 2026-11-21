@@ -28,8 +28,54 @@ private struct CuriumStandbyWindow: View {
     var body: some View {
         CuriumScene(store: store)
             .onChange(of: scenePhase) { _, phase in
-                if phase == .background { store.library.checkpoint() }
+                switch phase {
+                case .inactive:
+                    store.handleSceneWillDeactivate()
+                    CuriumCheckpointRunner.run(library: store.library, reason: "StandbyInactive")
+                case .background:
+                    store.handleSceneDidEnterBackground()
+                    CuriumCheckpointRunner.run(library: store.library, reason: "StandbyBackground")
+                case .active:
+                    store.handleSceneWillEnterForeground()
+                @unknown default:
+                    break
+                }
             }
+    }
+}
+
+@MainActor
+private final class CuriumBackgroundTask {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    init(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.end() }
+            } else {
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated { self?.end() }
+                }
+            }
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        let current = identifier
+        identifier = .invalid
+        UIApplication.shared.endBackgroundTask(current)
+    }
+}
+
+@MainActor
+private enum CuriumCheckpointRunner {
+    static func run(library: CuriumLibrary, reason: String) {
+        let taskGuard = CuriumBackgroundTask(name: "CuriumSQLiteCheckpoint-\(reason)")
+        Task { @MainActor in
+            await library.checkpointAsync()
+            taskGuard.end()
+        }
     }
 }
 
@@ -92,6 +138,12 @@ private final class CuriumSceneHostingController: UIHostingController<CuriumScen
         )
         center.addObserver(
             self,
+            selector: #selector(onSceneWillDeactivate),
+            name: UIScene.willDeactivateNotification,
+            object: windowScene
+        )
+        center.addObserver(
+            self,
             selector: #selector(onSceneDidEnterBackground),
             name: UIScene.didEnterBackgroundNotification,
             object: windowScene
@@ -108,9 +160,14 @@ private final class CuriumSceneHostingController: UIHostingController<CuriumScen
         store.handleMemoryWarning()
     }
 
+    @objc private func onSceneWillDeactivate(_ notification: Notification) {
+        store.handleSceneWillDeactivate()
+        CuriumCheckpointRunner.run(library: store.library, reason: "WillDeactivate")
+    }
+
     @objc private func onSceneDidEnterBackground(_ notification: Notification) {
-        store.library.checkpoint()
         store.handleSceneDidEnterBackground()
+        CuriumCheckpointRunner.run(library: store.library, reason: "DidEnterBackground")
     }
 
     @objc private func onSceneWillEnterForeground(_ notification: Notification) {

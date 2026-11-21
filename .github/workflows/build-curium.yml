@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: "Optional GitHub Release tag override (defaults to curium-v<MARKETING_VERSION>)"
+        description: "Optional GitHub Release tag override (defaults to curium-v<MARKETING_VERSION>-b<CURRENT_PROJECT_VERSION>)"
         type: string
         default: ""
       release_notes:
@@ -155,7 +155,7 @@ jobs:
           elif [ -n "$INPUT_RELEASE_TAG" ]; then
             tag="$INPUT_RELEASE_TAG"
           else
-            tag="curium-v${CURIUM_VERSION}"
+            tag="curium-v${CURIUM_VERSION}-b${CURIUM_BUILD}"
           fi
 
           notes_file="$RUNNER_TEMP/curium-release-notes.md"
@@ -164,7 +164,7 @@ jobs:
               printf '%s\n\n' "$INPUT_RELEASE_NOTES"
             fi
             cat <<EOF
-          ### Curium ${CURIUM_VERSION} (${CURIUM_BUILD})
+          ### Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}
 
           Ad-hoc signed \`arm64\` iOS IPA built with Xcode ${SDK_VERSION} (iOS ${SDK_VERSION} SDK) for LiveContainer and sideloading.
 
@@ -181,7 +181,7 @@ jobs:
 
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" \
-              --title "Curium ${CURIUM_VERSION} (${CURIUM_BUILD})" \
+              --title "Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}" \
               --notes-file "$notes_file"
             gh release upload "$tag" "$IPA_PATH" "$SHA_PATH" --clobber
           else
@@ -192,7 +192,7 @@ jobs:
             gh release create "$tag" \
               "$IPA_PATH" "$SHA_PATH" \
               --target "$GITHUB_SHA" \
-              --title "Curium ${CURIUM_VERSION} (${CURIUM_BUILD})" \
+              --title "Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}" \
               --notes-file "$notes_file" \
               --generate-notes \
               ${extra_flags[@]+"${extra_flags[@]}"}
@@ -203,7 +203,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         run: |
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
-          ## Curium ${CURIUM_VERSION} (${CURIUM_BUILD})
+          ## Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}
 
           | Metric | Value |
           | --- | --- |

@@ -46,15 +46,18 @@ enum CuriumLibraryLocation {
     /// Copies the newest legacy library into `resolution.database` if it does not exist.
     /// Safe when two LiveContainer instances launch at once: the copy is staged
     /// privately and installed with an exclusive rename, so the first one wins.
-    static func adoptLegacyIfNeeded(_ resolution: Resolution) {
+    /// Returns `false` if a non-empty legacy library exists and adoption failed; the
+    /// caller must fail closed instead of creating an empty target DB that would block retries.
+    @discardableResult
+    static func adoptLegacyIfNeeded(_ resolution: Resolution) -> Bool {
         let files = FileManager.default
         let target = resolution.database
-        guard !files.fileExists(atPath: target.path) else { return }
+        guard !files.fileExists(atPath: target.path) else { return true }
 
         let source = resolution.legacy
             .filter { $0 != target && nonEmpty($0) }
             .max { modified($0) < modified($1) }
-        guard let source else { return }
+        guard let source else { return true }
 
         do {
             try files.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -63,13 +66,15 @@ enum CuriumLibraryLocation {
             defer { try? files.removeItem(at: scratch) }
             try snapshot(source, into: scratch)
             if renamex_np(scratch.path, target.path, UInt32(RENAME_EXCL)) != 0 {
-                if errno == EEXIST { return } // Another instance adopted first.
+                if errno == EEXIST { return true } // Another instance adopted first.
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             log.notice("library: adopted \(source.path, privacy: .public) into \(target.path, privacy: .public)")
+            return true
         } catch {
-            // The source is untouched; the library opens empty and the next launch retries.
+            // Keep `target` absent so the next launch retries adoption cleanly.
             log.error("library: could not adopt \(source.path, privacy: .public): \(String(describing: error), privacy: .public)")
+            return false
         }
     }
 
@@ -106,7 +111,11 @@ enum CuriumLibraryLocation {
             if let handle { sqlite3_close(handle) }
             throw CocoaError(.fileReadCorruptFile)
         }
-        defer { sqlite3_close(handle) }
+        defer { sqlite3_close_v2(handle) }
+        var suspendFlag: UInt8 = 1
+        for suffix in ["", "-wal", "-shm"] {
+            _ = setxattr(source.path + suffix, "com.apple.runningboard.can-suspend-locked", &suspendFlag, 1, 0, 0)
+        }
         sqlite3_busy_timeout(handle, 2_000)
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "VACUUM INTO ?", -1, &statement, nil) == SQLITE_OK, let statement else {

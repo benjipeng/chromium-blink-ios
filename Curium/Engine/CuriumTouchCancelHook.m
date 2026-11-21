@@ -25,6 +25,7 @@
 // touchesCancelled:withEvent:.
 
 typedef void (*CuriumTouchHandlerIMP)(id, SEL, NSSet<UITouch *> *, UIEvent *);
+typedef void (*CuriumRemoveViewIMP)(id, SEL);
 
 static const NSUInteger kWebTouchBuilderCapacity = 16;
 
@@ -32,6 +33,9 @@ static CuriumTouchHandlerIMP gOrigTouchesBegan;
 static CuriumTouchHandlerIMP gOrigTouchesMoved;
 static CuriumTouchHandlerIMP gOrigTouchesEnded;
 static CuriumTouchHandlerIMP gOrigTouchesCancelled;
+static CuriumRemoveViewIMP gOrigRemoveView;
+
+static char kCuriumRenderWidgetDetachedKey;
 
 static os_log_t CuriumTouchHookLog(void) {
     static os_log_t log;
@@ -40,6 +44,22 @@ static os_log_t CuriumTouchHookLog(void) {
         log = os_log_create("com.appautomaton.curium", "engine");
     });
     return log;
+}
+
+static BOOL CuriumIsRenderWidgetDetached(id view) {
+    if (!view) {
+        return YES;
+    }
+    if (objc_getAssociatedObject(view, &kCuriumRenderWidgetDetachedKey) != nil) {
+        return YES;
+    }
+    return ((UIView *)view).window == nil;
+}
+
+static void CuriumRemoveView(id self, SEL _cmd) {
+    objc_setAssociatedObject(self, &kCuriumRenderWidgetDetachedKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gOrigRemoveView(self, _cmd);
 }
 
 static NSMutableArray<UITouch *> *CuriumTrackedTouches(void) {
@@ -78,13 +98,25 @@ static void CuriumRemoveTouches(NSMutableArray<UITouch *> *tracked, NSArray<UITo
 }
 
 static void CuriumTouchesBegan(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
+    // RenderWidgetUIView early-returns when its C++ _view is detached without
+    // registering touches in WebTouchEventBuilder's global table. Skip both
+    // admission and forwarding while detached or unattached so our mirror stays
+    // strictly synchronized with WebTouchEventBuilder.
+    if (CuriumIsRenderWidgetDetached(self)) {
+        return;
+    }
+
     NSMutableArray<UITouch *> *tracked = CuriumTrackedTouches();
 
-    // If the 16-slot table is full, reclaim any stale touches before admitting new ones.
-    if (tracked.count >= kWebTouchBuilderCapacity) {
-        NSMutableArray<UITouch *> *stale = [NSMutableArray array];
+    // Reclaim any stale touches left over from a detached/closed view before
+    // admitting new ones so phantom fingers cannot accumulate across tabs.
+    if (tracked.count > 0) {
+        NSMutableArray<UITouch *> *stale = nil;
         for (UITouch *t in tracked) {
             if (CuriumIsTouchStale(t)) {
+                if (!stale) {
+                    stale = [NSMutableArray array];
+                }
                 [stale addObject:t];
             }
         }
@@ -112,6 +144,20 @@ static void CuriumTouchesBegan(id self, SEL _cmd, NSSet<UITouch *> *touches, UIE
 
 static void CuriumTouchesMoved(id self, SEL _cmd, NSSet<UITouch *> *touches, UIEvent *event) {
     NSMutableArray<UITouch *> *tracked = CuriumTrackedTouches();
+    if (tracked.count == 0 || touches.count == 0) {
+        return;
+    }
+    BOOL allTracked = YES;
+    for (UITouch *touch in touches) {
+        if (CuriumFindTrackedTouch(tracked, touch) == NSNotFound) {
+            allTracked = NO;
+            break;
+        }
+    }
+    if (allTracked) {
+        gOrigTouchesMoved(self, _cmd, touches, event);
+        return;
+    }
     NSMutableSet<UITouch *> *known = [NSMutableSet setWithCapacity:touches.count];
     for (UITouch *touch in touches) {
         if (CuriumFindTrackedTouch(tracked, touch) != NSNotFound) {
@@ -203,19 +249,33 @@ void CuriumInstallTouchCancelHook(void) {
     dispatch_once(&onceToken, ^{
         os_log_t log = CuriumTouchHookLog();
         Class cls = NSClassFromString(@"RenderWidgetUIView");
+        if (!cls) {
+            CuriumRecordHookStatus(@"Touch Cancel Guard", @"skipped",
+                                   @"RenderWidgetUIView class not present");
+            return;
+        }
         const char *sig = "v32@0:8@16@24";
-        Method mBegan     = cls ? CuriumExpectMethod(cls, "touchesBegan:withEvent:", sig) : NULL;
-        Method mMoved     = cls ? CuriumExpectMethod(cls, "touchesMoved:withEvent:", sig) : NULL;
-        Method mEnded     = cls ? CuriumExpectMethod(cls, "touchesEnded:withEvent:", sig) : NULL;
-        Method mCancelled = cls ? CuriumExpectMethod(cls, "touchesCancelled:withEvent:", sig) : NULL;
+        Method mBegan     = CuriumExpectMethod(cls, "touchesBegan:withEvent:", sig);
+        Method mMoved     = CuriumExpectMethod(cls, "touchesMoved:withEvent:", sig);
+        Method mEnded     = CuriumExpectMethod(cls, "touchesEnded:withEvent:", sig);
+        Method mCancelled = CuriumExpectMethod(cls, "touchesCancelled:withEvent:", sig);
         if (!mBegan || !mMoved || !mEnded || !mCancelled) {
             os_log_error(log, "touch cancel hook: skipped, unexpected RenderWidgetUIView methods");
+            CuriumRecordHookStatus(@"Touch Cancel Guard", @"failed",
+                                   @"Unexpected RenderWidgetUIView touch method layout");
             return;
         }
         gOrigTouchesBegan     = (CuriumTouchHandlerIMP)method_setImplementation(mBegan, (IMP)CuriumTouchesBegan);
         gOrigTouchesMoved     = (CuriumTouchHandlerIMP)method_setImplementation(mMoved, (IMP)CuriumTouchesMoved);
         gOrigTouchesEnded     = (CuriumTouchHandlerIMP)method_setImplementation(mEnded, (IMP)CuriumTouchesEnded);
         gOrigTouchesCancelled = (CuriumTouchHandlerIMP)method_setImplementation(mCancelled, (IMP)CuriumTouchesCancelled);
-        os_log(log, "touch cancel hook: installed on RenderWidgetUIView");
+
+        Method mRemoveView = CuriumExpectMethod(cls, "removeView", "v16@0:8");
+        if (mRemoveView) {
+            gOrigRemoveView = (CuriumRemoveViewIMP)method_setImplementation(mRemoveView, (IMP)CuriumRemoveView);
+        }
+        os_log(log, "touch cancel hook: installed on RenderWidgetUIView (removeView=%d)", mRemoveView != NULL);
+        CuriumRecordHookStatus(@"Touch Cancel Guard", @"active",
+                               mRemoveView ? @"touches* + removeView guarded" : @"touches* guarded");
     });
 }

@@ -28,13 +28,21 @@ struct CuriumChromeState: Equatable {
     }
 
     mutating func engineReported(collapse: CGFloat?) {
-        let next: Source = collapse.map { .compositor(collapse: min(1, max(0, $0))) } ?? .fixed
+        let next: Source = collapse.map { .compositor(collapse: Self.quantize($0)) } ?? .fixed
         guard next != source else { return }
         if (next == .fixed) != (source == .fixed) {
             Self.log.notice("chrome source: \(next == .fixed ? "fixed" : "compositor", privacy: .public)")
         }
         source = next
         if pinnedOpen, case .compositor(let value) = next, value == 0 { unpin(.reachedTop) }
+    }
+
+    /// Snaps sub-pixel compositor drift into 0.005 steps and settles endpoints cleanly.
+    private static func quantize(_ raw: CGFloat) -> CGFloat {
+        let clamped = min(1, max(0, raw))
+        if clamped <= 0.005 { return 0 }
+        if clamped >= 0.995 { return 1 }
+        return (clamped * 200).rounded() / 200
     }
 
     mutating func pin() {

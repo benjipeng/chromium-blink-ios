@@ -42,12 +42,19 @@ void CuriumInstallInputAccessoryHook(void) {
     dispatch_once(&onceToken, ^{
         os_log_t log = os_log_create("com.appautomaton.curium", "engine");
         Class cls = NSClassFromString(@"RenderWidgetUIView");
-        Method method = cls ? CuriumExpectMethod(cls, "inputAccessoryView", "@16@0:8") : NULL;
+        if (!cls) {
+            CuriumRecordHookStatus(@"Input Accessory", @"skipped",
+                                   @"RenderWidgetUIView class not present");
+            return;
+        }
+        Method method = CuriumExpectMethod(cls, "inputAccessoryView", "@16@0:8");
         gCuriumReloadInputViews = sel_registerName("curium_reloadInputViews");
         // Fail closed: on an unexpected layout, keep the engine's accessory.
         if (!method || !class_addMethod(cls, gCuriumReloadInputViews,
                                         (IMP)CuriumReloadInputViews, "v16@0:8")) {
             os_log_error(log, "input accessory hook: skipped, unexpected RenderWidgetUIView");
+            CuriumRecordHookStatus(@"Input Accessory", @"failed",
+                                   @"Unexpected RenderWidgetUIView inputAccessoryView layout");
             return;
         }
         gCuriumEngineInputAccessoryView = (CuriumInputAccessoryIMP)method_setImplementation(
@@ -66,5 +73,7 @@ void CuriumInstallInputAccessoryHook(void) {
                             }];
         }
         os_log(log, "input accessory hook: installed");
+        CuriumRecordHookStatus(@"Input Accessory", @"active",
+                               @"Suppressed while hardware keyboard attached");
     });
 }

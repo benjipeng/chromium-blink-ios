@@ -70,10 +70,12 @@ struct CuriumAddressMatches: View {
             }
         }
         .task(id: Request(query: text, bookmarkRevision: library.bookmarkRevision)) {
-            result = nil
-            guard !text.isEmpty else { return }
+            guard !text.isEmpty else {
+                result = nil
+                return
+            }
             do {
-                try await Task.sleep(for: .milliseconds(120))
+                try await Task.sleep(for: .milliseconds(60))
                 let matches = await library.addressMatches(for: text)
                 try Task.checkCancellation()
                 result = (text, matches)
@@ -89,7 +91,7 @@ struct CuriumAddressMatches: View {
                 CuriumAddressMatch(kind: .bookmark, url: $0.url, title: $0.title)
             }
         }
-        return result?.query == text ? (result?.matches ?? []) : []
+        return result?.matches ?? []
     }
 
     private func rows(input: CuriumAddressInput?, matches: [CuriumAddressMatch]) -> some View {

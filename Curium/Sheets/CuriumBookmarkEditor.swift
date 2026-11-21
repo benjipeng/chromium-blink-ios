@@ -17,21 +17,27 @@ struct CuriumBookmarkEditor: View {
     @State private var isEditingBookmark = false
     @State private var isSaving = false
     @State private var saveFailed = false
+    @State private var destinations: [CuriumBookmarkTree.Destination]
 
     init(library: CuriumLibrary, subject: Subject) {
         self.library = library
         self.subject = subject
+        let excludedID: Int64?
         switch subject {
         case .bookmark(_, let title):
             _title = State(initialValue: title)
             _folderID = State(initialValue: CuriumBookmarkFolder.favoritesID)
+            excludedID = nil
         case .newFolder(let parentID):
             _title = State(initialValue: "")
             _folderID = State(initialValue: parentID)
+            excludedID = nil
         case .folder(let folder):
             _title = State(initialValue: folder.title)
             _folderID = State(initialValue: folder.parentID)
+            excludedID = folder.id
         }
+        _destinations = State(initialValue: library.bookmarks.destinations(excluding: excludedID))
     }
 
     var body: some View {
@@ -42,7 +48,7 @@ struct CuriumBookmarkEditor: View {
                     .submitLabel(.done)
                     .onSubmit(save)
                 Picker(selection: $folderID) {
-                    ForEach(library.bookmarks.destinations(excluding: editedFolderID)) { destination in
+                    ForEach(destinations) { destination in
                         Label(destination.title, systemImage: destination.symbol)
                             .tag(destination.id)
                     }
@@ -72,6 +78,9 @@ struct CuriumBookmarkEditor: View {
         }
         .interactiveDismissDisabled(isSaving)
         .presentationDetents([.medium, .large])
+        .onChange(of: library.bookmarkRevision) {
+            destinations = library.bookmarks.destinations(excluding: editedFolderID)
+        }
         .task {
             guard !isReady else { return }
             if case .bookmark(let url, _) = subject,
@@ -80,6 +89,7 @@ struct CuriumBookmarkEditor: View {
                 folderID = bookmark.parentID
                 isEditingBookmark = true
             }
+            destinations = library.bookmarks.destinations(excluding: editedFolderID)
             isReady = true
         }
     }

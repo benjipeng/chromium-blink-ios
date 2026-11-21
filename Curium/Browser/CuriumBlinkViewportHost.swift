@@ -11,6 +11,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
     let tab: CuriumTabModel?
     let restingTopInset: CGFloat
     let viewportSize: CGSize
+    let isChromePinned: Bool
     let standby: CuriumStandbyPage
     let scheduleSnapshot: (CuriumTabModel) -> Void
 
@@ -18,13 +19,85 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: Controller, context: Context) {
         controller.update(
-            tab: tab, restingTopInset: restingTopInset, viewportSize: viewportSize, standby: standby,
-            scheduleSnapshot: scheduleSnapshot
+            tab: tab, restingTopInset: restingTopInset, viewportSize: viewportSize,
+            isChromePinned: isChromePinned, standby: standby, scheduleSnapshot: scheduleSnapshot
         )
     }
 
     static func dismantleUIViewController(_ controller: Controller, coordinator: Void) {
         controller.teardown()
+    }
+
+    /// Isolated KVO observer token with a unique context pointer and unconditional
+    /// cleanup on `deinit`, avoiding raw KVO teardown traps if the controller exits early.
+    private final class ShownRatioObserver: NSObject {
+        private nonisolated(unsafe) static var kvoContext: UInt8 = 0
+        private let keyPath: String
+        private var target: NSObject?
+        private let onChange: @MainActor @Sendable () -> Void
+
+        @MainActor
+        init(target: NSObject, keyPath: String, onChange: @escaping @MainActor @Sendable () -> Void) {
+            self.target = target
+            self.keyPath = keyPath
+            self.onChange = onChange
+            super.init()
+            target.addObserver(self, forKeyPath: keyPath, options: [.new], context: &Self.kvoContext)
+        }
+
+        func invalidate() {
+            guard let target else { return }
+            self.target = nil
+            target.removeObserver(self, forKeyPath: keyPath, context: &Self.kvoContext)
+        }
+
+        deinit {
+            invalidate()
+        }
+
+        override func observeValue(
+            forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?,
+            context: UnsafeMutableRawPointer?
+        ) {
+            guard context == &Self.kvoContext else {
+                super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+                return
+            }
+            let callback = onChange
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { callback() }
+            } else {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { callback() }
+                }
+            }
+        }
+    }
+
+    /// Holds KVO tokens so `Controller.deinit` can invalidate all observers without
+    /// violating Swift 6 main-actor isolation.
+    private final class ObserverBag: @unchecked Sendable {
+        var background: NSKeyValueObservation?
+        var scroll: NSKeyValueObservation?
+        var shownRatio: ShownRatioObserver?
+
+        func invalidateScroll() {
+            scroll?.invalidate()
+            scroll = nil
+        }
+
+        func invalidateAll() {
+            background?.invalidate()
+            background = nil
+            scroll?.invalidate()
+            scroll = nil
+            shownRatio?.invalidate()
+            shownRatio = nil
+        }
+
+        deinit {
+            invalidateAll()
+        }
     }
 
     final class Controller: UIViewController, UIGestureRecognizerDelegate {
@@ -33,6 +106,8 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         /// Scroll distance after which a pinned bar yields to the page again.
         private static let unpinTravel: CGFloat = 24
 
+        private let observations = ObserverBag()
+        private let historyFeedback = UIImpactFeedbackGenerator(style: .light)
         private weak var browserTab: CuriumTabModel?
         private var mountedTabID: String?
         private weak var mountedEngine: (any CrIOSTabHostingV1)?
@@ -40,8 +115,6 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         private var standbyController: UIHostingController<CuriumStandbyPage>?
         private weak var mountedView: UIView?
         private weak var scrollView: UIScrollView?
-        private var backgroundObservation: NSKeyValueObservation?
-        private var scrollObservation: NSKeyValueObservation?
         private var compositorControls: CompositorControls?
         private var pinnedScrollY: CGFloat?
         private var mountGeneration = 0
@@ -51,6 +124,10 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         private var originalIndicatorInsets: UIEdgeInsets = .zero
         private var originalAdjustment: UIScrollView.ContentInsetAdjustmentBehavior = .automatic
         private var originalAutomaticIndicators = true
+
+        deinit {
+            observations.invalidateAll()
+        }
 
         override func loadView() {
             let container = UIView()
@@ -72,7 +149,8 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         }
 
         func update(
-            tab: CuriumTabModel?, restingTopInset: CGFloat, viewportSize: CGSize, standby: CuriumStandbyPage,
+            tab: CuriumTabModel?, restingTopInset: CGFloat, viewportSize: CGSize,
+            isChromePinned: Bool, standby: CuriumStandbyPage,
             scheduleSnapshot: (CuriumTabModel) -> Void
         ) {
             browserTab = tab
@@ -94,6 +172,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
                 mount(webView, scrollView: tab.scrollView, engine: engine)
                 scheduleSnapshot(tab)
             }
+            syncScrollObservation(isPinned: isChromePinned)
             syncViewportGeometry()
         }
 
@@ -136,11 +215,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
             mountGeneration += 1
             historyGestureTab = nil
             pinnedScrollY = nil
-            backgroundObservation?.invalidate()
-            backgroundObservation = nil
-            scrollObservation?.invalidate()
-            scrollObservation = nil
-            compositorControls?.removeObserver(self, forKeyPath: Self.shownRatioKey)
+            observations.invalidateAll()
             compositorControls = nil
             if let controls = engine as? CompositorControls,
                controls.responds(to: #selector(getter: CrIOSTabBrowserControlsV1.topControlsHeight)),
@@ -170,39 +245,56 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
                 originalIndicatorInsets = newScrollView.verticalScrollIndicatorInsets
                 originalAdjustment = newScrollView.contentInsetAdjustmentBehavior
                 originalAutomaticIndicators = newScrollView.automaticallyAdjustsScrollIndicatorInsets
-                backgroundObservation = newScrollView.observe(\.backgroundColor, options: [.initial, .new]) { [weak self] _, _ in
-                    MainActor.assumeIsolated {
+                observations.background = newScrollView.observe(\.backgroundColor, options: [.new]) { [weak self] _, _ in
+                    let apply: @MainActor @Sendable () -> Void = {
                         self?.browserTab?.syncScrollCanvasColor()
                     }
-                }
-                scrollObservation = newScrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, _ in
-                    MainActor.assumeIsolated {
-                        self?.releasePinIfScrolled(scrollView)
+                    if Thread.isMainThread {
+                        MainActor.assumeIsolated { apply() }
+                    } else {
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated { apply() }
+                        }
                     }
                 }
             }
             if let controls = compositorControls {
-                controls.addObserver(self, forKeyPath: Self.shownRatioKey, options: [.new], context: nil)
+                observations.shownRatio = ShownRatioObserver(target: controls, keyPath: Self.shownRatioKey) { [weak self] in
+                    self?.reportCollapse()
+                }
             }
             // Mounting runs inside a SwiftUI update; publish the first state after it.
             let generation = mountGeneration
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.mountGeneration == generation else { return }
+                self.browserTab?.syncScrollCanvasColor()
                 self.reportCollapse()
             }
         }
 
-        nonisolated override func observeValue(
-            forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?,
-            context: UnsafeMutableRawPointer?
-        ) {
-            let handled = MainActor.assumeIsolated {
-                guard keyPath == Self.shownRatioKey else { return false }
-                self.reportCollapse()
-                return true
+        /// Attaches `contentOffset` KVO strictly while the reader has pinned the bar open,
+        /// avoiding 120Hz KVO callback overhead during normal scrolling.
+        private func syncScrollObservation(isPinned: Bool) {
+            guard isPinned, let scrollView else {
+                pinnedScrollY = nil
+                observations.invalidateScroll()
+                return
             }
-            if !handled {
-                super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            if pinnedScrollY == nil {
+                pinnedScrollY = scrollView.contentOffset.y
+            }
+            guard observations.scroll == nil else { return }
+            observations.scroll = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] observed, _ in
+                let apply: @MainActor @Sendable () -> Void = {
+                    self?.releasePinIfScrolled(observed)
+                }
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { apply() }
+                } else {
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { apply() }
+                    }
+                }
             }
         }
 
@@ -211,17 +303,13 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
             guard let tab = browserTab, tab.engine === mountedEngine else { return }
             let collapse = compositorControls.map { 1 - $0.topControlsShownRatio }
             tab.reportChromeCollapse(collapse)
-            if tab.chrome.pinnedOpen, pinnedScrollY == nil {
-                pinnedScrollY = scrollView?.contentOffset.y
-            } else if !tab.chrome.pinnedOpen {
-                pinnedScrollY = nil
-            }
+            syncScrollObservation(isPinned: tab.isChromePinned)
         }
 
         /// A bar the reader pinned open yields once they scroll on.
         private func releasePinIfScrolled(_ scrollView: UIScrollView) {
-            guard let tab = browserTab, tab.chrome.pinnedOpen else {
-                pinnedScrollY = nil
+            guard let tab = browserTab, tab.isChromePinned else {
+                syncScrollObservation(isPinned: false)
                 return
             }
             guard let start = pinnedScrollY else {
@@ -231,6 +319,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
             if abs(scrollView.contentOffset.y - start) > Self.unpinTravel {
                 pinnedScrollY = nil
                 tab.unpinChrome(.scrolled)
+                syncScrollObservation(isPinned: false)
             }
         }
 
@@ -290,13 +379,22 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
         ) -> Bool {
-            (other.view as? UIScrollView)?.panGestureRecognizer === other
+            guard (other.view as? UIScrollView)?.panGestureRecognizer === other else { return false }
+            // Yield while undecided so vertical drags near the edge stay responsive; once
+            // horizontal edge navigation begins, stop competing with page scroll.
+            return gestureRecognizer.state == .possible
         }
 
         @objc private func handleHistoryPan(_ pan: UIPanGestureRecognizer) {
             switch pan.state {
             case .began:
                 historyGestureTab = browserTab
+                historyFeedback.prepare()
+                if let scrollPan = scrollView?.panGestureRecognizer,
+                   scrollPan.state == .began || scrollPan.state == .changed {
+                    scrollPan.isEnabled = false
+                    scrollPan.isEnabled = true
+                }
             case .ended:
                 defer { historyGestureTab = nil }
                 guard let tab = historyGestureTab, tab === browserTab else { return }
@@ -304,6 +402,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
                 let advance = direction * pan.translation(in: view).x
                 let speed = direction * pan.velocity(in: view).x
                 guard advance >= 64 || (advance >= 24 && speed >= 550) else { return }
+                historyFeedback.impactOccurred()
                 if goesBack(pan) { tab.goBack() } else { tab.goForward() }
             case .cancelled, .failed:
                 historyGestureTab = nil

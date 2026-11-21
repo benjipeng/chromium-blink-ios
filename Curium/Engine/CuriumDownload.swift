@@ -42,6 +42,16 @@ final class CuriumDownload: Identifiable {
         if fraction != newFraction { fraction = newFraction }
     }
 
+    nonisolated private static func downloadsRootDirectory() throws -> URL {
+        if let hostPath = ProcessInfo.processInfo.environment["LC_HOME_PATH"], !hostPath.isEmpty {
+            let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
+            return host.appending(path: "Documents/Curium/Downloads", directoryHint: .isDirectory)
+        }
+        let root = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                               appropriateFor: nil, create: true)
+        return root.appending(path: "Downloads", directoryHint: .isDirectory)
+    }
+
     func start() async {
         guard state == .pending, !isStarting else { return }
         isStarting = true
@@ -50,9 +60,7 @@ final class CuriumDownload: Identifiable {
         let name = filename
         do {
             let destination = try await Task.detached(priority: .utility) {
-                let root = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
-                                                       appropriateFor: nil, create: true)
-                let directory = root.appending(path: "Downloads", directoryHint: .isDirectory)
+                let directory = try Self.downloadsRootDirectory()
                     .appending(path: UUID().uuidString, directoryHint: .isDirectory)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 return directory.appending(path: name)

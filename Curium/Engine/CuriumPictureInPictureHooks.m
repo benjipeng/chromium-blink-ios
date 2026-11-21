@@ -68,6 +68,8 @@ static void CuriumPiPBridgeDealloc(__unsafe_unretained id self, SEL _cmd) {
 static void CuriumInstallPiPCloseFix(Class cls) {
     if (class_getInstanceMethod(cls, sel_registerName("detachObservers"))) {
         os_log(CuriumPiPLog(), "pip close fix: not needed, engine has detachObservers");
+        CuriumRecordHookStatus(@"PiP Dealloc Fix", @"skipped",
+                               @"Engine provides native detachObservers");
         return;
     }
     const char *observerNames[4] = {"_didEnterBgObserver", "_willEnterFgObserver",
@@ -88,11 +90,15 @@ static void CuriumInstallPiPCloseFix(Class cls) {
     if (!layoutMatches || !gCuriumPiPDeallocController || !gCuriumPiPObservingPossible ||
         !gCuriumPiPHostView || !method || method_getImplementation(method) == superDealloc) {
         os_log_error(CuriumPiPLog(), "pip close fix: skipped, unexpected CuriumPiPBridge layout");
+        CuriumRecordHookStatus(@"PiP Dealloc Fix", @"failed",
+                               @"Unexpected CuriumPiPBridge dealloc layout");
         return;
     }
     gCuriumPiPBridgeSuperDealloc = (CuriumDeallocIMP)superDealloc;
     method_setImplementation(method, (IMP)CuriumPiPBridgeDealloc);
     os_log(CuriumPiPLog(), "pip close fix: installed");
+    CuriumRecordHookStatus(@"PiP Dealloc Fix", @"active",
+                           @"Replaced dealloc without render-queue self-retain");
 }
 
 #pragma mark - Start when ready
@@ -175,7 +181,12 @@ static BOOL CuriumPiPAttemptOpen(id bridge, AVPictureInPictureController *contro
 // Ready means the controller has existed for the settle time, reports possible, and
 // its layer has received a frame. Anything the engine handles on its own (no
 // controller, a stale generation, an active window) counts as ready.
-static BOOL CuriumPiPReady(id bridge, uint64_t generation) {
+// When not yet settled, writes the remaining settle interval to `outWait` so the
+// caller sleeps once through the settle period instead of polling every 30 ms.
+static BOOL CuriumPiPReady(id bridge, uint64_t generation, CFTimeInterval *outWait) {
+    if (outWait) {
+        *outWait = kCuriumPiPPollSeconds;
+    }
     AVPictureInPictureController *controller = object_getIvar(bridge, gCuriumPiPController);
     AVSampleBufferDisplayLayer *layer = object_getIvar(bridge, gCuriumPiPDisplayLayer);
     if (!controller || !layer || controller.isPictureInPictureActive ||
@@ -189,8 +200,14 @@ static BOOL CuriumPiPReady(id bridge, uint64_t generation) {
         objc_setAssociatedObject(controller, &kCuriumPiPFirstSeenKey, firstSeen,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    return now - firstSeen.doubleValue >= kCuriumPiPSettleSeconds &&
-           controller.isPictureInPicturePossible &&
+    CFTimeInterval remainingSettle = kCuriumPiPSettleSeconds - (now - firstSeen.doubleValue);
+    if (remainingSettle > 0) {
+        if (outWait) {
+            *outWait = remainingSettle > kCuriumPiPPollSeconds ? remainingSettle : kCuriumPiPPollSeconds;
+        }
+        return NO;
+    }
+    return controller.isPictureInPicturePossible &&
            layer.sampleBufferRenderer.status == AVQueuedSampleBufferRenderingStatusRendering;
 }
 
@@ -199,13 +216,18 @@ static BOOL CuriumPiPReady(id bridge, uint64_t generation) {
 static void CuriumPiPWhenReady(id bridge, uint64_t generation, CFTimeInterval startedAt,
                                void (^action)(id bridge, BOOL ready, CFTimeInterval waited)) {
     CFTimeInterval waited = CACurrentMediaTime() - startedAt;
-    BOOL ready = CuriumPiPReady(bridge, generation);
+    CFTimeInterval nextWait = kCuriumPiPPollSeconds;
+    BOOL ready = CuriumPiPReady(bridge, generation, &nextWait);
     if (ready || waited >= kCuriumPiPReadyDeadlineSeconds) {
         action(bridge, ready, waited);
         return;
     }
+    CFTimeInterval remainingDeadline = kCuriumPiPReadyDeadlineSeconds - waited;
+    if (nextWait > remainingDeadline) {
+        nextWait = remainingDeadline;
+    }
     __weak id weakBridge = bridge;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kCuriumPiPPollSeconds * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(nextWait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        id strongBridge = weakBridge;
                        if (strongBridge) {
@@ -279,12 +301,16 @@ static void CuriumInstallPiPStartWhenReady(Class cls) {
         !gCuriumPiPActiveGeneration || !gCuriumPiPAttemptGeneration ||
         !gCuriumPiPAttemptActive || !gCuriumPiPActive) {
         os_log_error(CuriumPiPLog(), "pip start hook: skipped, unexpected CuriumPiPBridge layout");
+        CuriumRecordHookStatus(@"PiP Start-When-Ready", @"failed",
+                               @"Unexpected CuriumPiPBridge start layout");
         return;
     }
     gCuriumPiPEngineStart = (CuriumPiPStartIMP)method_setImplementation(start, (IMP)CuriumPiPStart);
     gCuriumPiPEngineFailed =
         (CuriumPiPFailedIMP)method_setImplementation(failed, (IMP)CuriumPiPFailedToStart);
     os_log(CuriumPiPLog(), "pip start hook: installed");
+    CuriumRecordHookStatus(@"PiP Start-When-Ready", @"active",
+                           @"Readiness gate + 1 retry installed");
 }
 
 void CuriumInstallPictureInPictureHooks(void) {
@@ -292,6 +318,10 @@ void CuriumInstallPictureInPictureHooks(void) {
     dispatch_once(&onceToken, ^{
         Class cls = NSClassFromString(@"CuriumPiPBridge");
         if (!cls) {
+            CuriumRecordHookStatus(@"PiP Dealloc Fix", @"skipped",
+                                   @"CuriumPiPBridge class not present");
+            CuriumRecordHookStatus(@"PiP Start-When-Ready", @"skipped",
+                                   @"CuriumPiPBridge class not present");
             return;
         }
         CuriumInstallPiPCloseFix(cls);

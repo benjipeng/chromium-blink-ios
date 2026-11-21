@@ -21,6 +21,12 @@ final class CuriumTabModel: Identifiable {
     private(set) var zoomScale: CGFloat = 1.0
     private(set) var pageCanvasColor: UIColor?
     private(set) var isFullscreen = false
+    /// Coarse flag mirroring whether this tab is currently showing the blank start page,
+    /// so root browser chrome doesn't re-evaluate on every webpage URL/loading update.
+    private(set) var isBlankStartPage = false
+    /// Coarse flag mirroring `chrome.pinnedOpen` without exposing 120Hz `collapse` ticks
+    /// to the viewport host.
+    private(set) var isChromePinned = false
     /// The address bar's collapse. Updated every compositor frame while scrolling, so
     /// only the address bar's leaf views read it.
     private(set) var chrome = CuriumChromeState()
@@ -43,6 +49,18 @@ final class CuriumTabModel: Identifiable {
         self.engine === engine && webView === engine.webView && scrollView === engine.scrollView
     }
 
+    /// Releases engine/view references and cancels timers once the tab has been closed.
+    func invalidate() {
+        pictureInPictureTimer?.cancel()
+        pictureInPictureTimer = nil
+        clearSnapshot()
+        if engine != nil { engine = nil }
+        if webView != nil { webView = nil }
+        if scrollView != nil { scrollView = nil }
+        updateChrome { $0 = CuriumChromeState() }
+        syncBlankStartPage()
+    }
+
     /// Reports the engine title when history needs to reconsider this tab.
     fileprivate func refresh(from engine: any CrIOSTabHostingV1) -> (title: String, titleChanged: Bool)? {
         let nextView = engine.webView
@@ -52,7 +70,7 @@ final class CuriumTabModel: Identifiable {
         }
         if self.engine !== engine {
             self.engine = engine
-            update(\.chrome) { $0 = CuriumChromeState() }
+            updateChrome { $0 = CuriumChromeState() }
         }
         if webView !== nextView { webView = nextView }
         if scrollView !== nextScroll { scrollView = nextScroll }
@@ -62,7 +80,7 @@ final class CuriumTabModel: Identifiable {
         if urlChanged {
             url = newURL
             if newURL != nil { configuredInitialSiteMode = true }
-            update(\.chrome) { $0.unpin(.navigated) }
+            updateChrome { $0.unpin(.navigated) }
             clearSnapshot()
         }
 
@@ -111,7 +129,20 @@ final class CuriumTabModel: Identifiable {
 
         let newExtTabID = engine.extensionTabID
         if extensionTabID != newExtTabID { extensionTabID = newExtTabID }
+
+        syncBlankStartPage()
         return urlChanged || titleChanged || loadingChanged ? (rawTitle, titleChanged) : nil
+    }
+
+    private func syncBlankStartPage() {
+        let next = !isFullscreen && engine != nil && url == nil && !isLoading
+        if isBlankStartPage != next { isBlankStartPage = next }
+    }
+
+    private func updateChrome(_ transition: (inout CuriumChromeState) -> Void) {
+        update(\.chrome, transition)
+        let pinned = chrome.pinnedOpen
+        if isChromePinned != pinned { isChromePinned = pinned }
     }
 
     private static func isPureWhite(_ color: UIColor) -> Bool {
@@ -212,12 +243,12 @@ final class CuriumTabModel: Identifiable {
     /// Blink's compositor reports the shown fraction of the top controls; nil means the
     /// engine has none.
     func reportChromeCollapse(_ collapse: CGFloat?) {
-        update(\.chrome) { $0.engineReported(collapse: collapse) }
+        updateChrome { $0.engineReported(collapse: collapse) }
     }
 
-    func pinChromeOpen() { update(\.chrome) { $0.pin() } }
+    func pinChromeOpen() { updateChrome { $0.pin() } }
 
-    func unpinChrome(_ reason: CuriumChromeState.UnpinReason) { update(\.chrome) { $0.unpin(reason) } }
+    func unpinChrome(_ reason: CuriumChromeState.UnpinReason) { updateChrome { $0.unpin(reason) } }
 
     /// Writes a state value only when a transition changed it, so observers of an
     /// unchanged value are not woken on every engine update.
@@ -255,41 +286,96 @@ final class CuriumTabModel: Identifiable {
         snapshotRevision += 1
     }
 
-    /// Rasterizes the mounted page into a compact SDR thumbnail.
-    fileprivate func captureThumbnail() -> Bool {
-        guard let webView, url != nil, !isLoading, !isFullscreen, thumbnail == nil else { return false }
+    @MainActor
+    private final class SnapshotResumeGate {
+        var resumed = false
+    }
+
+    /// Captures a compact SDR thumbnail asynchronously via the engine's compositor snapshot
+    /// path, downscaling off the main thread so browsing never stalls.
+    fileprivate func captureSnapshotAsync() async -> Bool {
+        guard let engine, let webView, url != nil, !isLoading, !isFullscreen, thumbnail == nil else { return false }
         let bounds = webView.bounds
         guard webView.window != nil, bounds.width > 1, bounds.height > 1 else { return false }
+        guard UIApplication.shared.applicationState == .active else { return false }
 
-        let longest = max(bounds.width, bounds.height)
+        let revision = snapshotRevision
+        let gate = SnapshotResumeGate()
+        let rawImage: UIImage? = await withCheckedContinuation { continuation in
+            engine.takeSnapshot { image in
+                guard !gate.resumed else { return }
+                gate.resumed = true
+                continuation.resume(returning: image)
+            }
+        }
+
+        guard !Task.isCancelled,
+              revision == snapshotRevision,
+              self.engine === engine,
+              url != nil, !isLoading, !isFullscreen, thumbnail == nil else {
+            return false
+        }
+
+        if let rawImage {
+            let maxPixels = Self.maxSnapshotPixels
+            let scaled = await Task.detached(priority: .utility) {
+                Self.downscaleToSDRThumbnail(rawImage, maxPixels: maxPixels)
+            }.value
+            guard !Task.isCancelled,
+                  revision == snapshotRevision,
+                  self.engine === engine,
+                  thumbnail == nil else {
+                return false
+            }
+            thumbnail = scaled
+            return true
+        }
+
+        // Fallback only when the app is still foreground-active and the view is mounted.
+        guard UIApplication.shared.applicationState == .active,
+              let mountedView = self.webView,
+              mountedView.window != nil else {
+            return false
+        }
+        let fallbackBounds = mountedView.bounds
+        guard fallbackBounds.width > 1, fallbackBounds.height > 1 else { return false }
+        let longest = max(fallbackBounds.width, fallbackBounds.height)
         let scaleFactor = min(1.0, Self.maxSnapshotPixels / longest)
         let targetSize = CGSize(
-            width: max(1, (bounds.width * scaleFactor).rounded()),
-            height: max(1, (bounds.height * scaleFactor).rounded())
+            width: max(1, (fallbackBounds.width * scaleFactor).rounded()),
+            height: max(1, (fallbackBounds.height * scaleFactor).rounded())
         )
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = true
         format.preferredRange = .standard
 
-        let revision = snapshotRevision
-        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-        var complete = true
-        let image = renderer.image { context in
-            if hasPlayingVideo || isPictureInPictureActive {
-                // Video may be composited separately from the page's layer tree.
-                complete = webView.drawHierarchy(in: CGRect(origin: .zero, size: targetSize), afterScreenUpdates: false)
-            } else {
-                // Blink's page layers can render straight into the thumbnail bitmap.
-                let cg = context.cgContext
-                cg.scaleBy(x: targetSize.width / bounds.width, y: targetSize.height / bounds.height)
-                cg.translateBy(x: -bounds.minX, y: -bounds.minY)
-                webView.layer.render(in: cg)
-            }
+        var complete = false
+        let image = UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            complete = mountedView.drawHierarchy(in: CGRect(origin: .zero, size: targetSize), afterScreenUpdates: false)
         }
-        guard complete, revision == snapshotRevision else { return false }
+        guard complete, revision == snapshotRevision, self.engine === engine, thumbnail == nil else { return false }
         thumbnail = image
         return true
+    }
+
+    private nonisolated static func downscaleToSDRThumbnail(_ image: UIImage, maxPixels: CGFloat) -> UIImage {
+        let pixelWidth = image.size.width * image.scale
+        let pixelHeight = image.size.height * image.scale
+        guard pixelWidth > 1, pixelHeight > 1 else { return image }
+        let longest = max(pixelWidth, pixelHeight)
+        let scaleFactor = min(1.0, maxPixels / longest)
+        let targetSize = CGSize(
+            width: max(1, (pixelWidth * scaleFactor).rounded()),
+            height: max(1, (pixelHeight * scaleFactor).rounded())
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        format.preferredRange = .standard
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
     }
 
     private func updateStandbyHistory() {
@@ -301,6 +387,7 @@ final class CuriumTabModel: Identifiable {
         if canGoBack != newCanGoBack { canGoBack = newCanGoBack }
         let newCanGoForward = historyIndex < history.count - 1
         if canGoForward != newCanGoForward { canGoForward = newCanGoForward }
+        syncBlankStartPage()
     }
 }
 
@@ -311,6 +398,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private static let maxLiveTabs = 24
     private static let minTabAdmissionHeadroomBytes: UInt64 = 192 * 1024 * 1024
     private static let repeatVisitInterval: Duration = .seconds(2)
+    private static let idleSnapshotDelay: Duration = .milliseconds(1500)
 
     private struct ObservedVisit {
         let url: URL
@@ -344,7 +432,10 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var isUnderMemoryPressure = false
     @ObservationIgnored private var isSceneBackgrounded = false
     @ObservationIgnored private var isSheetPresented = false
-    @ObservationIgnored private var snapshotTask: Task<Void, Never>?
+    @ObservationIgnored private var isRecoveringEmptyTabs = false
+    @ObservationIgnored private var hasSyncedInitialViewportWidth = false
+    @ObservationIgnored private var idleSnapshotTask: Task<Void, Never>?
+    @ObservationIgnored private var onDemandSnapshotTask: Task<Void, Never>?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
     var isEngineReady: Bool { host != nil }
@@ -369,12 +460,11 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func updateViewportWidth(_ width: CGFloat) {
         guard width > 0 else { return }
-        if abs(viewportWidth - width) >= 0.5 {
-            viewportWidth = width
-            syncDefaultSiteModeForBlankTabs()
-        } else {
-            syncDefaultSiteModeForBlankTabs()
-        }
+        let changed = abs(viewportWidth - width) >= 0.5
+        guard changed || !hasSyncedInitialViewportWidth else { return }
+        viewportWidth = width
+        hasSyncedInitialViewportWidth = true
+        syncDefaultSiteModeForBlankTabs()
     }
 
     func syncDefaultSiteModeForBlankTabs() {
@@ -392,16 +482,20 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleMemoryWarning() {
         isUnderMemoryPressure = true
-        cancelSnapshotCapture()
+        cancelAllSnapshotCaptures()
         snapshotLRU.removeAll()
         for tab in tabs {
             tab.clearSnapshot()
         }
     }
 
+    func handleSceneWillDeactivate() {
+        cancelAllSnapshotCaptures()
+    }
+
     func handleSceneDidEnterBackground() {
         isSceneBackgrounded = true
-        cancelSnapshotCapture()
+        cancelAllSnapshotCaptures()
         backgroundEpoch += 1
         // Retain at most the active tab's thumbnail in background to minimize idle footprint.
         let keepID = activeTab?.id
@@ -420,51 +514,84 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     func setSheetPresented(_ presented: Bool) {
         isSheetPresented = presented
         if presented {
-            cancelSnapshotCapture()
+            cancelIdleSnapshotCapture()
         } else if let activeTab {
             scheduleSnapshot(for: activeTab)
         }
     }
 
+    /// Captures the active tab's thumbnail on demand right as the Tabs sheet opens.
+    func prepareSnapshotsForTabsSheet() {
+        guard let tab = activeTab else { return }
+        captureSnapshotOnDemand(for: tab)
+    }
+
+    /// Schedules a single calm idle snapshot after navigation settles. Does not poll while
+    /// scrolling; tab switches and opening the Tabs sheet trigger on-demand captures instead.
     func scheduleSnapshot(for tab: CuriumTabModel) {
         guard activeTab === tab else { return }
-        cancelSnapshotCapture()
+        cancelIdleSnapshotCapture()
         guard !isUnderMemoryPressure, !isSceneBackgrounded, !isSheetPresented,
-              tab.webView != nil, tab.url != nil,
+              UIApplication.shared.applicationState == .active,
+              tab.engine != nil, tab.webView != nil, tab.url != nil,
               !tab.isLoading, !tab.isFullscreen, tab.thumbnail == nil else { return }
         let targetID = tab.id
         let revision = tab.snapshotRevision
         let initialOffset = tab.scrollView?.contentOffset
-        snapshotTask = Task(priority: .utility) { @MainActor [weak self] in
-            var lastOffset = initialOffset
-            // Blink can move the offset even when UIKit isn't tracking a gesture.
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
-                guard !Task.isCancelled, let self, let current = self.activeTab,
-                      current.id == targetID, current.snapshotRevision == revision else { return }
-                let scroll = current.scrollView
-                let offset = scroll?.contentOffset
-                if offset != lastOffset || scroll?.isTracking == true || scroll?.isDecelerating == true {
-                    lastOffset = offset
-                    continue
-                }
-                self.snapshotTask = nil
-                if current.captureThumbnail() {
-                    self.recordSnapshot(for: targetID)
-                }
+        idleSnapshotTask = Task(priority: .utility) { @MainActor [weak self] in
+            do { try await Task.sleep(for: Self.idleSnapshotDelay) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.idleSnapshotTask = nil
+            guard !self.isUnderMemoryPressure, !self.isSceneBackgrounded, !self.isSheetPresented,
+                  UIApplication.shared.applicationState == .active,
+                  let current = self.activeTab,
+                  current.id == targetID, current.snapshotRevision == revision else { return }
+            let scroll = current.scrollView
+            if scroll?.isTracking == true || scroll?.isDecelerating == true || scroll?.contentOffset != initialOffset {
                 return
+            }
+            if await current.captureSnapshotAsync() {
+                self.recordSnapshot(for: targetID)
             }
         }
     }
 
-    private func cancelSnapshotCapture() {
-        snapshotTask?.cancel()
-        snapshotTask = nil
+    private func captureSnapshotOnDemand(for tab: CuriumTabModel) {
+        guard !isUnderMemoryPressure, !isSceneBackgrounded,
+              UIApplication.shared.applicationState == .active,
+              tab.engine != nil, tab.webView?.window != nil, tab.url != nil,
+              !tab.isLoading, !tab.isFullscreen, tab.thumbnail == nil else { return }
+        let targetID = tab.id
+        let revision = tab.snapshotRevision
+        onDemandSnapshotTask?.cancel()
+        onDemandSnapshotTask = Task(priority: .utility) { @MainActor [weak self] in
+            guard !Task.isCancelled, let self else { return }
+            guard !self.isUnderMemoryPressure, !self.isSceneBackgrounded,
+                  UIApplication.shared.applicationState == .active,
+                  tab.snapshotRevision == revision else { return }
+            if await tab.captureSnapshotAsync() {
+                self.recordSnapshot(for: targetID)
+            }
+            if !Task.isCancelled {
+                self.onDemandSnapshotTask = nil
+            }
+        }
+    }
+
+    private func cancelIdleSnapshotCapture() {
+        idleSnapshotTask?.cancel()
+        idleSnapshotTask = nil
+    }
+
+    private func cancelAllSnapshotCaptures() {
+        cancelIdleSnapshotCapture()
+        onDemandSnapshotTask?.cancel()
+        onDemandSnapshotTask = nil
     }
 
     private func setActiveTab(_ tab: CuriumTabModel?) {
         guard activeTab !== tab else { return }
-        cancelSnapshotCapture()
+        cancelIdleSnapshotCapture()
         activeTab = tab
     }
 
@@ -516,6 +643,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         if !tabs.isEmpty && !canAdmitNewTab() {
             return false
         }
+        if let outgoing = activeTab {
+            captureSnapshotOnDemand(for: outgoing)
+        }
         let preferDesktop = prefersDesktopByDefault()
         if let host {
             // Create the tab without immediately loading a mobile-UA URL so Desktop Site
@@ -547,9 +677,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func select(_ tab: CuriumTabModel) {
         guard activeTab?.id != tab.id else { return }
+        if let outgoing = activeTab {
+            captureSnapshotOnDemand(for: outgoing)
+        }
         if let host {
             guard host.activateTab(withID: tab.id) else { return }
-            updateTabs(from: host)
+            if activeTab?.id != tab.id { updateTabs(from: host) }
         } else {
             setActiveTab(tab)
         }
@@ -557,11 +690,11 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func close(_ tab: CuriumTabModel) {
         if let host {
-            // A coalesced update may still be queued when the shell closes the tab.
-            if let engine = tab.engine { refresh(tab, from: engine) }
-            if host.closeTab(withID: tab.id) { updateTabs(from: host) }
+            _ = host.closeTab(withID: tab.id)
+            if tabsByID[tab.id] != nil { updateTabs(from: host) }
         } else if let index = tabs.firstIndex(where: { $0.id == tab.id }) {
-            tabs.remove(at: index)
+            let removed = tabs.remove(at: index)
+            removed.invalidate()
             tabsByID.removeValue(forKey: tab.id)
             snapshotLRU.removeAll { $0 == tab.id }
             if activeTab?.id == tab.id { setActiveTab(tabs.isEmpty ? nil : tabs[min(index, tabs.count - 1)]) }
@@ -689,6 +822,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     private func recordSnapshot(for tabID: String) {
+        guard tabsByID[tabID] != nil else { return }
         snapshotLRU.removeAll { $0 == tabID }
         snapshotLRU.append(tabID)
         while snapshotLRU.count > Self.maxRetainedSnapshots {
@@ -710,7 +844,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             && zip(hostTabs, tabs).allSatisfy { $1.matchesViewport(of: $0) }
         let activeViewportMatches = activeEngine.map { activeTab?.matchesViewport(of: $0) == true } ?? true
 
-        if viewportsMatch && activeMatches && activeViewportMatches {
+        if viewportsMatch && activeMatches && activeViewportMatches && !hostTabs.isEmpty {
             updateExtensionContext(force: false)
             return
         }
@@ -744,14 +878,28 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             }
         }
 
+        var evictedAny = false
+        for (evictedID, evictedTab) in tabsByID where nextIndex[evictedID] == nil {
+            evictedAny = true
+            evictedTab.invalidate()
+            historyByTabID.removeValue(forKey: evictedID)
+            committedHistoryByTabID.removeValue(forKey: evictedID)
+        }
+
         if !orderMatches { tabs = nextTabs }
         tabsByID = nextIndex
-        historyByTabID = historyByTabID.filter { nextIndex[$0.key] != nil }
-        committedHistoryByTabID = committedHistoryByTabID.filter { nextIndex[$0.key] != nil }
-        snapshotLRU.removeAll { nextIndex[$0] == nil }
+        if evictedAny {
+            snapshotLRU.removeAll { nextIndex[$0] == nil }
+        }
 
         setActiveTab(activeID.flatMap { nextIndex[$0] })
         updateExtensionContext(force: !activeMatches || !activeViewportMatches)
+
+        if hostTabs.isEmpty && !isRecoveringEmptyTabs {
+            isRecoveringEmptyTabs = true
+            defer { isRecoveringEmptyTabs = false }
+            newTab()
+        }
     }
 
     private func updateExtensionContext(force: Bool) {

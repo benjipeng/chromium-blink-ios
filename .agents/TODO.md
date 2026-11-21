@@ -9,8 +9,8 @@ the pinned engine first, translate to `patches/` once proven.
 
 - **Engine:** build 35, `Kernel.lock` → `3b973e0` (Chromium 160.0.8171.0), patches
   through 0097. Patch 0095 (page scrolls under the floating top chrome) is live.
-- **On `ac_duo`:** 0.1.9 (10) Release, `Curium-0.1.9-engine35-20261120.ipa`,
-  also in LiveContainer `Documents/`. Packaged and released via Pipeline 2
+- **On `ac_duo`:** 0.1.10-b11 Release (`Curium-0.1.10-b11-arm64.ipa`),
+  also archived in LiveContainer `Documents/` and published via Pipeline 2
   (`.github/workflows/build-curium.yml` + `scripts/build_curium_ipa.sh`).
 
 ## App (on the pinned engine)
@@ -84,12 +84,31 @@ the pinned engine first, translate to `patches/` once proven.
   shows no bar. Shipped to `ac_duo` in 0.1.8 (9).
 - [ ] **Floating PiP button over the playing video.** Requested. Open question:
   placement over the in-page video or in the top chrome.
-- [ ] **Readable guest logs on `ac_duo`.** Under LiveContainer, `log collect` shows
-  every Curium `os_log` line as `<compose failure>`, so device occlusion margins are
-  still unknown. Route diagnostics through a path the archive can decode.
-- [ ] **Address bar buttons are unreachable to accessibility.** The address field's
-  element covers the leading Picture in Picture and trailing Reload buttons: AXe
-  refuses both with `targetCovered`, so VoiceOver likely cannot reach them either.
+- [x] **Readable guest logs on `ac_duo`.** Under LiveContainer, `log collect` showed
+  every Curium `os_log` line as `<compose failure>`. Added `CuriumDiagnostics.swift`
+  (lock-guarded 200-line ring buffer + async `.utility` rolling file writer to
+  `<CuriumLibraryLocation>/curium-diagnostics.log`, 128 KB rotation, zero main-thread
+  I/O) reporting startup metadata, `CuriumRuntimeHookStatuses()` (`8/8 active`),
+  `os_proc_available_memory()`, memory warnings, and deduplicated occlusion regions,
+  with an in-app viewer + Copy/ShareLink in Settings. Verified on Simulator.
+- [x] **Address bar buttons are unreachable to accessibility.** Separated leading
+  PiP and trailing Clear/Reload controls into non-overlapping `.overlay` layers
+  above `.glassEffect` in `CuriumBrowserView.swift`. Verified on Simulator via
+  `axe tap --agent` on `Reload` (`enqueuedAndDrained`, zero `targetCovered`).
+- [x] **Swift/Obj-C shell stability, 120 Hz scroll smoothness & idle-efficiency sweep.**
+  Fixed uninitialized `ScopedProcessMap` stack reads, extension popup `window.close()`
+  synchronous UAF, `RenderWidgetUIView` detached-view touch desync (`removeView`),
+  `CuriumBlinkViewportHost` dangling KVO + `MainActor.assumeIsolated` traps,
+  `NSProcessInfo.arguments` `dispatch_once` deadlock hazard, `CuriumExpectMethod`
+  superclass matching, `permissions.request` alert dismissal retain cycle, LiveContainer
+  SQLite WAL `0xdead10cc` (`willDeactivate` + `beginBackgroundTask` + xattr) & legacy
+  adoption fail-closed, LiveContainer durable download path (`Documents/Curium/Downloads`),
+  synchronous `@MainActor` `layer.render` snapshot freezes (switched to async
+  `takeSnapshot` + off-main downscale), `CuriumReadingEdge` masked blur mount hitch,
+  120 Hz `CuriumAddressBar` layout/TextField/KVO churn, extension badge rebuild storms,
+  and all 10 `idle-auditor` wasted-work findings. Added standalone `CuriumTests` target
+  (9/9 passing). Verified on Simulator (`sdk 27.2`, `8/8` hooks active, `2.0% CPU` /
+  `221M` idle).
 - [x] **Top chrome follows reserved regions exactly.** The bar meets the occlusion
   frame with no extra gap, and the collapsed pill stays in the status row unless a
   region crosses the center (`CuriumBrowserView.swift`, `CuriumOcclusionReader.swift`).

@@ -43,9 +43,18 @@ struct CuriumHistoryEntry: Identifiable, Hashable, Sendable {
     let title: String
     let lastVisit: Date
     let visitsThatDay: Int
+    let host: String
+
+    init(siteID: Int64, url: URL, title: String, lastVisit: Date, visitsThatDay: Int) {
+        self.siteID = siteID
+        self.url = url
+        self.title = title
+        self.lastVisit = lastVisit
+        self.visitsThatDay = visitsThatDay
+        self.host = url.host() ?? url.absoluteString
+    }
 
     var id: String { "\(siteID)@\(Int(lastVisit.timeIntervalSince1970))" }
-    var host: String { url.host() ?? url.absoluteString }
 }
 
 struct CuriumHistoryDay: Identifiable, Sendable {
@@ -127,6 +136,7 @@ final class CuriumLibrary {
         private static let searchEngineKey = "curium.searchEngine"
         let database = CuriumDatabase.shared
         @ObservationIgnored var pendingMutation: Task<Bool, Never>?
+        @ObservationIgnored var hasLoadedBookmarks = false
 
         init() {
             let raw = UserDefaults.standard.string(forKey: Self.searchEngineKey)
@@ -140,6 +150,7 @@ final class CuriumLibrary {
         guard Self.state.pendingMutation == nil else { return }
         enqueue { library in
             library.bookmarks = try await library.database.bookmarkTree()
+            library.hasLoadedBookmarks = true
         }
     }
 
@@ -278,6 +289,7 @@ final class CuriumLibrary {
     ) -> Task<Bool, Never> {
         enqueue { library in
             library.bookmarks = try await operation(library.database)
+            library.hasLoadedBookmarks = true
         }
     }
 
@@ -286,6 +298,31 @@ final class CuriumLibrary {
 
     /// Bookmarks first, then history ranked by frequency and recency. No network suggestions.
     func addressMatches(for text: String, limit: Int = 6) async -> [CuriumAddressMatch] {
+        guard limit > 0, !Task.isCancelled else { return [] }
+        let needle = Self.normalizedNeedle(for: text)
+        guard !needle.isEmpty else { return [] }
+
+        if Self.state.hasLoadedBookmarks {
+            let bookmarkMatches = Self.matchingBookmarks(in: Self.state.bookmarks, needle: needle, limit: limit)
+            if bookmarkMatches.count >= limit { return bookmarkMatches }
+            let excluded = Set(bookmarkMatches.map { $0.url.absoluteString })
+            do {
+                // WAL allows concurrent reads without stalling behind queued write/checkpoint chains.
+                let history = try await Self.state.database.historyAddressMatches(
+                    for: text,
+                    excludingURLs: excluded,
+                    limit: limit - bookmarkMatches.count,
+                    now: .now
+                )
+                return bookmarkMatches + history
+            } catch is CancellationError {
+                return []
+            } catch {
+                Self.record(error)
+                return bookmarkMatches
+            }
+        }
+
         _ = await Self.state.pendingMutation?.value
         guard !Task.isCancelled else { return [] }
         do {
@@ -298,10 +335,76 @@ final class CuriumLibrary {
         }
     }
 
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+
+    private static func normalizedNeedle(for input: String) -> String {
+        var needle = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let scheme = needle.range(of: "://"),
+           !needle[..<scheme.lowerBound].contains(where: \.isWhitespace) {
+            needle = String(needle[scheme.upperBound...])
+        }
+        if needle.prefix(4).lowercased() == "www." { needle.removeFirst(4) }
+        return needle.folding(options: .caseInsensitive, locale: Self.posixLocale)
+    }
+
+    private static func normalizedAddress(_ urlString: String) -> String {
+        var address = urlString
+        if let scheme = address.range(of: "://") {
+            address = String(address[scheme.upperBound...])
+        }
+        if address.prefix(4).lowercased() == "www." { address.removeFirst(4) }
+        return address.folding(options: .caseInsensitive, locale: Self.posixLocale)
+    }
+
+    private static func matchingBookmarks(
+        in tree: CuriumBookmarkTree, needle: String, limit: Int
+    ) -> [CuriumAddressMatch] {
+        var matches: [CuriumAddressMatch] = []
+        matches.reserveCapacity(min(limit, 8))
+
+        func consider(_ bookmark: CuriumBookmark) -> Bool {
+            let address = normalizedAddress(bookmark.url.absoluteString)
+            let title = bookmark.title.folding(options: .caseInsensitive, locale: Self.posixLocale)
+            if address.contains(needle) || title.contains(needle) {
+                matches.append(CuriumAddressMatch(kind: .bookmark, url: bookmark.url, title: bookmark.title))
+                return matches.count < limit
+            }
+            return true
+        }
+
+        for favorite in tree.favorites {
+            if !consider(favorite) { return matches }
+        }
+
+        var visitedFolders: Set<Int64> = [CuriumBookmarkFolder.favoritesID]
+        func visit(_ folderID: Int64?) -> Bool {
+            for item in tree.items(in: folderID) {
+                switch item {
+                case .bookmark(let bookmark):
+                    if bookmark.parentID != CuriumBookmarkFolder.favoritesID, !consider(bookmark) {
+                        return false
+                    }
+                case .folder(let folder):
+                    if visitedFolders.insert(folder.id).inserted, !visit(folder.id) {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+        _ = visit(nil)
+        return matches
+    }
+
     // MARK: Lifecycle
 
     /// Flushes the write-ahead log; call when the scene leaves the foreground.
     func checkpoint() {
         enqueue { library in try await library.database.checkpoint() }
+    }
+
+    /// Flushes the write-ahead log and awaits completion for background-task handoffs.
+    func checkpointAsync() async {
+        _ = await enqueue { library in try await library.database.checkpoint() }.value
     }
 }

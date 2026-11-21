@@ -8,6 +8,7 @@
 /* Begin PBXFileReference section */
 		C09600010000000000000001 /* Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Version.xcconfig; sourceTree = "<group>"; };
 		C09600010000000000000002 /* Curium.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Curium.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C09600020000000000000002 /* CuriumTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CuriumTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -16,30 +17,50 @@
 			membershipExceptions = (App/Curium-Engine-Info.plist, Engine/embed-frameworks.sh, README.md);
 			target = C09600010000000000000009 /* Curium */;
 		};
+		C09600020000000000000003 /* CuriumTests membership exceptions */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				App/Curium-Engine-Info.plist,
+				App/CuriumApp.swift,
+				App/CuriumScene.storyboard,
+				AppIcon.icon,
+				Assets.xcassets,
+				Engine/embed-frameworks.sh,
+				README.md,
+			);
+			target = C09600020000000000000009 /* CuriumTests */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		C09600010000000000000004 /* Curium */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (C09600010000000000000003);
+			exceptions = (C09600010000000000000003, C09600020000000000000003);
 			path = Curium;
+			sourceTree = "<group>";
+		};
+		C09600020000000000000004 /* CuriumTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = ();
+			path = CuriumTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		C09600010000000000000005 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		C09600020000000000000005 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		C09600010000000000000006 = {
 			isa = PBXGroup;
-			children = (C09600010000000000000001, C09600010000000000000017, C09600010000000000000004, C09600010000000000000007);
+			children = (C09600010000000000000001, C09600010000000000000017, C09600010000000000000004, C09600020000000000000004, C09600010000000000000007);
 			sourceTree = "<group>";
 		};
 		C09600010000000000000007 /* Products */ = {
 			isa = PBXGroup;
-			children = (C09600010000000000000002);
+			children = (C09600010000000000000002, C09600020000000000000002);
 			name = Products;
 			sourceTree = "<group>";
 		};
@@ -47,6 +68,7 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		C09600010000000000000008 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		C09600020000000000000008 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXNativeTarget section */
@@ -62,6 +84,18 @@
 			productReference = C09600010000000000000002;
 			productType = "com.apple.product-type.application";
 		};
+		C09600020000000000000009 /* CuriumTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C0960002000000000000000E;
+			buildPhases = (C09600020000000000000008, C09600020000000000000005);
+			buildRules = ();
+			dependencies = ();
+			fileSystemSynchronizedGroups = (C09600010000000000000004, C09600020000000000000004);
+			name = CuriumTests;
+			productName = CuriumTests;
+			productReference = C09600020000000000000002;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXResourcesBuildPhase section */
@@ -71,7 +105,13 @@
 /* Begin PBXProject section */
 		C0960001000000000000000B /* Project object */ = {
 			isa = PBXProject;
-			attributes = { LastUpgradeCheck = 2720; TargetAttributes = { C09600010000000000000009 = { CreatedOnToolsVersion = 27.2; }; }; };
+			attributes = {
+				LastUpgradeCheck = 2720;
+				TargetAttributes = {
+					C09600010000000000000009 = { CreatedOnToolsVersion = 27.2; };
+					C09600020000000000000009 = { CreatedOnToolsVersion = 27.2; };
+				};
+			};
 			buildConfigurationList = C0960001000000000000000F;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -81,7 +121,7 @@
 			productRefGroup = C09600010000000000000007;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (C09600010000000000000009);
+			targets = (C09600010000000000000009, C09600020000000000000009);
 		};
 /* End PBXProject section */
 
@@ -126,6 +166,56 @@
 			buildSettings = {};
 			name = Release;
 		};
+		C09600020000000000000011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURIUM_USE_ENGINE_XCFRAMEWORK = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(inherited) \"$(SRCROOT)/EngineContract\"";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appautomaton.curium.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_INCLUDE_PATHS = "$(inherited) \"$(SRCROOT)/EngineContract\"";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Curium/Engine/CuriumRuntime.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C09600020000000000000012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURIUM_USE_ENGINE_XCFRAMEWORK = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(inherited) \"$(SRCROOT)/EngineContract\"";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.appautomaton.curium.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_INCLUDE_PATHS = "$(inherited) \"$(SRCROOT)/EngineContract\"";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Curium/Engine/CuriumRuntime.h";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -138,6 +228,12 @@
 		C0960001000000000000000F = {
 			isa = XCConfigurationList;
 			buildConfigurations = (C0960001000000000000000C, C0960001000000000000000D);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C0960002000000000000000E = {
+			isa = XCConfigurationList;
+			buildConfigurations = (C09600020000000000000011, C09600020000000000000012);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};

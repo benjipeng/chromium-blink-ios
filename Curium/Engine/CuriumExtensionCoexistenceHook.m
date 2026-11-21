@@ -1,9 +1,11 @@
 #import "CuriumExtensionCoexistenceHook.h"
+#import "CuriumHookSupport.h"
 
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
+#import <objc/runtime.h>
 #import <os/log.h>
 #import <stdbool.h>
 #import <stddef.h>
@@ -544,12 +546,18 @@ typedef struct {
     CrProcessMapEntry stack_entries[16];
 } ScopedProcessMap;
 
+static inline void ScopeInit(ScopedProcessMap *s) {
+    s->process_map = NULL;
+    s->kind = kScopeNone;
+}
+
 static void ScopeBeginAllowExtension(ScopedProcessMap *s,
                                      void *browser_context,
                                      int32_t child_id,
                                      const char ext_id[33]) {
-    memset(s, 0, sizeof(*s));
-    if (!browser_context || child_id < 0 || !CrIsValidExtensionIDBytes(ext_id, 32)) {
+    ScopeInit(s);
+    if (![NSThread isMainThread] || !browser_context || child_id < 0 ||
+        !CrIsValidExtensionIDBytes(ext_id, 32)) {
         return;
     }
     void *pm = gFnProcessMapGet(browser_context);
@@ -570,6 +578,11 @@ static void ScopeBeginAllowExtension(ScopedProcessMap *s,
     }
     for (uint64_t i = 0; i < count; i++) {
         if (entries[i].child_id == child_id) {
+            // Already scoped to this exact extension ID: skip mutating ProcessMap.
+            CrStrView cur = CrStringView(&entries[i].extension_id);
+            if (cur.data && cur.len == 32 && memcmp(cur.data, ext_id, 32) == 0) {
+                return;
+            }
             s->kind = kScopeSwapStringInPlace;
             s->entry_index = (size_t)i;
             s->saved_str = entries[i].extension_id;
@@ -609,8 +622,8 @@ static void ScopeBeginAllowExtension(ScopedProcessMap *s,
 static void ScopeBeginDenyProcess(ScopedProcessMap *s,
                                   void *browser_context,
                                   int32_t child_id) {
-    memset(s, 0, sizeof(*s));
-    if (!browser_context || child_id < 0) {
+    ScopeInit(s);
+    if (![NSThread isMainThread] || !browser_context || child_id < 0) {
         return;
     }
     void *pm = gFnProcessMapGet(browser_context);
@@ -663,11 +676,18 @@ static void ScopeEnd(ScopedProcessMap *s) {
         case kScopeSwapStringInPlace: {
             CrProcessMapEntry *entries = *entries_slot;
             uint64_t count = *count_slot;
-            if (s->entry_index < count && entries[s->entry_index].child_id == s->child_id) {
+            // Only restore the slot that still holds our exact stack-backed view, so a
+            // concurrent ProcessMap::Insert/Remove during the call is never clobbered.
+            if (entries && s->entry_index < count &&
+                entries[s->entry_index].child_id == s->child_id &&
+                (entries[s->entry_index].extension_id.s.size & 0x80u) != 0 &&
+                entries[s->entry_index].extension_id.l.data == s->ext_buf) {
                 entries[s->entry_index].extension_id = s->saved_str;
-            } else {
+            } else if (entries && count <= 64) {
                 for (uint64_t i = 0; i < count; i++) {
-                    if (entries[i].child_id == s->child_id) {
+                    if (entries[i].child_id == s->child_id &&
+                        (entries[i].extension_id.s.size & 0x80u) != 0 &&
+                        entries[i].extension_id.l.data == s->ext_buf) {
                         entries[i].extension_id = s->saved_str;
                         break;
                     }
@@ -678,14 +698,32 @@ static void ScopeEnd(ScopedProcessMap *s) {
         case kScopeSwapPidInPlace: {
             CrProcessMapEntry *entries = *entries_slot;
             uint64_t count = *count_slot;
-            if (s->entry_index < count && entries[s->entry_index].child_id == -999999) {
-                entries[s->entry_index].child_id = s->saved_pid;
+            if (!entries || count == 0 || count > 64) {
+                break;
+            }
+            // If Chromium inserted a fresh entry for saved_pid while our sentinel was
+            // hiding it, do not restore saved_pid (that would create duplicate keys and
+            // break base::flat_map's sorted-unique invariant).
+            bool duplicate_exists = false;
+            size_t sentinel_index = SIZE_MAX;
+            for (uint64_t i = 0; i < count; i++) {
+                if (entries[i].child_id == s->saved_pid) {
+                    duplicate_exists = true;
+                } else if (entries[i].child_id == -999999 && sentinel_index == SIZE_MAX) {
+                    sentinel_index = (size_t)i;
+                }
+            }
+            if (!duplicate_exists && sentinel_index != SIZE_MAX) {
+                entries[sentinel_index].child_id = s->saved_pid;
             }
             break;
         }
         case kScopeSwapVector:
-            *entries_slot = s->saved_entries;
-            *count_slot = s->saved_count;
+            // Only restore if ProcessMap still points at our stack buffer (not reallocated).
+            if (*entries_slot == s->stack_entries) {
+                *entries_slot = s->saved_entries;
+                *count_slot = s->saved_count;
+            }
             break;
         case kScopeNone:
             break;
@@ -694,6 +732,14 @@ static void ScopeEnd(ScopedProcessMap *s) {
 }
 
 #pragma mark - 1. Subresource & worker resource loading hooks
+
+typedef struct {
+    void *factory;
+    uint8_t saved_has_value;
+} ActiveLoaderFrame;
+
+static ActiveLoaderFrame gActiveLoaderFrames[8];
+static size_t gActiveLoaderDepth = 0;
 
 static void HookRegisterSubresourceFactories(void *self,
                                              int32_t render_process_id,
@@ -746,9 +792,23 @@ static void HookCreateLoaderAndStart(void *self,
     }
 
     // Read the browser-verified initiator_origin_ stored at +0x68 (has_value at +0xb8).
+    // If re-entering on the same factory whose has_value was temporarily zeroed by an
+    // outer frame, recover the true saved_has_value instead of denying a valid extension.
     uint8_t *opt_origin = factory + 0x68;
     uint8_t saved_has_value = opt_origin[0x50];
+    bool is_reentrant = false;
+    if ([NSThread isMainThread]) {
+        for (size_t i = gActiveLoaderDepth; i > 0; i--) {
+            if (gActiveLoaderFrames[i - 1].factory == self) {
+                saved_has_value = gActiveLoaderFrames[i - 1].saved_has_value;
+                is_reentrant = true;
+                break;
+            }
+        }
+    }
+
     ScopedProcessMap scope;
+    ScopeInit(&scope);
     char origin_ext_id[33];
     if (saved_has_value == 1 &&
         CrOriginExtractExtensionID(opt_origin, origin_ext_id) &&
@@ -761,12 +821,28 @@ static void HookCreateLoaderAndStart(void *self,
         ScopeBeginDenyProcess(&scope, browser_context, render_process_id);
     }
 
-    // Temporarily hide initiator_origin_ from ExtensionURLLoader so upstream_url_
-    // matches unhooked Build 35 semantics for subresource loads.
-    opt_origin[0x50] = 0;
+    bool pushed_frame = false;
+    bool hid_origin = false;
+    if (!is_reentrant && saved_has_value != 0) {
+        if ([NSThread isMainThread] && gActiveLoaderDepth < 8) {
+            gActiveLoaderFrames[gActiveLoaderDepth++] = (ActiveLoaderFrame){self, saved_has_value};
+            pushed_frame = true;
+        }
+        // Temporarily hide initiator_origin_ from ExtensionURLLoader so upstream_url_
+        // matches unhooked Build 35 semantics for subresource loads.
+        opt_origin[0x50] = 0;
+        hid_origin = true;
+    }
+
     gOrigCreateLoaderAndStart(self, loader, request_id, options, request,
                               client, traffic_annotation);
-    opt_origin[0x50] = saved_has_value;
+
+    if (hid_origin) {
+        opt_origin[0x50] = saved_has_value;
+    }
+    if (pushed_frame && gActiveLoaderDepth > 0) {
+        gActiveLoaderDepth--;
+    }
     ScopeEnd(&scope);
 }
 
@@ -782,7 +858,7 @@ static void *FrameHostCurrentFrame(void *frame_host) {
 }
 
 static void ScopeForFrameHost(ScopedProcessMap *scope, void *frame_host) {
-    memset(scope, 0, sizeof(*scope));
+    ScopeInit(scope);
     void *rfh = FrameHostCurrentFrame(frame_host);
     void *browser_context = NULL;
     int32_t child_id = -1;
@@ -832,7 +908,7 @@ static void HookFrameOpenChannelToTab(void *self, int32_t tab_id, int32_t frame_
 #pragma mark - 3. ServiceWorkerHost hooks (worker lifecycle, API dispatch & messaging)
 
 static void ScopeForVerifiedServiceWorkerHost(ScopedProcessMap *scope, void *sw_host) {
-    memset(scope, 0, sizeof(*scope));
+    ScopeInit(scope);
     void *rph = *(void *const *)((const uint8_t *)sw_host + 0x20);
     if (!rph) {
         return;
@@ -906,6 +982,7 @@ static void HookSWDidInitialize(void *self,
                                 const void *sw_token,
                                 void *event_dispatcher) {
     ScopedProcessMap scope;
+    ScopeInit(&scope);
     void *ctx = NULL;
     int32_t child_id = -1;
     char verified_ext[33];
@@ -927,6 +1004,7 @@ static void HookSWDidStart(void *self,
                            int32_t worker_thread_id,
                            const void *sw_token) {
     ScopedProcessMap scope;
+    ScopeInit(&scope);
     void *ctx = NULL;
     int32_t child_id = -1;
     char verified_ext[33];
@@ -948,6 +1026,7 @@ static void HookSWDidStop(void *self,
                           int32_t worker_thread_id,
                           const void *sw_token) {
     ScopedProcessMap scope;
+    ScopeInit(&scope);
     void *ctx = NULL;
     int32_t child_id = -1;
     char verified_ext[33];
@@ -1026,7 +1105,7 @@ static void ScopeForEventRouter(ScopedProcessMap *scope,
                                 void *er_subobject,
                                 const CrString *ext_id_str,
                                 bool is_service_worker) {
-    memset(scope, 0, sizeof(*scope));
+    ScopeInit(scope);
     if (!er_subobject || !ext_id_str) {
         return;
     }
@@ -1228,6 +1307,33 @@ typedef struct CuriumInstallPrompt CuriumInstallPrompt;
 @implementation CuriumPromptGate
 @end
 
+static char kCuriumPromptAlertSentinelKey;
+static void CuriumCompleteInstallPrompt(CuriumInstallPrompt *prompt, uint32_t result);
+
+// Guarantees pending_bind_state settles with USER_CANCELED if the alert fails to
+// present or is dismissed externally (e.g. its parent popup sheet dismisses on
+// backgrounding) without an action button firing.
+@interface CuriumPromptAlertSentinel : NSObject
+@property(nonatomic, strong) CuriumPromptGate *gate;
+@end
+
+@implementation CuriumPromptAlertSentinel
+- (void)dealloc {
+    CuriumPromptGate *gate = _gate;
+    if (!gate) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CuriumInstallPrompt *p = gate->prompt;
+        if (!p) {
+            return;
+        }
+        gate->prompt = NULL;
+        CuriumCompleteInstallPrompt(p, 2 /* USER_CANCELED */);
+    });
+}
+@end
+
 struct CuriumInstallPrompt {
     const void *const *vtable;
     void *pending_bind_state;
@@ -1341,6 +1447,56 @@ static NSString *CuriumExtensionDisplayName(const void *extension) {
     return @"This extension";
 }
 
+static void CuriumCancelGateAsync(CuriumPromptGate *gate) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CuriumInstallPrompt *p = gate->prompt;
+        if (!p) {
+            return;
+        }
+        gate->prompt = NULL;
+        CuriumCompleteInstallPrompt(p, 2 /* USER_CANCELED */);
+    });
+}
+
+static void CuriumPresentInstallPromptAlert(UIAlertController *alert,
+                                            CuriumPromptGate *gate,
+                                            int remainingAttempts) {
+    if (!gate->prompt) {
+        return;
+    }
+    UIViewController *presenter = CuriumTopmostViewController(CuriumActiveKeyWindow());
+    if (!presenter) {
+        CuriumCancelGateAsync(gate);
+        return;
+    }
+    // Wait out an active dismissal (e.g. closing sheet/popup) so UIKit does not
+    // silently drop presentViewController: and hang chrome.permissions.request().
+    UIViewController *dismissingChild = presenter.presentedViewController;
+    if (dismissingChild || presenter.isBeingDismissed) {
+        if (remainingAttempts <= 0) {
+            CuriumCancelGateAsync(gate);
+            return;
+        }
+        id<UIViewControllerTransitionCoordinator> coordinator =
+            dismissingChild.transitionCoordinator ?: presenter.transitionCoordinator;
+        if (coordinator) {
+            [coordinator animateAlongsideTransition:nil
+                                         completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> ctx) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    CuriumPresentInstallPromptAlert(alert, gate, remainingAttempts - 1);
+                });
+            }];
+        } else {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                CuriumPresentInstallPromptAlert(alert, gate, remainingAttempts - 1);
+            });
+        }
+        return;
+    }
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
 static void CuriumInstallPromptShowDialog(CuriumInstallPrompt *self,
                                           void *bind_state,
                                           const void *extension,
@@ -1359,14 +1515,7 @@ static void CuriumInstallPromptShowDialog(CuriumInstallPrompt *self,
 
     UIViewController *presenter = CuriumTopmostViewController(CuriumActiveKeyWindow());
     if (!presenter) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CuriumInstallPrompt *p = gate->prompt;
-            if (!p) {
-                return;
-            }
-            gate->prompt = NULL;
-            CuriumCompleteInstallPrompt(p, 2 /* USER_CANCELED */);
-        });
+        CuriumCancelGateAsync(gate);
         return;
     }
 
@@ -1377,6 +1526,11 @@ static void CuriumInstallPromptShowDialog(CuriumInstallPrompt *self,
         [UIAlertController alertControllerWithTitle:title
                                             message:message
                                      preferredStyle:UIAlertControllerStyleAlert];
+
+    CuriumPromptAlertSentinel *sentinel = [[CuriumPromptAlertSentinel alloc] init];
+    sentinel.gate = gate;
+    objc_setAssociatedObject(alert, &kCuriumPromptAlertSentinelKey, sentinel,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     [alert addAction:[UIAlertAction actionWithTitle:@"Deny"
                                               style:UIAlertActionStyleCancel
@@ -1400,7 +1554,7 @@ static void CuriumInstallPromptShowDialog(CuriumInstallPrompt *self,
         CuriumCompleteInstallPrompt(p, 0 /* ACCEPTED */);
     }]];
 
-    [presenter presentViewController:alert animated:YES completion:nil];
+    CuriumPresentInstallPromptAlert(alert, gate, 3);
 }
 
 static const void *const kCuriumInstallPromptVtable[12] = {
@@ -1527,11 +1681,15 @@ static void PatchTabsSchemaTabIdNone(uintptr_t slide) {
         os_log_error(CuriumExtHookLog(),
                      "tabs schema TAB_ID_NONE patch: skipped, slot mismatch (data=%#lx len=%zu)",
                      (unsigned long)actual_data, actual_len);
+        CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"failed",
+                               @"Schema slot mismatch");
         return;
     }
     const char *orig = (const char *)actual_data;
     if (orig[actual_len - 1] != '}') {
         os_log_error(CuriumExtHookLog(), "tabs schema TAB_ID_NONE patch: skipped, unexpected tail");
+        CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"failed",
+                               @"Unexpected tabs schema JSON tail");
         return;
     }
     static const char kTabIdNoneProp[] =
@@ -1540,23 +1698,30 @@ static void PatchTabsSchemaTabIdNone(uintptr_t slide) {
     const size_t new_len = (actual_len - 1) + prop_len;
     char *buf = (char *)malloc(new_len + 1);
     if (!buf) {
+        CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"failed", @"Allocation failed");
         return;
     }
     memcpy(buf, orig, actual_len - 1);
     memcpy(buf + (actual_len - 1), kTabIdNoneProp, prop_len + 1);
     if (!PatchVtableSlot(data_slot, buf)) {
         free(buf);
+        CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"failed",
+                               @"vm_protect failed on schema data slot");
         return;
     }
     if (!PatchVtableSlot(len_slot, (void *)(uintptr_t)new_len)) {
         PatchVtableSlot(data_slot, (void *)actual_data);
         free(buf);
+        CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"failed",
+                               @"vm_protect failed on schema length slot");
         return;
     }
     gPatchedTabsSchemaBuf = buf;
     os_log(CuriumExtHookLog(),
            "tabs schema TAB_ID_NONE patch: installed (len %zu -> %zu)",
            actual_len, new_len);
+    CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"active",
+                           [NSString stringWithFormat:@"len %zu -> %zu", actual_len, new_len]);
 }
 
 void CuriumInstallExtensionCoexistenceHooks(void) {
@@ -1566,6 +1731,10 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
         if (!FindBuild35ChromeFramework(&slide)) {
             os_log(CuriumExtHookLog(),
                    "extension coexistence hooks: skipped (chrome_framework Build 35 UUID not present)");
+            CuriumRecordHookStatus(@"Extension Coexistence", @"skipped",
+                                   @"Build 35 chrome_framework UUID not present");
+            CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
+                                   @"Build 35 chrome_framework UUID not present");
             return;
         }
         gSlide = slide;
@@ -1668,6 +1837,10 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
                              "extension coexistence hooks: aborted, slot mismatch for %{public}s "
                              "(actual=%#lx expected=%#lx)",
                              patches[i].label, (unsigned long)actual, (unsigned long)expected);
+                CuriumRecordHookStatus(@"Extension Coexistence", @"failed",
+                                       [NSString stringWithFormat:@"Slot mismatch: %s", patches[i].label]);
+                CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
+                                       @"Skipped after vtable slot mismatch");
                 return;
             }
         }
@@ -1703,10 +1876,17 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
                 for (size_t j = 0; j < installed; j++) {
                     PatchVtableSlot(slide + patches[j].slot_offset, *patches[j].orig_out);
                 }
+                CuriumRecordHookStatus(@"Extension Coexistence", @"failed",
+                                       [NSString stringWithFormat:@"vm_protect failed: %s", patches[i].label]);
+                CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
+                                       @"Skipped after vm_protect rollback");
                 return;
             }
             installed++;
         }
+
+        CuriumRecordHookStatus(@"Extension Coexistence", @"active",
+                               [NSString stringWithFormat:@"%zu Build 35 vtable slots patched", installed]);
 
         PatchTabsSchemaTabIdNone(slide);
 
@@ -1718,6 +1898,9 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
 
 #else
 
-void CuriumInstallExtensionCoexistenceHooks(void) {}
+void CuriumInstallExtensionCoexistenceHooks(void) {
+    CuriumRecordHookStatus(@"Extension Coexistence", @"skipped", @"Non-arm64 architecture");
+    CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped", @"Non-arm64 architecture");
+}
 
 #endif

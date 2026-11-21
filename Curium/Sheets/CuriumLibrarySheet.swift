@@ -74,6 +74,9 @@ private struct CuriumHistoryList: View {
     var body: some View {
         let request = Request(query: search.trimmingCharacters(in: .whitespacesAndNewlines),
                               revision: library.historyRevision)
+        let calendar = Calendar.autoupdatingCurrent
+        let today = calendar.startOfDay(for: .now)
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: today)
 
         List {
             ForEach(result?.days ?? []) { day in
@@ -84,7 +87,7 @@ private struct CuriumHistoryList: View {
                         }
                     }
                 } header: {
-                    dayLabel(day.day)
+                    dayLabel(day.day, calendar: calendar, today: today, weekAgo: weekAgo)
                         .textCase(nil)
                 }
             }
@@ -154,14 +157,11 @@ private struct CuriumHistoryList: View {
         }
     }
 
-    private func dayLabel(_ day: Date) -> Text {
-        let calendar = Calendar.autoupdatingCurrent
+    private func dayLabel(_ day: Date, calendar: Calendar, today: Date, weekAgo: Date?) -> Text {
         if calendar.isDateInToday(day) { return Text("Today") }
         if calendar.isDateInYesterday(day) { return Text("Yesterday") }
 
-        let today = calendar.startOfDay(for: .now)
-        if let weekAgo = calendar.date(byAdding: .day, value: -7, to: today),
-           (weekAgo..<today).contains(day) {
+        if let weekAgo, (weekAgo..<today).contains(day) {
             return Text(day, format: .dateTime.weekday(.wide))
         }
         return Text(day, format: .dateTime.weekday(.wide).day().month(.wide))
@@ -177,7 +177,6 @@ private struct CuriumHistoryRow: View {
     var body: some View {
         let title = entry.title.isEmpty ? entry.host : entry.title
         let time = entry.lastVisit.formatted(date: .omitted, time: .shortened)
-        let isBookmarked = library.isBookmarked(entry.url)
 
         Button {
             open(entry.url, false)
@@ -209,14 +208,27 @@ private struct CuriumHistoryRow: View {
             Button { UIPasteboard.general.url = entry.url } label: {
                 Label("Copy Link", systemImage: "link")
             }
-            Button(action: editBookmark) {
-                Label(isBookmarked ? "Edit Bookmark" : "Add Bookmark",
-                      systemImage: isBookmarked ? "bookmark.fill" : "bookmark")
-            }
+            CuriumHistoryBookmarkMenuButton(url: entry.url, library: library, action: editBookmark)
             Divider()
             Button(role: .destructive) { Task { await library.delete(entry) } } label: {
                 Label("Delete", systemImage: "trash")
             }
+        }
+    }
+}
+
+/// Evaluates `library.isBookmarked` lazily inside the context menu so scrolling history
+/// rows do not register an observation dependency on `library.bookmarks`.
+private struct CuriumHistoryBookmarkMenuButton: View {
+    let url: URL
+    let library: CuriumLibrary
+    let action: () -> Void
+
+    var body: some View {
+        let isBookmarked = library.isBookmarked(url)
+        Button(action: action) {
+            Label(isBookmarked ? "Edit Bookmark" : "Add Bookmark",
+                  systemImage: isBookmarked ? "bookmark.fill" : "bookmark")
         }
     }
 }

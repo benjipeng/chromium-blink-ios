@@ -97,37 +97,36 @@ struct CuriumTabsSheet: View {
     }
 
     private func tabRow(range: Range<Int>, geo: RowGeometry) -> some View {
+        let allTabs = store.tabs
+        let clampedLower = min(range.lowerBound, allTabs.count)
+        let clampedUpper = min(range.upperBound, allTabs.count)
         let half = geo.count / 2
-        let mid = min(range.upperBound, range.lowerBound + half)
+        let mid = min(clampedUpper, clampedLower + half)
         let leftToRight = layoutDirection == .leftToRight
 
         return HStack(spacing: 0) {
-            cards(range: range.lowerBound..<mid, columns: half)
+            cards(tabs: allTabs[clampedLower..<mid], columns: half)
                 .frame(width: leftToRight ? geo.leftWidth : geo.rightWidth)
             Spacer(minLength: 0)
-            cards(range: mid..<range.upperBound, columns: half)
+            cards(tabs: allTabs[mid..<clampedUpper], columns: half)
                 .frame(width: leftToRight ? geo.rightWidth : geo.leftWidth)
         }
         .padding(.leading, leftToRight ? geo.leftInset : geo.rightInset)
         .padding(.trailing, leftToRight ? geo.rightInset : geo.leftInset)
     }
 
-    private func cards(range: Range<Int>, columns: Int) -> some View {
-        let allTabs = store.tabs
-        return HStack(spacing: 14) {
-            ForEach(range, id: \.self) { index in
-                if index < allTabs.count {
-                    let tab = allTabs[index]
-                    CuriumTabCard(tab: tab, selected: store.activeTab?.id == tab.id) {
-                        store.select(tab)
-                        dismiss()
-                    } onClose: {
-                        store.close(tab)
-                    }
-                    .frame(maxWidth: .infinity)
+    private func cards(tabs rowTabs: ArraySlice<CuriumTabModel>, columns: Int) -> some View {
+        HStack(spacing: 14) {
+            ForEach(rowTabs) { tab in
+                CuriumTabCard(tab: tab, selected: store.activeTab?.id == tab.id) {
+                    store.select(tab)
+                    dismiss()
+                } onClose: {
+                    store.close(tab)
                 }
+                .frame(maxWidth: .infinity)
             }
-            ForEach(0..<max(0, columns - range.count), id: \.self) { _ in
+            ForEach(0..<max(0, columns - rowTabs.count), id: \.self) { _ in
                 Color.clear.frame(maxWidth: .infinity)
                     .accessibilityHidden(true)
             }
@@ -146,26 +145,27 @@ private struct CuriumTabCard: View {
     var body: some View {
         Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 0) {
-                GeometryReader { proxy in
-                    if let snapshot = tab.thumbnail {
-                        Image(uiImage: snapshot)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-                            .clipped()
-                    } else {
-                        ZStack {
-                            palette.tile
-                            if tab.url == nil {
-                                Text("Cm").font(.system(.title, design: .serif).weight(.medium))
-                            } else {
-                                Image(systemName: "globe")
-                                    .font(.title2.weight(.light))
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(alignment: .top) {
+                        if let snapshot = tab.thumbnail {
+                            Image(uiImage: snapshot)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            ZStack {
+                                palette.tile
+                                if tab.url == nil {
+                                    Text("Cm").font(.system(.title, design: .serif).weight(.medium))
+                                } else {
+                                    Image(systemName: "globe")
+                                        .font(.title2.weight(.light))
+                                }
                             }
+                            .foregroundStyle(palette.tint)
                         }
-                        .foregroundStyle(palette.tint)
                     }
-                }
+                    .clipped()
                 HStack(spacing: 5) {
                     if selected {
                         Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(palette.tint)

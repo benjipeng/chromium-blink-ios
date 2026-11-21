@@ -14,7 +14,7 @@ struct CuriumBrowserView: View {
     @FocusState private var addressFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private enum Destination: Hashable, Identifiable {
+    fileprivate enum Destination: Hashable, Identifiable {
         case tabs, extensions, downloads, bookmarks, history, settings
 
         var id: Self { self }
@@ -22,10 +22,7 @@ struct CuriumBrowserView: View {
 
     private var tab: CuriumTabModel? { store.activeTab }
     private var isFullscreen: Bool { tab?.isFullscreen == true }
-    private var showsStartPage: Bool {
-        !isFullscreen && tab?.engine != nil && tab?.url == nil && tab?.isLoading == false
-    }
-    private var canScalePage: Bool { tab?.url != nil && tab?.engine != nil }
+    private var showsStartPage: Bool { tab?.isBlankStartPage == true }
 
     var body: some View {
         GeometryReader { proxy in
@@ -43,8 +40,9 @@ struct CuriumBrowserView: View {
                         width: proxy.size.width,
                         height: proxy.size.height + proxy.safeAreaInsets.top + proxy.safeAreaInsets.bottom
                     ),
+                    isChromePinned: tab?.isChromePinned == true,
                     standby: CuriumStandbyPage(
-                        url: tab?.url, topInset: restingTopInset, engineReady: store.isEngineReady, palette: palette
+                        tab: tab, topInset: restingTopInset, engineReady: store.isEngineReady, palette: palette
                     ),
                     scheduleSnapshot: store.scheduleSnapshot(for:)
                 )
@@ -91,16 +89,13 @@ struct CuriumBrowserView: View {
                     .ignoresSafeArea(.container, edges: .top)
                 }
 
-                if !isFullscreen,
-                   let storeID = CuriumExtensionStore.storeExtensionID(from: tab?.url) {
-                    VStack {
-                        Spacer()
-                        storeInstallPill(storeID: storeID)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, placement == .none ? CuriumSpace.bottomToolbarClearance : 14)
-                    .ignoresSafeArea(.keyboard)
+                if !isFullscreen {
+                    CuriumStoreInstallPillOverlay(
+                        store: store,
+                        palette: palette,
+                        bottomPadding: placement == .none ? CuriumSpace.bottomToolbarClearance : 14,
+                        openExtensions: { present(.extensions) }
+                    )
                 }
             }
             .onChange(of: proxy.size.width, initial: true) { _, newWidth in
@@ -142,7 +137,9 @@ struct CuriumBrowserView: View {
             case .bookmarks:
                 CuriumLibrarySheet(
                     store: store, section: .bookmarks,
-                    currentPage: tab?.url.map { CuriumBookmarkPage(url: $0, title: tab?.title ?? "") }
+                    currentPage: store.activeTab?.url.map {
+                        CuriumBookmarkPage(url: $0, title: store.activeTab?.title ?? "")
+                    }
                 )
             case .history: CuriumLibrarySheet(store: store, section: .history)
             case .settings:
@@ -165,100 +162,24 @@ struct CuriumBrowserView: View {
     @ToolbarContentBuilder
     private var browserToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .bottomBar) {
-            Button {
-                tab?.goBack()
-            } label: { Label("Back", systemImage: "chevron.left") }
-            .disabled(tab?.canGoBack != true)
-            Button {
-                tab?.goForward()
-            } label: { Label("Forward", systemImage: "chevron.right") }
-            .disabled(tab?.canGoForward != true)
+            CuriumBackToolbarButton(store: store)
+            CuriumForwardToolbarButton(store: store)
             Spacer()
             Button {
                 store.newTab()
             } label: { Label("New Tab", systemImage: "plus") }
             CuriumExtensionsToolbarButton(extensions: store.extensions) { present(.extensions) }
-            tabsButton
-            overflowMenu
+            CuriumTabsToolbarButton(store: store) { present(.tabs) }
+            CuriumOverflowToolbarMenu(store: store, present: present)
         }
-    }
-
-    private var tabsButton: some View {
-        Button { present(.tabs) } label: {
-            Label("Tabs", systemImage: "square.on.square")
-        }
-        .accessibilityValue(Text(store.tabs.count, format: .number))
-    }
-
-    private var overflowMenu: some View {
-
-        return Menu {
-            pageScaleControls
-            Button {
-                tab?.engine?.presentFindInPage()
-            } label: {
-                Label("Find in Page", systemImage: "magnifyingglass")
-            }
-            .disabled(tab?.url == nil || tab?.engine == nil)
-
-            Button {
-                tab?.toggleDesktopSite()
-            } label: {
-                Label(
-                    tab?.usesDesktopSite == true ? "Request Mobile Site" : "Request Desktop Site",
-                    systemImage: tab?.usesDesktopSite == true ? "iphone" : "desktopcomputer"
-                )
-            }
-            .disabled(tab?.engine == nil)
-
-
-            Button { present(.bookmarks) } label: { Label("Bookmarks", systemImage: "book") }
-                .accessibilityIdentifier("curium.menu.bookmarks")
-            Button { present(.history) } label: { Label("History", systemImage: "clock") }
-                .accessibilityIdentifier("curium.menu.history")
-
-            Button { present(.downloads) } label: { Label("Downloads", systemImage: "arrow.down.circle") }
-            Button { present(.settings) } label: { Label("Settings", systemImage: "gearshape") }
-        } label: {
-            Label("More", systemImage: "ellipsis")
-        }
-    }
-
-    /// Safari's inline row: steps stay in the open menu; the percentage resets to 100%.
-    /// One compact inline row, as Safari's: steps keep the menu open; the percentage resets to 100%.
-    @ViewBuilder private var pageScaleControls: some View {
-        let percentage = Int(((tab?.zoomScale ?? 1) * 100).rounded())
-        let value = Text(Double(percentage) / 100, format: .percent.precision(.fractionLength(0)))
-        ControlGroup {
-            Button { setPageScale(percentage - 5) } label: {
-                Label("Decrease Page Scale", systemImage: "minus")
-            }
-            .disabled(!canScalePage || percentage <= 50)
-
-            Button { setPageScale(100) } label: { value }
-                .disabled(!canScalePage || percentage == 100)
-                .accessibilityLabel("Page Scale")
-                .accessibilityValue(value)
-                .accessibilityHint("Resets to 100 percent.")
-
-            Button { setPageScale(percentage + 5) } label: {
-                Label("Increase Page Scale", systemImage: "plus")
-            }
-            .disabled(!canScalePage || percentage >= 200)
-        }
-        .controlGroupStyle(.palette)
-        .labelStyle(.iconOnly)
-        .menuActionDismissBehavior(.disabled)
-        .accessibilityIdentifier("curium.pagescale")
-    }
-
-    private func setPageScale(_ percentage: Int) {
-        tab?.setZoomScale(CGFloat(min(200, max(50, percentage))) / 100)
     }
 
     private var chromeAnimation: Animation? { reduceMotion ? nil : .smooth(duration: 0.32) }
 
     private func present(_ destination: Destination) {
+        if destination == .tabs {
+            store.prepareSnapshotsForTabsSheet()
+        }
         store.setSheetPresented(true)
         dismissKeyboardTrigger += 1
         sheet = destination
@@ -450,36 +371,156 @@ struct CuriumBrowserView: View {
             top = (blockers.map(\.maxY).max() ?? top) + 6
         }
     }
+}
 
-    @ViewBuilder
-    private func storeInstallPill(storeID: String) -> some View {
-        let alreadyInstalled = store.extensions.isInstalled(storeID)
+private struct CuriumBackToolbarButton: View {
+    let store: CuriumBrowserStore
+
+    var body: some View {
         Button {
-            if alreadyInstalled {
-                present(.extensions)
-            } else {
-                store.extensions.prepareStoreExtension(id: storeID)
-                present(.extensions)
-            }
-        } label: {
-            HStack(spacing: 8) {
-                if store.extensions.isWorking {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: alreadyInstalled ? "checkmark.circle.fill" : "plus.circle.fill")
-                        .font(.callout.weight(.semibold))
-                }
-                Text(alreadyInstalled ? "Installed in Curium" : "Add to Curium")
-                    .font(.callout.weight(.semibold))
-            }
-            .foregroundStyle(alreadyInstalled ? AnyShapeStyle(.secondary) : AnyShapeStyle(palette.tint))
-            .padding(.horizontal, 18)
-            .frame(minHeight: CuriumSpace.tapTarget)
-            .contentShape(Capsule())
+            store.activeTab?.goBack()
+        } label: { Label("Back", systemImage: "chevron.left") }
+        .disabled(store.activeTab?.canGoBack != true)
+    }
+}
+
+private struct CuriumForwardToolbarButton: View {
+    let store: CuriumBrowserStore
+
+    var body: some View {
+        Button {
+            store.activeTab?.goForward()
+        } label: { Label("Forward", systemImage: "chevron.right") }
+        .disabled(store.activeTab?.canGoForward != true)
+    }
+}
+
+private struct CuriumTabsToolbarButton: View {
+    let store: CuriumBrowserStore
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            Label("Tabs", systemImage: "square.on.square")
         }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: Capsule())
-        .accessibilityIdentifier("curium.store.install")
+        .accessibilityValue(Text(store.tabs.count, format: .number))
+    }
+}
+
+private struct CuriumOverflowToolbarMenu: View {
+    let store: CuriumBrowserStore
+    let present: (CuriumBrowserView.Destination) -> Void
+
+    private var tab: CuriumTabModel? { store.activeTab }
+    private var canScalePage: Bool { tab?.url != nil && tab?.engine != nil }
+
+    var body: some View {
+        Menu {
+            pageScaleControls
+            Button {
+                tab?.engine?.presentFindInPage()
+            } label: {
+                Label("Find in Page", systemImage: "magnifyingglass")
+            }
+            .disabled(tab?.url == nil || tab?.engine == nil)
+
+            Button {
+                tab?.toggleDesktopSite()
+            } label: {
+                Label(
+                    tab?.usesDesktopSite == true ? "Request Mobile Site" : "Request Desktop Site",
+                    systemImage: tab?.usesDesktopSite == true ? "iphone" : "desktopcomputer"
+                )
+            }
+            .disabled(tab?.engine == nil)
+
+            Button { present(.bookmarks) } label: { Label("Bookmarks", systemImage: "book") }
+                .accessibilityIdentifier("curium.menu.bookmarks")
+            Button { present(.history) } label: { Label("History", systemImage: "clock") }
+                .accessibilityIdentifier("curium.menu.history")
+
+            Button { present(.downloads) } label: { Label("Downloads", systemImage: "arrow.down.circle") }
+            Button { present(.settings) } label: { Label("Settings", systemImage: "gearshape") }
+        } label: {
+            Label("More", systemImage: "ellipsis")
+        }
+    }
+
+    /// One compact inline row, as Safari's: steps keep the menu open; the percentage resets to 100%.
+    @ViewBuilder private var pageScaleControls: some View {
+        let percentage = Int(((tab?.zoomScale ?? 1) * 100).rounded())
+        let value = Text(Double(percentage) / 100, format: .percent.precision(.fractionLength(0)))
+        ControlGroup {
+            Button { setPageScale(percentage - 5) } label: {
+                Label("Decrease Page Scale", systemImage: "minus")
+            }
+            .disabled(!canScalePage || percentage <= 50)
+
+            Button { setPageScale(100) } label: { value }
+                .disabled(!canScalePage || percentage == 100)
+                .accessibilityLabel("Page Scale")
+                .accessibilityValue(value)
+                .accessibilityHint("Resets to 100 percent.")
+
+            Button { setPageScale(percentage + 5) } label: {
+                Label("Increase Page Scale", systemImage: "plus")
+            }
+            .disabled(!canScalePage || percentage >= 200)
+        }
+        .controlGroupStyle(.palette)
+        .labelStyle(.iconOnly)
+        .menuActionDismissBehavior(.disabled)
+        .accessibilityIdentifier("curium.pagescale")
+    }
+
+    private func setPageScale(_ percentage: Int) {
+        tab?.setZoomScale(CGFloat(min(200, max(50, percentage))) / 100)
+    }
+}
+
+private struct CuriumStoreInstallPillOverlay: View {
+    let store: CuriumBrowserStore
+    let palette: CuriumPalette
+    let bottomPadding: CGFloat
+    let openExtensions: () -> Void
+
+    var body: some View {
+        if let storeID = CuriumExtensionStore.storeExtensionID(from: store.activeTab?.url) {
+            let alreadyInstalled = store.extensions.isInstalled(storeID)
+            VStack {
+                Spacer()
+                Button {
+                    if alreadyInstalled {
+                        openExtensions()
+                    } else {
+                        store.extensions.prepareStoreExtension(id: storeID)
+                        openExtensions()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        if store.extensions.isWorking {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: alreadyInstalled ? "checkmark.circle.fill" : "plus.circle.fill")
+                                .font(.callout.weight(.semibold))
+                        }
+                        Text(alreadyInstalled ? "Installed in Curium" : "Add to Curium")
+                            .font(.callout.weight(.semibold))
+                    }
+                    .foregroundStyle(alreadyInstalled ? AnyShapeStyle(.secondary) : AnyShapeStyle(palette.tint))
+                    .padding(.horizontal, 18)
+                    .frame(minHeight: CuriumSpace.tapTarget)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
+                .accessibilityIdentifier("curium.store.install")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.bottom, bottomPadding)
+            .ignoresSafeArea(.keyboard)
+        }
     }
 }
 
@@ -505,7 +546,8 @@ private struct CuriumPageCanvas: View {
     }
 }
 
-/// Safari's reading edge: the page blurs out under the pill as the bar collapses.
+/// Soft canvas-tinted gradient veil behind the collapsed pill. Permanently mounted and
+/// driven purely by GPU opacity so scroll start never allocates a backdrop blur pass.
 private struct CuriumReadingEdge: View {
     let tab: CuriumTabModel?
     let focused: Bool
@@ -513,22 +555,20 @@ private struct CuriumReadingEdge: View {
 
     var body: some View {
         let collapse = tab?.chrome.collapse(focused: focused, hasPage: tab?.url != nil) ?? 0
-        if collapse > 0.01 {
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .mask {
-                    LinearGradient(
-                        stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.4),
-                                .init(color: .clear, location: 1)],
-                        startPoint: .top, endPoint: .bottom
-                    )
-                }
-                .frame(height: height)
-                .opacity(collapse)
-                .ignoresSafeArea(.container, edges: .top)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        }
+        let base = Color(uiColor: tab?.pageCanvasColor ?? .systemBackground)
+        LinearGradient(
+            stops: [
+                .init(color: base.opacity(0.92), location: 0),
+                .init(color: base.opacity(0.72), location: 0.45),
+                .init(color: base.opacity(0), location: 1)
+            ],
+            startPoint: .top, endPoint: .bottom
+        )
+        .frame(height: height)
+        .opacity(collapse)
+        .ignoresSafeArea(.container, edges: .top)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -549,6 +589,7 @@ private struct CuriumAddressBar: View {
     @State private var address = ""
     /// Focus selects the whole address, so typing replaces it as in every browser.
     @State private var selection: TextSelection?
+    @State private var cachedSite = ""
     @State private var siteWidth: CGFloat = 0
 
     private var text: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -557,9 +598,28 @@ private struct CuriumAddressBar: View {
         !addressFocused && (tab?.pictureInPicture.phase ?? .unavailable) != .unavailable
     }
 
-    private var site: String {
-        let host = tab?.url?.host(percentEncoded: false) ?? ""
+    private var showsClearButton: Bool {
+        addressFocused && !address.isEmpty
+    }
+
+    private var showsReloadButton: Bool {
+        !showsClearButton && tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
+    }
+
+    private var hasTrailingButton: Bool {
+        showsClearButton || showsReloadButton
+    }
+
+    private static func hostLabel(for url: URL?) -> String {
+        let host = url?.host(percentEncoded: false) ?? ""
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    private func refreshCachedSite(for url: URL?) {
+        let nextSite = Self.hostLabel(for: url)
+        guard nextSite != cachedSite else { return }
+        cachedSite = nextSite
+        siteWidth = (nextSite as NSString).size(withAttributes: [.font: CuriumSpace.pillUIFont]).width.rounded(.up)
     }
 
     var body: some View {
@@ -569,19 +629,32 @@ private struct CuriumAddressBar: View {
         let pillWidth = min(pillMaxWidth, siteWidth + 24)
         let width = span + (pillWidth - span) * collapse
         let height = CuriumSpace.tapTarget + (CuriumSpace.compactPillHeight - CuriumSpace.tapTarget) * collapse
-        let top = restingTop + (pillTop - restingTop) * collapse
         let collapsed = collapse >= 0.5
+        let fieldOpacity = max(0, 1 - collapse / 0.6)
+        let fieldScale = 1 - 0.22 * collapse
 
         VStack(spacing: 6) {
             ZStack {
-                field
-                    .frame(width: span, height: CuriumSpace.tapTarget)
-                    .scaleEffect(1 - 0.22 * collapse)
-                    .opacity(max(0, 1 - collapse / 0.6))
-                    .allowsHitTesting(!collapsed)
-                    .accessibilityHidden(collapsed)
+                CuriumAddressTextField(
+                    searchEngineTitle: store.library.searchEngine.title,
+                    addressText: address,
+                    selectionValue: selection,
+                    isFocused: addressFocused,
+                    address: $address,
+                    selection: $selection,
+                    addressFocused: $addressFocused,
+                    leadingInset: showsPictureInPictureButton ? CuriumSpace.tapTarget + 6 : 14,
+                    trailingInset: hasTrailingButton ? CuriumSpace.tapTarget + 6 : 14,
+                    submit: submit
+                )
+                .equatable()
+                .frame(width: span, height: CuriumSpace.tapTarget)
+                .scaleEffect(fieldScale)
+                .opacity(fieldOpacity)
+                .allowsHitTesting(!collapsed)
+                .accessibilityHidden(collapsed)
 
-                Text(verbatim: site)
+                Text(verbatim: cachedSite)
                     .font(CuriumSpace.pillFont)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -601,18 +674,75 @@ private struct CuriumAddressBar: View {
             }
             .clipShape(Capsule())
             .glassEffect(.regular.interactive(), in: Capsule())
-            .overlay {
-                if collapsed {
-                    Button(action: expand) { Color.clear.contentShape(Capsule()) }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Address")
-                        .accessibilityValue(Text(verbatim: site))
-                        .accessibilityHint("Shows the full address bar.")
-                        .accessibilityIdentifier("curium.address.compact")
+            // Keep leading/trailing controls strictly above the glass capsule and text field
+            // in Z-order and non-overlapping in X so accessibility hit-testing reaches them directly.
+            .overlay(alignment: .leading) {
+                if showsPictureInPictureButton, let tab {
+                    let active = tab.pictureInPicture.phase == .active
+                    Button { withAnimation(.smooth(duration: 0.25)) { tab.togglePictureInPicture() } } label: {
+                        Label(active ? "Exit Picture in Picture" : "Picture in Picture",
+                              systemImage: active ? "pip.exit" : "pip.enter")
+                            .labelStyle(.iconOnly)
+                            .contentTransition(.symbolEffect(.replace))
+                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.leading, 2)
+                    .scaleEffect(fieldScale)
+                    .opacity(fieldOpacity)
+                    .allowsHitTesting(!collapsed)
+                    .accessibilityHidden(collapsed)
+                    .accessibilitySortPriority(2)
+                    .accessibilityIdentifier("curium.address.pip")
                 }
             }
-            .offset(x: pillShift * collapse)
-            .padding(.top, top)
+            .overlay(alignment: .trailing) {
+                if showsClearButton {
+                    Button { address = "" } label: {
+                        Label("Clear Address", systemImage: "xmark.circle.fill")
+                            .labelStyle(.iconOnly)
+                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 2)
+                    .scaleEffect(fieldScale)
+                    .opacity(fieldOpacity)
+                    .allowsHitTesting(!collapsed)
+                    .accessibilityHidden(collapsed)
+                    .accessibilitySortPriority(2)
+                    .accessibilityIdentifier("curium.address.clear")
+                } else if showsReloadButton, let tab {
+                    Button { tab.reloadOrStop() } label: {
+                        Label(tab.isLoading ? "Stop Loading" : "Reload",
+                              systemImage: tab.isLoading ? "xmark" : "arrow.clockwise")
+                            .labelStyle(.iconOnly)
+                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 2)
+                    .scaleEffect(fieldScale)
+                    .opacity(fieldOpacity)
+                    .allowsHitTesting(!collapsed)
+                    .accessibilityHidden(collapsed)
+                    .accessibilitySortPriority(2)
+                    .accessibilityIdentifier("curium.address.reload")
+                }
+            }
+            .overlay {
+                Button(action: expand) { Color.clear.contentShape(Capsule()) }
+                    .buttonStyle(.plain)
+                    .allowsHitTesting(collapsed)
+                    .accessibilityLabel("Address")
+                    .accessibilityValue(Text(verbatim: cachedSite))
+                    .accessibilityHint("Shows the full address bar.")
+                    .accessibilityIdentifier("curium.address.compact")
+                    .accessibilityHidden(!collapsed)
+            }
+            .offset(x: pillShift * collapse, y: (pillTop - restingTop) * collapse)
+            .padding(.top, restingTop)
 
             if addressFocused {
                 CuriumAddressMatches(library: store.library, text: text, submit: submit, open: openMatch)
@@ -627,15 +757,14 @@ private struct CuriumAddressBar: View {
                     .accessibilityAddTraits(.updatesFrequently)
             }
         }
-        .onChange(of: site, initial: true) {
-            siteWidth = (site as NSString).size(withAttributes: [.font: CuriumSpace.pillUIFont]).width.rounded(.up)
-        }
         .onChange(of: tab?.id, initial: true) {
             addressFocused = false
             address = tab?.url?.absoluteString ?? ""
+            refreshCachedSite(for: tab?.url)
         }
-        .onChange(of: tab?.url) {
+        .onChange(of: tab?.url, initial: true) {
             if !addressFocused { address = tab?.url?.absoluteString ?? "" }
+            refreshCachedSite(for: tab?.url)
         }
         .onChange(of: dismissKeyboardTrigger) {
             addressFocused = false
@@ -651,60 +780,10 @@ private struct CuriumAddressBar: View {
         }
     }
 
-    private var field: some View {
-        let prompt = Text("Search \(store.library.searchEngine.title) or enter address")
-        return HStack(spacing: 8) {
-            // The leading slot is empty unless a playing video can go into Picture in Picture.
-            if showsPictureInPictureButton, let tab {
-                let active = tab.pictureInPicture.phase == .active
-                Button { withAnimation(.smooth(duration: 0.25)) { tab.togglePictureInPicture() } } label: {
-                    Label(active ? "Exit Picture in Picture" : "Picture in Picture",
-                          systemImage: active ? "pip.exit" : "pip.enter")
-                        .labelStyle(.iconOnly)
-                        .contentTransition(.symbolEffect(.replace))
-                        .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                }
-                .buttonStyle(.plain)
-                .transition(.opacity)
-                .accessibilityIdentifier("curium.address.pip")
-            }
-
-            TextField(text: $address, selection: $selection, prompt: prompt.foregroundStyle(CuriumSpace.secondaryInk)) { prompt }
-                .textFieldStyle(.plain)
-                .font(.body)
-                .keyboardType(.webSearch)
-                .submitLabel(.go)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .focused($addressFocused)
-                .onSubmit(submit)
-                .accessibilityIdentifier("curium.address")
-
-            if addressFocused && !address.isEmpty {
-                Button { address = "" } label: {
-                    Label("Clear Address", systemImage: "xmark.circle.fill").labelStyle(.iconOnly)
-                        .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                }
-                .buttonStyle(.plain)
-            } else if let tab, tab.engine != nil && (tab.url != nil || tab.isLoading) {
-                Button { tab.reloadOrStop() } label: {
-                    Label(tab.isLoading ? "Stop Loading" : "Reload",
-                          systemImage: tab.isLoading ? "xmark" : "arrow.clockwise")
-                        .labelStyle(.iconOnly)
-                        .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.leading, showsPictureInPictureButton ? 2 : 14)
-        .padding(.trailing, addressFocused && !address.isEmpty || tab?.url != nil && tab?.engine != nil ? 2 : 14)
-    }
-
     private func submit() {
         addressFocused = false
         store.submitAddress(text)
     }
-
 
     private func openMatch(_ url: URL) {
         addressFocused = false
@@ -713,6 +792,50 @@ private struct CuriumAddressBar: View {
         } else {
             store.newTab(url: url)
         }
+    }
+}
+
+/// Isolated text-input leaf conforming to `Equatable` so 120Hz chrome collapse updates
+/// skip re-evaluating the `TextField` and prompt string, while keeping its bounds clipped
+/// inside the leading/trailing button slots.
+private struct CuriumAddressTextField: View, Equatable {
+    let searchEngineTitle: String
+    let addressText: String
+    let selectionValue: TextSelection?
+    let isFocused: Bool
+    @Binding var address: String
+    @Binding var selection: TextSelection?
+    @FocusState.Binding var addressFocused: Bool
+    let leadingInset: CGFloat
+    let trailingInset: CGFloat
+    let submit: () -> Void
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.searchEngineTitle == rhs.searchEngineTitle
+            && lhs.addressText == rhs.addressText
+            && lhs.selectionValue == rhs.selectionValue
+            && lhs.isFocused == rhs.isFocused
+            && lhs.leadingInset == rhs.leadingInset
+            && lhs.trailingInset == rhs.trailingInset
+    }
+
+    var body: some View {
+        let prompt = Text("Search \(searchEngineTitle) or enter address")
+        TextField(text: $address, selection: $selection, prompt: prompt.foregroundStyle(CuriumSpace.secondaryInk)) { prompt }
+            .textFieldStyle(.plain)
+            .font(.body)
+            .keyboardType(.webSearch)
+            .submitLabel(.go)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .focused($addressFocused)
+            .onSubmit(submit)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: CuriumSpace.tapTarget, alignment: .leading)
+            .clipped()
+            .contentShape(Rectangle())
+            .accessibilityIdentifier("curium.address")
+            .padding(.leading, leadingInset)
+            .padding(.trailing, trailingInset)
     }
 }
 
@@ -762,7 +885,7 @@ private struct CuriumLoadingFill: View {
 }
 
 struct CuriumStandbyPage: View {
-    let url: URL?
+    let tab: CuriumTabModel?
     let topInset: CGFloat
     let engineReady: Bool
     let palette: CuriumPalette
@@ -782,7 +905,7 @@ struct CuriumStandbyPage: View {
                 .accessibilityLabel("Curium, element 96")
 
                 VStack(alignment: .leading, spacing: 9) {
-                    Text(url?.host() ?? "Curium")
+                    Text(tab?.url?.host() ?? "Curium")
                         .font(.system(.largeTitle, design: .serif).weight(.medium))
                     Text(engineReady ? "Waiting for Blink to open a tab." :
                          "Tabs and address history are available for this session. Loading websites requires Blink.")

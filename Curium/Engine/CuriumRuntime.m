@@ -1,14 +1,66 @@
 #import "CuriumRuntime.h"
 #import "CuriumExtensionCoexistenceHook.h"
+#import "CuriumHookSupport.h"
 #import "CuriumInputAccessoryHook.h"
 #import "CuriumPictureInPictureHooks.h"
 #import "CuriumTouchCancelHook.h"
 #import <TargetConditionals.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import <os/log.h>
 #import <os/proc.h>
 #import <UIKit/UIKit.h>
+
+static os_unfair_lock gCuriumHookStatusLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray<NSDictionary<NSString *, NSString *> *> *gCuriumHookStatuses = nil;
+
+void CuriumRecordHookStatus(NSString *name, NSString *status, NSString *detail) {
+    NSString *safeName = name.length > 0 ? [name copy] : @"unknown";
+    NSString *safeStatus = status.length > 0 ? [status copy] : @"failed";
+    NSString *safeDetail = detail ? [detail copy] : @"";
+    NSDictionary<NSString *, NSString *> *entry = @{
+        @"name": safeName,
+        @"status": safeStatus,
+        @"detail": safeDetail,
+    };
+    os_unfair_lock_lock(&gCuriumHookStatusLock);
+    if (!gCuriumHookStatuses) {
+        gCuriumHookStatuses = [NSMutableArray arrayWithCapacity:10];
+    }
+    NSUInteger existingIndex = NSNotFound;
+    for (NSUInteger i = 0; i < gCuriumHookStatuses.count; i++) {
+        if ([gCuriumHookStatuses[i][@"name"] isEqualToString:safeName]) {
+            existingIndex = i;
+            break;
+        }
+    }
+    if (existingIndex != NSNotFound) {
+        gCuriumHookStatuses[existingIndex] = entry;
+    } else {
+        [gCuriumHookStatuses addObject:entry];
+    }
+    os_unfair_lock_unlock(&gCuriumHookStatusLock);
+}
+
+NSArray<NSDictionary<NSString *, NSString *> *> *CuriumRuntimeHookStatuses(void) {
+    os_unfair_lock_lock(&gCuriumHookStatusLock);
+    NSArray<NSDictionary<NSString *, NSString *> *> *snapshot =
+        gCuriumHookStatuses ? [gCuriumHookStatuses copy] : @[];
+    os_unfair_lock_unlock(&gCuriumHookStatusLock);
+    return snapshot;
+}
+
+static void CuriumRunOnMain(dispatch_block_t block) {
+    if (!block) {
+        return;
+    }
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), block);
+    }
+}
 
 static void CuriumNoOpLogLaunchMetrics(id self, SEL _cmd, id startupInfo, NSArray *scenes) {
     // Launch metrics walk Chrome's tab model for UMA that Curium never uploads.
@@ -20,7 +72,7 @@ static void CuriumNoOpLogLaunchMetrics(id self, SEL _cmd, id startupInfo, NSArra
     (void)scenes;
 }
 
-static NSArray<NSString *> *(*gCuriumOrigProcessArguments)(id, SEL) = NULL;
+static NSArray<NSString *> *gCuriumAugmentedArguments = nil;
 
 // Adds a bare switch once.
 static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
@@ -50,9 +102,12 @@ static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *na
     return YES;
 }
 
-// Builds the engine's command line once. NSProcessInfo.arguments is read
-// repeatedly during startup, and the result cannot change within a launch.
-static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base) {
+// Builds the engine's command line once. Inputs from NSBundle and NSUserDefaults
+// are read BEFORE swizzling -[NSProcessInfo arguments] so initializing Foundation's
+// NSArgumentDomain can never re-enter a dispatch_once lock on the main thread.
+static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
+                                                 BOOL supportsDisableSync,
+                                                 NSString *_Nullable jitPref) {
     NSMutableArray<NSString *> *args = [base mutableCopy];
     BOOL changed = NO;
 
@@ -72,11 +127,10 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base) {
 
     // Enable only after vendoring an engine with patch 0096. Build 32
     // dereferences a missing SyncService at launch with this switch.
-    if ([[NSBundle mainBundle].infoDictionary[@"CuriumEngineSupportsDisableSync"] boolValue]) {
+    if (supportsDisableSync) {
         changed |= CuriumAddSwitch(args, @"--disable-sync");
     }
 
-    NSString *jitPref = [[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"];
     if ([jitPref isEqualToString:@"jitless"]) {
         changed |= CuriumAddSwitch(args, @"--curium-disable-jit");
     } else if ([jitPref isEqualToString:@"forceJIT"]) {
@@ -89,32 +143,39 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base) {
 static NSArray<NSString *> *CuriumAugmentedProcessArguments(id self, SEL _cmd) {
     // IOSChromeMain initializes base::CommandLine from NSProcessInfo.processInfo.arguments
     // rather than ChromeMain(argc, argv).
-    static NSArray<NSString *> *arguments;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSArray<NSString *> *base = gCuriumOrigProcessArguments
-            ? gCuriumOrigProcessArguments(self, _cmd)
-            : @[];
-        arguments = CuriumBuildArguments(base);
-    });
-    return arguments;
+    (void)self;
+    (void)_cmd;
+    return gCuriumAugmentedArguments ?: @[];
 }
 
 static void CuriumInstallCommandLineGuard(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        Class cls = object_getClass([NSProcessInfo processInfo]);
+        NSProcessInfo *processInfo = [NSProcessInfo processInfo];
+        NSArray<NSString *> *base = [processInfo arguments] ?: @[];
+        BOOL supportsDisableSync =
+            [[NSBundle mainBundle].infoDictionary[@"CuriumEngineSupportsDisableSync"] boolValue];
+        NSString *jitPref =
+            [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
+        gCuriumAugmentedArguments = CuriumBuildArguments(base, supportsDisableSync, jitPref);
+
+        Class cls = object_getClass(processInfo);
         SEL sel = @selector(arguments);
         Method method = class_getInstanceMethod(cls, sel);
         if (!method) {
+            CuriumRecordHookStatus(@"Command-Line Guard", @"failed",
+                                   @"NSProcessInfo arguments method missing");
             return;
         }
-        gCuriumOrigProcessArguments =
-            (NSArray<NSString *> *(*)(id, SEL))method_getImplementation(method);
         if (!class_addMethod(cls, sel, (IMP)CuriumAugmentedProcessArguments,
                              method_getTypeEncoding(method))) {
             method_setImplementation(method, (IMP)CuriumAugmentedProcessArguments);
         }
+        NSString *detail = [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@)",
+                            (unsigned long)gCuriumAugmentedArguments.count,
+                            supportsDisableSync ? 1 : 0,
+                            jitPref.length > 0 ? jitPref : @"automatic"];
+        CuriumRecordHookStatus(@"Command-Line Guard", @"active", detail);
     });
 }
 
@@ -126,12 +187,19 @@ static void CuriumInstallHeadlessRuntimeGuards(void) {
     CuriumInstallTouchCancelHook();
     Class metricsMediator = NSClassFromString(@"MetricsMediator");
     if (!metricsMediator) {
+        CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",
+                               @"MetricsMediator class not present");
         return;
     }
     SEL logLaunch = NSSelectorFromString(@"logLaunchMetricsWithStartupInformation:connectedScenes:");
     Method method = class_getClassMethod(metricsMediator, logLaunch);
     if (method) {
         method_setImplementation(method, (IMP)CuriumNoOpLogLaunchMetrics);
+        CuriumRecordHookStatus(@"MetricsMediator No-Op", @"active",
+                               @"Suppressed Chrome launch UMA walk");
+    } else {
+        CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",
+                               @"Launch metrics selector not present");
     }
 }
 
@@ -196,24 +264,40 @@ static NSError *CuriumUnsupported(void) {
 
 void CuriumPrepareExtension(id<CrIOSExtensionManagingV1> manager, NSString *source,
                             BOOL isStore, CuriumExtensionResult completion) {
+    if (!completion) {
+        return;
+    }
+    CuriumExtensionResult safeCompletion = ^(NSDictionary<NSString *, id> *result, NSError *error) {
+        CuriumRunOnMain(^{
+            completion(result, error);
+        });
+    };
     if (![manager respondsToSelector:@selector(confirmPreparedExtensionWithToken:completion:)] ||
         ![manager respondsToSelector:@selector(cancelPreparedExtensionWithToken:error:)]) {
-        completion(nil, CuriumUnsupported());
+        safeCompletion(nil, CuriumUnsupported());
     } else if (isStore && [manager respondsToSelector:@selector(prepareStoreExtensionWithID:completion:)]) {
-        [manager prepareStoreExtensionWithID:source completion:completion];
+        [manager prepareStoreExtensionWithID:source completion:safeCompletion];
     } else if (!isStore && [manager respondsToSelector:@selector(prepareSignedExtensionAtPath:completion:)]) {
-        [manager prepareSignedExtensionAtPath:source completion:completion];
+        [manager prepareSignedExtensionAtPath:source completion:safeCompletion];
     } else {
-        completion(nil, CuriumUnsupported());
+        safeCompletion(nil, CuriumUnsupported());
     }
 }
 
 void CuriumConfirmExtension(id<CrIOSExtensionManagingV1> manager, NSString *token,
                             CuriumExtensionResult completion) {
+    if (!completion) {
+        return;
+    }
+    CuriumExtensionResult safeCompletion = ^(NSDictionary<NSString *, id> *result, NSError *error) {
+        CuriumRunOnMain(^{
+            completion(result, error);
+        });
+    };
     if ([manager respondsToSelector:@selector(confirmPreparedExtensionWithToken:completion:)]) {
-        [manager confirmPreparedExtensionWithToken:token completion:completion];
+        [manager confirmPreparedExtensionWithToken:token completion:safeCompletion];
     } else {
-        completion(nil, CuriumUnsupported());
+        safeCompletion(nil, CuriumUnsupported());
     }
 }
 
@@ -225,10 +309,18 @@ void CuriumCancelExtension(id<CrIOSExtensionManagingV1> manager, NSString *token
 
 void CuriumRemoveExtension(id<CrIOSExtensionManagingV1> manager, NSString *identifier,
                            void (^completion)(BOOL, NSError *)) {
+    if (!completion) {
+        return;
+    }
+    void (^safeCompletion)(BOOL, NSError *) = ^(BOOL removed, NSError *error) {
+        CuriumRunOnMain(^{
+            completion(removed, error);
+        });
+    };
     if ([manager respondsToSelector:@selector(uninstallExtensionWithID:completion:)]) {
-        [manager uninstallExtensionWithID:identifier completion:completion];
+        [manager uninstallExtensionWithID:identifier completion:safeCompletion];
     } else {
-        completion(NO, CuriumUnsupported());
+        safeCompletion(NO, CuriumUnsupported());
     }
 }
 
