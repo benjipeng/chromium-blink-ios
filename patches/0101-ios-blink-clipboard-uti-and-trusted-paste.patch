@@ -1,0 +1,772 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink clipboard: UTI conformance matching and trusted pasteboard snapshot
+
+ClipboardIOS::GetAllAvailableFormats previously compared literal pasteboard item
+keys without checking UTType conformance, causing iOS plain text stored under
+public.utf8-plain-text to miss ClipboardFormatType::PlainTextType()
+(public.plain-text). In addition, RenderWidgetUIView -paste: dispatched edit
+commands asynchronously so subsequent Blink clipboard reads ran outside UIKit's
+trusted paste action and triggered OS paste confirmation prompts.
+
+Add UTType conformance matching across ClipboardIOS format probing and reads,
+link UniformTypeIdentifiers.framework on iOS, add Clipboard::PrepareForPaste()
+called synchronously inside -[RenderWidgetUIView paste:] to snapshot the
+pasteboard with a short TTL, and accept URLs and images in canPerformAction:.
+
+---
+ .../render_widget_host_view_ios_uiview.mm          |    9 
+ ui/base/clipboard/BUILD.gn                         |   15 +
+ ui/base/clipboard/clipboard.h                      |    6 
+ ui/base/clipboard/clipboard_ios.h                  |   11 +
+ ui/base/clipboard/clipboard_ios.mm                 |  433 ++++++++++++++++++--
+ 5 files changed, 424 insertions(+), 50 deletions(-)
+
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index 991bb6d78542dc0046b376ead7531534ecc21869..40361bc8186174b775d7ffa38c6df4413f692182 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -14,6 +14,7 @@
+ #include "components/strings/grit/components_strings.h"
+ #include "content/browser/renderer_host/ios_extended_text_input_traits.h"
+ #include "ui/accessibility/platform/browser_accessibility_manager.h"
++#include "ui/base/clipboard/clipboard.h"
+ #include "ui/base/device_form_factor.h"
+ #include "ui/base/ime/text_input_flags.h"
+ #include "ui/base/l10n/l10n_util_mac.h"
+@@ -937,7 +938,10 @@ - (BOOL)canPerformAction:(SEL)action withSender:(nullable id)sender {
+     return hasSelection && _isEditable;
+   }
+   if (action == @selector(paste:)) {
+-    return _isEditable && UIPasteboard.generalPasteboard.hasStrings;
++    UIPasteboard* pasteboard = UIPasteboard.generalPasteboard;
++    return _isEditable &&
++           (pasteboard.hasStrings || pasteboard.hasURLs ||
++            pasteboard.hasImages);
+   }
+   if (action == @selector(select:)) {
+     return _isEditable && !hasSelection && [self hasText];
+@@ -1787,6 +1791,9 @@ - (void)cut:(nullable id)sender {
+ }
+ 
+ - (void)paste:(nullable id)sender {
++  if (ui::Clipboard* clipboard = ui::Clipboard::GetForCurrentThread()) {
++    clipboard->PrepareForPaste();
++  }
+   [self handleEditCommands:{"paste"}];
+ }
+ 
+diff --git a/ui/base/clipboard/BUILD.gn b/ui/base/clipboard/BUILD.gn
+index 793c31c161229c69a7197d1ef9f51c916c31a1bd..11793f0cb099efa8278ef6a119683d4b8ce22978 100644
+--- a/ui/base/clipboard/BUILD.gn
++++ b/ui/base/clipboard/BUILD.gn
+@@ -55,14 +55,14 @@ component("clipboard_types") {
+ 
+   frameworks = []
+   if (is_apple) {
+-    frameworks += [ "Foundation.framework" ]
+-  }
+-  if (is_mac) {
+     frameworks += [
+-      "AppKit.framework",
++      "Foundation.framework",
+       "UniformTypeIdentifiers.framework",
+     ]
+   }
++  if (is_mac) {
++    frameworks += [ "AppKit.framework" ]
++  }
+ }
+ 
+ if (is_linux && use_dbus) {
+@@ -221,6 +221,13 @@ component("clipboard") {
+       "UniformTypeIdentifiers.framework",
+     ]
+   }
++
++  if (is_ios) {
++    frameworks = [
++      "UIKit.framework",
++      "UniformTypeIdentifiers.framework",
++    ]
++  }
+ }
+ 
+ source_set("clipboard_test_support") {
+diff --git a/ui/base/clipboard/clipboard.h b/ui/base/clipboard/clipboard.h
+index b94ebd3166ec0db06b35393508091c18c150416a..42ebab37b636c20c9173d91155e0e8a698d0893f 100644
+--- a/ui/base/clipboard/clipboard.h
++++ b/ui/base/clipboard/clipboard.h
+@@ -158,6 +158,12 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) Clipboard
+ 
+   virtual void OnPreShutdown() = 0;
+ 
++  // Captures a short-lived snapshot of the system pasteboard while the caller
++  // is inside a user-initiated trusted paste action (such as iOS's
++  // -[UIResponder paste:]), so subsequent asynchronous Blink clipboard reads
++  // do not trigger extra OS paste-permission prompts.
++  virtual void PrepareForPaste() {}
++
+   // Gets the source of the current clipboard buffer contents.
+   virtual void GetSource(ClipboardBuffer buffer,
+                          GetSourceCallback callback) const = 0;
+diff --git a/ui/base/clipboard/clipboard_ios.h b/ui/base/clipboard/clipboard_ios.h
+index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..f60f87c261d700a8e359027b26eafb2d94e5ed09 100644
+--- a/ui/base/clipboard/clipboard_ios.h
++++ b/ui/base/clipboard/clipboard_ios.h
+@@ -5,6 +5,7 @@
+ #ifndef UI_BASE_CLIPBOARD_CLIPBOARD_IOS_H_
+ #define UI_BASE_CLIPBOARD_CLIPBOARD_IOS_H_
+ 
++#include <memory>
+ #include <string_view>
+ 
+ #include "base/component_export.h"
+@@ -28,6 +29,7 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
+ 
+   // Clipboard overrides:
+   void OnPreShutdown() override;
++  void PrepareForPaste() override;
+   void GetSource(ClipboardBuffer buffer,
+                  GetSourceCallback callback) const override;
+   const ClipboardSequenceNumberToken& GetSequenceNumber(
+@@ -97,9 +99,18 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
+   void WriteData(const ClipboardFormatType& format,
+                  base::span<const uint8_t> data) override;
+ 
++  struct PasteSnapshot;
++
++  void InvalidatePasteSnapshot() const;
++  const PasteSnapshot* GetActivePasteSnapshot(UIPasteboard* pasteboard) const;
+   std::vector<uint8_t> ReadPngInternal(ClipboardBuffer buffer,
+                                        UIPasteboard* pasteboard) const;
+ 
++  // Short-lived snapshot populated by PrepareForPaste() inside a trusted iOS
++  // paste action so subsequent Blink IPC reads avoid triggering OS paste
++  // confirmation prompts.
++  mutable std::unique_ptr<PasteSnapshot> paste_snapshot_;
++
+   // Mapping of OS-provided sequence number to a unique token.
+   mutable struct {
+     NSInteger sequence_number;
+diff --git a/ui/base/clipboard/clipboard_ios.mm b/ui/base/clipboard/clipboard_ios.mm
+index 92206cbd69bcc6b98b1bd76fe9f21694906edfba..0460eb08d1ac8aa575910e8869e752bd88f19f8d 100644
+--- a/ui/base/clipboard/clipboard_ios.mm
++++ b/ui/base/clipboard/clipboard_ios.mm
+@@ -5,7 +5,9 @@
+ #include "ui/base/clipboard/clipboard_ios.h"
+ 
+ #import <UIKit/UIKit.h>
++#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+ 
++#include <limits>
+ #include <string_view>
+ 
+ #include "base/apple/foundation_util.h"
+@@ -14,6 +16,7 @@
+ #include "base/strings/string_view_util.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
+ #include "base/types/optional_util.h"
+ #include "skia/ext/skia_utils_base.h"
+ #include "skia/ext/skia_utils_ios.h"
+@@ -26,19 +29,234 @@
+ 
+ namespace {
+ 
++constexpr base::TimeDelta kPasteSnapshotTTL = base::Seconds(2);
++
+ UIPasteboard* GetPasteboard() {
+   UIPasteboard* pasteboard = [UIPasteboard generalPasteboard];
+   return pasteboard;
+ }
+ 
+-NSData* GetDataWithTypeFromPasteboard(UIPasteboard* pasteboard,
+-                                      NSString* type) {
++bool ItemsHaveAnyEntries(NSArray<NSDictionary<NSString*, id>*>* items) {
++  for (NSDictionary<NSString*, id>* item in items) {
++    if ([item isKindOfClass:[NSDictionary class]] && item.count > 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool ItemsHaveRasterImage(NSArray<NSDictionary<NSString*, id>*>* items) {
++  for (NSDictionary<NSString*, id>* item in items) {
++    if (![item isKindOfClass:[NSDictionary class]]) {
++      continue;
++    }
++    for (id raw_key in item) {
++      NSString* key = base::apple::ObjCCast<NSString>(raw_key);
++      if (!key) {
++        continue;
++      }
++      UTType* ut = [UTType typeWithIdentifier:key];
++      if (ut && [ut conformsToType:UTTypeImage] &&
++          ![ut conformsToType:UTTypeSVG]) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++NSString* DecodePlainTextValue(id value, NSString* source_key) {
++  if ([value isKindOfClass:[NSString class]]) {
++    return static_cast<NSString*>(value);
++  }
++  if ([value isKindOfClass:[NSURL class]]) {
++    NSString* abs = [static_cast<NSURL*>(value) absoluteString];
++    return abs.length > 0 ? abs : nil;
++  }
++  if ([value isKindOfClass:[NSData class]]) {
++    NSData* data = static_cast<NSData*>(value);
++    if (data.length == 0) {
++      return @"";
++    }
++    base::span<const uint8_t> bytes = base::apple::NSDataToSpan(data);
++    const bool has_utf16_bom =
++        bytes.size() >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) ||
++                              (bytes[0] == 0xFE && bytes[1] == 0xFF));
++    const bool is_utf16_type =
++        [source_key isEqualToString:UTTypeUTF16PlainText.identifier] ||
++        [source_key isEqualToString:UTTypeUTF16ExternalPlainText.identifier];
++    if (has_utf16_bom) {
++      return [[NSString alloc] initWithData:data encoding:NSUTF16StringEncoding];
++    }
++    if (is_utf16_type) {
++      return [[NSString alloc] initWithData:data
++                                   encoding:NSUTF16LittleEndianStringEncoding];
++    }
++    if (bytes.size() >= 6 &&
++        base::as_string_view(bytes.first(6)) == "bplist") {
++      return nil;
++    }
++    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
++  }
++  return nil;
++}
++
++NSData* DataFromPasteboardValue(id value,
++                                NSString* source_key,
++                                NSString* requested_type) {
++  if ([value isKindOfClass:[NSString class]]) {
++    return [static_cast<NSString*>(value)
++        dataUsingEncoding:NSUTF8StringEncoding];
++  }
++  if ([value isKindOfClass:[NSURL class]]) {
++    NSString* abs = [static_cast<NSURL*>(value) absoluteString];
++    return abs.length > 0 ? [abs dataUsingEncoding:NSUTF8StringEncoding] : nil;
++  }
++  if ([value isKindOfClass:[NSData class]]) {
++    NSData* data = static_cast<NSData*>(value);
++    if ([requested_type isEqualToString:UTTypePlainText.identifier] ||
++        [requested_type isEqualToString:UTTypeUTF8PlainText.identifier]) {
++      base::span<const uint8_t> bytes = base::apple::NSDataToSpan(data);
++      const bool has_utf16_bom =
++          bytes.size() >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) ||
++                                (bytes[0] == 0xFE && bytes[1] == 0xFF));
++      const bool is_utf16_type =
++          [source_key isEqualToString:UTTypeUTF16PlainText.identifier] ||
++          [source_key isEqualToString:UTTypeUTF16ExternalPlainText.identifier];
++      if (has_utf16_bom || is_utf16_type) {
++        if (NSString* decoded = DecodePlainTextValue(data, source_key)) {
++          return [decoded dataUsingEncoding:NSUTF8StringEncoding];
++        }
++      }
++    }
++    return data;
++  }
++  return nil;
++}
++
++NSArray<NSData*>* ExtractDataForTypeFromItems(
++    NSArray<NSDictionary<NSString*, id>*>* items,
++    NSString* requested_type) {
++  if (items.count == 0 || requested_type.length == 0) {
++    return nil;
++  }
++  UTType* requested_ut = [UTType typeWithIdentifier:requested_type];
++  const bool wants_plain_text =
++      requested_ut && [requested_ut isEqual:UTTypePlainText];
++  NSMutableArray<NSData*>* results = nil;
++
++  for (NSDictionary<NSString*, id>* item in items) {
++    if (![item isKindOfClass:[NSDictionary class]]) {
++      continue;
++    }
++    NSString* matched_key = nil;
++    id matched_val = item[requested_type];
++    if (matched_val) {
++      matched_key = requested_type;
++    } else if (requested_ut) {
++      if (wants_plain_text && item[UTTypeUTF8PlainText.identifier]) {
++        matched_key = UTTypeUTF8PlainText.identifier;
++        matched_val = item[matched_key];
++      } else {
++        NSString* url_fallback_key = nil;
++        id url_fallback_val = nil;
++        for (id raw_key in item) {
++          NSString* key = base::apple::ObjCCast<NSString>(raw_key);
++          if (!key) {
++            continue;
++          }
++          UTType* ut = [UTType typeWithIdentifier:key];
++          if (!ut) {
++            continue;
++          }
++          if ([ut conformsToType:requested_ut]) {
++            matched_key = key;
++            matched_val = item[key];
++            break;
++          }
++          if (wants_plain_text && !url_fallback_key &&
++              [ut conformsToType:UTTypeURL] &&
++              ![ut conformsToType:UTTypeFileURL]) {
++            url_fallback_key = key;
++            url_fallback_val = item[key];
++          }
++        }
++        if (!matched_key && url_fallback_key && url_fallback_val) {
++          matched_key = url_fallback_key;
++          matched_val = url_fallback_val;
++        }
++      }
++    }
++    if (!matched_key || !matched_val) {
++      continue;
++    }
++    if (NSData* data =
++            DataFromPasteboardValue(matched_val, matched_key, requested_type)) {
++      if (!results) {
++        results = [NSMutableArray arrayWithCapacity:items.count];
++      }
++      [results addObject:data];
++    }
++  }
++  return results.count > 0 ? [results copy] : nil;
++}
++
++}  // namespace
++
++struct ClipboardIOS::PasteSnapshot {
++  NSInteger change_count = NSNotFound;
++  base::TimeTicks expires_at;
++  NSArray<NSDictionary<NSString*, id>*>* items = nil;
++  UIImage* image = nil;
++};
++
++namespace {
++
++NSArray<NSDictionary<NSString*, id>*>* GetItemsForRead(
++    UIPasteboard* pasteboard,
++    const ClipboardIOS::PasteSnapshot* snapshot) {
+   CHECK(pasteboard, base::NotFatalUntil::M163);
+-  auto items = [pasteboard dataForPasteboardType:type inItemSet:nil];
+-  if (!items) {
+-    return nullptr;
++  if (snapshot) {
++    return snapshot->items;
++  }
++  NSArray<NSDictionary<NSString*, id>*>* items = pasteboard.items;
++  if (items.count > 0 && !ItemsHaveAnyEntries(items)) {
++    if (NSString* str = pasteboard.string; str.length > 0) {
++      return @[ @{UTTypeUTF8PlainText.identifier : [str copy]} ];
++    }
++    if (NSURL* url = pasteboard.URL; url.absoluteString.length > 0) {
++      return @[ @{UTTypeURL.identifier : [url.absoluteString copy]} ];
++    }
+   }
+-  return [items firstObject];
++  return items;
++}
++
++NSArray<NSData*>* GetAllDataForType(
++    UIPasteboard* pasteboard,
++    const ClipboardIOS::PasteSnapshot* snapshot,
++    NSString* requested_type) {
++  CHECK(pasteboard, base::NotFatalUntil::M163);
++  if (requested_type.length == 0) {
++    return nil;
++  }
++  if (snapshot) {
++    return ExtractDataForTypeFromItems(snapshot->items, requested_type);
++  }
++  NSArray<NSDictionary<NSString*, id>*>* items =
++      GetItemsForRead(pasteboard, nullptr);
++  if (NSArray<NSData*>* extracted =
++          ExtractDataForTypeFromItems(items, requested_type)) {
++    return extracted;
++  }
++  return [pasteboard dataForPasteboardType:requested_type inItemSet:nil];
++}
++
++NSData* GetDataForType(UIPasteboard* pasteboard,
++                       const ClipboardIOS::PasteSnapshot* snapshot,
++                       NSString* requested_type) {
++  NSArray<NSData*>* items =
++      GetAllDataForType(pasteboard, snapshot, requested_type);
++  return items.count > 0 ? items.firstObject : nil;
+ }
+ 
+ }  // namespace
+@@ -56,7 +274,58 @@
+   CHECK(CalledOnValidThread(), base::NotFatalUntil::M163);
+ }
+ 
+-void ClipboardIOS::OnPreShutdown() {}
++void ClipboardIOS::OnPreShutdown() {
++  InvalidatePasteSnapshot();
++}
++
++void ClipboardIOS::InvalidatePasteSnapshot() const {
++  paste_snapshot_.reset();
++}
++
++const ClipboardIOS::PasteSnapshot* ClipboardIOS::GetActivePasteSnapshot(
++    UIPasteboard* pasteboard) const {
++  if (!paste_snapshot_ || !pasteboard) {
++    return nullptr;
++  }
++  if (paste_snapshot_->change_count != pasteboard.changeCount ||
++      base::TimeTicks::Now() >= paste_snapshot_->expires_at) {
++    paste_snapshot_.reset();
++    return nullptr;
++  }
++  return paste_snapshot_.get();
++}
++
++void ClipboardIOS::PrepareForPaste() {
++  CHECK(CalledOnValidThread(), base::NotFatalUntil::M163);
++  UIPasteboard* pasteboard = GetPasteboard();
++  if (!pasteboard) {
++    InvalidatePasteSnapshot();
++    return;
++  }
++  const NSInteger change_count = pasteboard.changeCount;
++  NSArray<NSDictionary<NSString*, id>*>* raw_items = pasteboard.items;
++  NSMutableArray<NSDictionary<NSString*, id>*>* items =
++      raw_items.count > 0 ? [raw_items mutableCopy] : [NSMutableArray array];
++  if (!ItemsHaveAnyEntries(items)) {
++    if (NSString* str = pasteboard.string; str.length > 0) {
++      items = [NSMutableArray arrayWithObject:@{
++        UTTypeUTF8PlainText.identifier : [str copy],
++      }];
++    } else if (NSURL* url = pasteboard.URL; url.absoluteString.length > 0) {
++      items = [NSMutableArray arrayWithObject:@{
++        UTTypeURL.identifier : [url.absoluteString copy],
++      }];
++    }
++  }
++  UIImage* image = ItemsHaveRasterImage(items) ? pasteboard.image : nil;
++
++  auto snapshot = std::make_unique<PasteSnapshot>();
++  snapshot->change_count = change_count;
++  snapshot->expires_at = base::TimeTicks::Now() + kPasteSnapshotTTL;
++  snapshot->items = [items copy];
++  snapshot->image = image;
++  paste_snapshot_ = std::move(snapshot);
++}
+ 
+ // DataTransferEndpoint is not used on this platform.
+ void ClipboardIOS::GetSource(ClipboardBuffer buffer,
+@@ -87,14 +356,54 @@
+   CHECK(CalledOnValidThread(), base::NotFatalUntil::M163);
+   CHECK_EQ(buffer, ClipboardBuffer::kCopyPaste, base::NotFatalUntil::M163);
+ 
+-  NSArray<NSDictionary<NSString*, id>*>* items = GetPasteboard().items;
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSArray<NSDictionary<NSString*, id>*>* items =
++      GetItemsForRead(pasteboard, GetActivePasteSnapshot(pasteboard));
+   base::flat_set<ClipboardFormatType> formats;
+   for (NSDictionary<NSString*, id>* item in items) {
+-    for (NSString* type in item) {
++    if (![item isKindOfClass:[NSDictionary class]]) {
++      continue;
++    }
++    for (id raw_type in item) {
++      NSString* type = base::apple::ObjCCast<NSString>(raw_type);
++      if (!type) {
++        continue;
++      }
+       std::string type_utf8 = base::SysNSStringToUTF8(type);
+       if (base::IsStringASCII(type_utf8)) {
+         formats.insert(ClipboardFormatType::Deserialize(type_utf8));
+       }
++      UTType* ut = [UTType typeWithIdentifier:type];
++      if (!ut) {
++        continue;
++      }
++      // On iOS, plain text from UIKit, SwiftUI, Safari, and Universal Clipboard
++      // is stored under subtypes such as "public.utf8-plain-text", whereas
++      // ClipboardFormatType::PlainTextType() checks "public.plain-text". Map
++      // conforming UTIs to Blink's canonical ClipboardFormatType entries.
++      if ([ut conformsToType:UTTypePlainText]) {
++        formats.insert(ClipboardFormatType::PlainTextType());
++      } else if ([ut conformsToType:UTTypeURL] &&
++                 ![ut conformsToType:UTTypeFileURL]) {
++        formats.insert(ClipboardFormatType::UrlType());
++        formats.insert(ClipboardFormatType::PlainTextType());
++      }
++      if ([ut conformsToType:UTTypeHTML]) {
++        formats.insert(ClipboardFormatType::HtmlType());
++      }
++      if ([ut conformsToType:UTTypeRTF]) {
++        formats.insert(ClipboardFormatType::RtfType());
++      }
++      if ([ut conformsToType:UTTypeSVG]) {
++        formats.insert(ClipboardFormatType::SvgType());
++      }
++      if ([ut conformsToType:UTTypePNG]) {
++        formats.insert(ClipboardFormatType::PngType());
++      }
++      if ([ut conformsToType:UTTypeImage] && ![ut conformsToType:UTTypeSVG]) {
++        formats.insert(ClipboardFormatType::PngType());
++        formats.insert(ClipboardFormatType::BitmapType());
++      }
+     }
+   }
+ 
+@@ -144,6 +453,7 @@
+   CHECK(CalledOnValidThread(), base::NotFatalUntil::M163);
+   CHECK_EQ(buffer, ClipboardBuffer::kCopyPaste, base::NotFatalUntil::M163);
+ 
++  InvalidatePasteSnapshot();
+   [GetPasteboard() setItems:@[]];
+ }
+ 
+@@ -157,17 +467,18 @@
+   GetStandardFormats(
+       buffer, data_dst,
+       base::BindOnce(
+-          [](ReadAvailableTypesCallback callback,
++          [](const ClipboardIOS* clipboard, ReadAvailableTypesCallback callback,
+              std::vector<std::u16string> types) {
+-            NSData* data = GetDataWithTypeFromPasteboard(
+-                GetPasteboard(),
++            UIPasteboard* pasteboard = GetPasteboard();
++            NSData* data = GetDataForType(
++                pasteboard, clipboard->GetActivePasteSnapshot(pasteboard),
+                 (NSString*)kUTTypeChromiumDataTransferCustomData);
+             if (data) {
+               ReadCustomDataTypes(base::apple::NSDataToSpan(data), &types);
+             }
+             std::move(callback).Run(std::move(types));
+           },
+-          std::move(callback)));
++          base::Unretained(this), std::move(callback)));
+ }
+ 
+ // |data_dst| is not used. It's only passed to be consistent with other
+@@ -180,12 +491,16 @@
+   RecordRead(ClipboardFormatMetric::kText);
+ 
+   std::u16string result;
+-  NSData* data = GetDataWithTypeFromPasteboard(
+-      GetPasteboard(), ClipboardFormatType::PlainTextType().ToNSString());
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSData* data = GetDataForType(
++      pasteboard, GetActivePasteSnapshot(pasteboard),
++      ClipboardFormatType::PlainTextType().ToNSString());
+   if (data) {
+     NSString* contents = [[NSString alloc] initWithData:data
+                                                encoding:NSUTF8StringEncoding];
+-    result.assign(base::SysNSStringToUTF16(contents));
++    if (contents) {
++      result.assign(base::SysNSStringToUTF16(contents));
++    }
+   }
+   std::move(callback).Run(std::move(result));
+ }
+@@ -201,12 +516,16 @@
+   RecordRead(ClipboardFormatMetric::kText);
+ 
+   std::string result;
+-  NSData* data = GetDataWithTypeFromPasteboard(
+-      GetPasteboard(), ClipboardFormatType::PlainTextType().ToNSString());
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSData* data = GetDataForType(
++      pasteboard, GetActivePasteSnapshot(pasteboard),
++      ClipboardFormatType::PlainTextType().ToNSString());
+   if (data) {
+     NSString* contents = [[NSString alloc] initWithData:data
+                                                encoding:NSUTF8StringEncoding];
+-    result.assign(base::SysNSStringToUTF8(contents));
++    if (contents) {
++      result.assign(base::SysNSStringToUTF8(contents));
++    }
+   }
+   std::move(callback).Run(std::move(result));
+ }
+@@ -221,23 +540,26 @@
+   RecordRead(ClipboardFormatMetric::kHtml);
+ 
+   std::u16string markup;
+-  NSString* best_type = nil;
++  UIPasteboard* pasteboard = GetPasteboard();
++  const PasteSnapshot* snapshot = GetActivePasteSnapshot(pasteboard);
++  NSData* data = nil;
+   for (NSString* type in @[
+          ClipboardFormatType::HtmlType().ToNSString(),
+          ClipboardFormatType::RtfType().ToNSString(),
+          ClipboardFormatType::PlainTextType().ToNSString()
+        ]) {
+-    if ([GetPasteboard() containsPasteboardTypes:@[ type ]]) {
+-      best_type = type;
++    data = GetDataForType(pasteboard, snapshot, type);
++    if (data) {
+       break;
+     }
+   }
+ 
+-  NSData* data = GetDataWithTypeFromPasteboard(GetPasteboard(), best_type);
+   if (data) {
+     NSString* contents = [[NSString alloc] initWithData:data
+                                                encoding:NSUTF8StringEncoding];
+-    markup = base::SysNSStringToUTF16(contents);
++    if (contents) {
++      markup = base::SysNSStringToUTF16(contents);
++    }
+   }
+ 
+   uint32_t fragment_start = 0;
+@@ -260,12 +582,15 @@
+   RecordRead(ClipboardFormatMetric::kSvg);
+ 
+   std::u16string result;
+-  NSData* data = GetDataWithTypeFromPasteboard(
+-      GetPasteboard(), ClipboardFormatType::SvgType().ToNSString());
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSData* data = GetDataForType(pasteboard, GetActivePasteSnapshot(pasteboard),
++                                ClipboardFormatType::SvgType().ToNSString());
+   if (data) {
+     NSString* contents = [[NSString alloc] initWithData:data
+                                                encoding:NSUTF8StringEncoding];
+-    result = base::SysNSStringToUTF16(contents);
++    if (contents) {
++      result = base::SysNSStringToUTF16(contents);
++    }
+   }
+   std::move(callback).Run(std::move(result));
+ }
+@@ -306,8 +631,10 @@
+   RecordRead(ClipboardFormatMetric::kCustomData);
+ 
+   std::u16string result;
+-  NSData* data = GetDataWithTypeFromPasteboard(
+-      GetPasteboard(), (NSString*)kUTTypeChromiumDataTransferCustomData);
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSData* data =
++      GetDataForType(pasteboard, GetActivePasteSnapshot(pasteboard),
++                     (NSString*)kUTTypeChromiumDataTransferCustomData);
+   if (data) {
+     if (std::optional<std::u16string> maybe_result =
+             ReadCustomDataForType(base::apple::NSDataToSpan(data), type);
+@@ -328,9 +655,10 @@
+   CHECK_EQ(buffer, ClipboardBuffer::kCopyPaste, base::NotFatalUntil::M163);
+   RecordRead(ClipboardFormatMetric::kFilenames);
+ 
+-  auto items = [GetPasteboard()
+-      dataForPasteboardType:ClipboardFormatType::FilenamesType().ToNSString()
+-                  inItemSet:nil];
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSArray<NSData*>* items = GetAllDataForType(
++      pasteboard, GetActivePasteSnapshot(pasteboard),
++      ClipboardFormatType::FilenamesType().ToNSString());
+   if (!items) {
+     std::move(callback).Run({});
+     return;
+@@ -341,10 +669,12 @@
+     if (item) {
+       NSString* file_str = [[NSString alloc] initWithData:item
+                                                  encoding:NSUTF8StringEncoding];
+-      NSURL* file_url = [NSURL URLWithString:file_str];
+-      files.emplace_back(
+-          base::apple::NSURLToFilePath(file_url),
+-          base::apple::NSStringToFilePath(file_url.lastPathComponent));
++      NSURL* file_url = file_str ? [NSURL URLWithString:file_str] : nil;
++      if (file_url) {
++        files.emplace_back(
++            base::apple::NSURLToFilePath(file_url),
++            base::apple::NSStringToFilePath(file_url.lastPathComponent));
++      }
+     }
+   }
+   std::move(callback).Run(std::move(files));
+@@ -358,21 +688,26 @@
+   RecordRead(ClipboardFormatMetric::kUrl);
+ 
+   std::string url;
+-  NSData* url_data = GetDataWithTypeFromPasteboard(
+-      GetPasteboard(), ClipboardFormatType::UrlType().ToNSString());
++  UIPasteboard* pasteboard = GetPasteboard();
++  const PasteSnapshot* snapshot = GetActivePasteSnapshot(pasteboard);
++  NSData* url_data = GetDataForType(
++      pasteboard, snapshot, ClipboardFormatType::UrlType().ToNSString());
+   if (url_data) {
+     NSString* contents = [[NSString alloc] initWithData:url_data
+                                                encoding:NSUTF8StringEncoding];
+-    url.assign(base::SysNSStringToUTF8(contents));
++    if (contents) {
++      url.assign(base::SysNSStringToUTF8(contents));
++    }
+   }
+ 
+   std::u16string title;
+-  NSData* title_data =
+-      GetDataWithTypeFromPasteboard(GetPasteboard(), kUTTypeUrlName);
++  NSData* title_data = GetDataForType(pasteboard, snapshot, kUTTypeUrlName);
+   if (title_data) {
+     NSString* contents = [[NSString alloc] initWithData:title_data
+                                                encoding:NSUTF8StringEncoding];
+-    title.assign(base::SysNSStringToUTF16(contents));
++    if (contents) {
++      title.assign(base::SysNSStringToUTF16(contents));
++    }
+   }
+   ClipboardUrlInfo url_info;
+   url_info.url = GURL(url);
+@@ -389,8 +724,9 @@
+   RecordRead(ClipboardFormatMetric::kData);
+ 
+   std::string result;
+-  NSData* data =
+-      GetDataWithTypeFromPasteboard(GetPasteboard(), format.ToNSString());
++  UIPasteboard* pasteboard = GetPasteboard();
++  NSData* data = GetDataForType(pasteboard, GetActivePasteSnapshot(pasteboard),
++                                format.ToNSString());
+   if (data) {
+     result.assign(base::as_string_view(base::apple::NSDataToSpan(data)));
+   }
+@@ -409,6 +745,7 @@
+   CHECK(CalledOnValidThread(), base::NotFatalUntil::M163);
+   CHECK_EQ(buffer, ClipboardBuffer::kCopyPaste, base::NotFatalUntil::M163);
+ 
++  InvalidatePasteSnapshot();
+   [GetPasteboard() setItems:@[]];
+ 
+   DispatchPlatformRepresentations(std::move(platform_representations));
+@@ -492,6 +829,7 @@
+ }
+ 
+ void ClipboardIOS::WriteBitmap(const SkBitmap& bitmap) {
++  InvalidatePasteSnapshot();
+   // The bitmap type is sanitized to be N32 before we get here. The conversion
+   // to a UIImage would not explode if we got this wrong, so this is not a
+   // security CHECK.
+@@ -521,7 +859,12 @@
+   CHECK_EQ(buffer, ClipboardBuffer::kCopyPaste, base::NotFatalUntil::M163);
+   CHECK(pasteboard, base::NotFatalUntil::M163);
+ 
+-  UIImage* image = pasteboard.image;
++  UIImage* image = nil;
++  if (const PasteSnapshot* snapshot = GetActivePasteSnapshot(pasteboard)) {
++    image = snapshot->image;
++  } else {
++    image = pasteboard.image;
++  }
+   if (!image) {
+     return std::vector<uint8_t>();
+   }

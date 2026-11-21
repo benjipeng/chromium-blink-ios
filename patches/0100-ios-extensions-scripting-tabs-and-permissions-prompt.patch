@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS extensions: scripting permission, tabs.TAB_ID_NONE, and native permissions prompt
+
+Add tabs.TAB_ID_NONE (-1) to the iOS tabs schema, register the MV3 scripting API
+permission and permission feature in IOSExtensionsAPIProvider so extensions like
+uBlock Origin Lite load cleanly, and implement GetNativeWindowForFunction and
+CreateInstallPromptForNativeWindow in IOSExtensionsBrowserClient using a native
+UIAlertController with transition-aware presentation and a dealloc sentinel so
+chrome.permissions.request() always settles.
+
+---
+ .../model/ios_extensions_browser_client.h          |   7 +
+ .../model/ios_extensions_browser_client.mm         | 405 +++++++++++++++++++++
+ ios/web/content/init/extensions/BUILD.gn           |   8 +
+ .../init/extensions/ios_extensions_api_provider.cc |  18 +-
+ .../init/extensions/ios_permission_features.json   |   7 +
+ ios/web/content/init/extensions/tabs.json          |   7 +
+ 6 files changed, 450 insertions(+), 2 deletions(-)
+
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index 99915d800a80cf8c39ef00dbabccf8398c177381..fa92cdc282d1bbb536bdb240cef05e5fdea33bec 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -232,6 +232,13 @@ class IOSExtensionsBrowserClient final : public ExtensionsBrowserClient {
+       const ExtensionId& extension_id,
+       const base::Version& extension_version,
+       base::OnceCallback<void(bool, std::u16string)> callback) override;
++  gfx::NativeWindow GetNativeWindowForFunction(
++      ExtensionFunction& function) override;
++  std::unique_ptr<ExtensionInstallPromptClient>
++  CreateInstallPromptForNativeWindow(
++      gfx::NativeWindow native_window,
++      content::BrowserContext& browser_context,
++      std::unique_ptr<InstallPromptData> prompt) override;
+ 
+  private:
+   class IOSKioskDelegate final : public KioskDelegate {
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 168b71b6d954a9734ed7470bc7cc830a69ff5da0..6a8bdd0da2faff372a9409b93cc005375673816c 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -6,6 +6,7 @@
+ 
+ #import <Foundation/Foundation.h>
+ #import <UIKit/UIKit.h>
++#import <objc/runtime.h>
+ 
+ #include <map>
+ #include <memory>
+@@ -15,6 +16,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/apple/foundation_util.h"
+ #include "base/base_paths.h"
+ #include "base/check.h"
+ #include "base/command_line.h"
+@@ -25,6 +27,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
+ #include "base/strings/sys_string_conversions.h"
+@@ -62,7 +65,9 @@
+ #include "extensions/browser/disable_reason.h"
+ #include "extensions/browser/extension_action.h"
+ #include "extensions/browser/extension_action_manager.h"
++#include "extensions/browser/extension_function.h"
+ #include "extensions/browser/extension_host_delegate.h"
++#include "extensions/browser/extension_install_prompt_client.h"
+ #include "extensions/browser/extension_prefs.h"
+ #include "extensions/browser/extension_registrar.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -70,6 +75,7 @@
+ #include "extensions/browser/extension_host_registry.h"
+ #include "extensions/browser/extension_system.h"
+ #include "extensions/browser/extensions_browser_interface_binders.h"
++#include "extensions/browser/install_prompt_data.h"
+ #include "extensions/browser/load_error_reporter.h"
+ #include "extensions/browser/management_policy.h"
+ #include "extensions/browser/permissions_manager.h"
+@@ -91,8 +97,10 @@
+ #include "extensions/common/manifest_handlers/options_page_info.h"
+ #include "extensions/common/manifest_handlers/permissions_parser.h"
+ #include "extensions/common/mojom/manifest.mojom-shared.h"
++#include "extensions/common/permissions/api_permission.h"
+ #include "extensions/common/permissions/manifest_permission.h"
+ #include "extensions/common/permissions/permission_set.h"
++#include "extensions/common/permissions/permissions_data.h"
+ #include "extensions/common/switches.h"
+ #include "ios/chrome/browser/extensions/model/ios_commands_api.h"
+ #include "ios/chrome/browser/extensions/model/ios_extension_system_factory.h"
+@@ -115,6 +123,7 @@
+ #include "ui/base/accelerators/command.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/gfx/image/image.h"
++#include "ui/gfx/native_ui_types.h"
+ #include "third_party/blink/public/mojom/mediastream/media_stream.mojom.h"
+ #include "url/gurl.h"
+ 
+@@ -188,6 +197,38 @@ - (void)installExtensionFromTrustedDirectory:(NSString*)directoryPath
+                                                        NSError*))completion;
+ @end
+ 
++@interface CrIOSExtensionInstallPromptSentinel : NSObject
++- (instancetype)initWithOnDealloc:(base::OnceClosure)onDealloc;
++- (void)disarm;
++@end
++
++@implementation CrIOSExtensionInstallPromptSentinel {
++  base::OnceClosure _onDealloc;
++}
++
++- (instancetype)initWithOnDealloc:(base::OnceClosure)onDealloc {
++  self = [super init];
++  if (self) {
++    _onDealloc = std::move(onDealloc);
++  }
++  return self;
++}
++
++- (void)disarm {
++  _onDealloc.Reset();
++}
++
++- (void)dealloc {
++  if (_onDealloc) {
++    __block base::OnceClosure callback = std::move(_onDealloc);
++    dispatch_async(dispatch_get_main_queue(), ^{
++      std::move(callback).Run();
++    });
++  }
++}
++
++@end
++
+ namespace {
+ 
+ NSString* const kCrIOSExtensionManagerErrorDomain =
+@@ -1451,6 +1492,348 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   return context && !context->IsOffTheRecord() && IsValidContext(context);
+ }
+ 
++namespace {
++
++char kCrIOSInstallPromptSentinelKey;
++
++UIWindow* FindActivePresentationWindow(gfx::NativeWindow preferred_window) {
++  if (UIWindow* preferred = preferred_window.Get();
++      preferred && !preferred.hidden && preferred.alpha > 0.0 &&
++      preferred.rootViewController) {
++    return preferred;
++  }
++  UIWindow* fallback = nil;
++  for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
++    UIWindowScene* window_scene = base::apple::ObjCCast<UIWindowScene>(scene);
++    if (!window_scene) {
++      continue;
++    }
++    UIWindow* candidate = window_scene.keyWindow;
++    if (!candidate || candidate.hidden || candidate.alpha <= 0.0 ||
++        !candidate.rootViewController) {
++      candidate = nil;
++      for (UIWindow* w in window_scene.windows) {
++        if (!w.hidden && w.alpha > 0.0 && w.rootViewController) {
++          candidate = w;
++          break;
++        }
++      }
++    }
++    if (candidate &&
++        window_scene.activationState == UISceneActivationStateForegroundActive) {
++      return candidate;
++    }
++    if (candidate && !fallback) {
++      fallback = candidate;
++    }
++  }
++  return fallback;
++}
++
++UIViewController* FindTopmostViewController(UIWindow* window) {
++  UIViewController* vc = window.rootViewController;
++  while (vc.presentedViewController &&
++         !vc.presentedViewController.isBeingDismissed) {
++    vc = vc.presentedViewController;
++  }
++  return vc;
++}
++
++class IOSExtensionInstallPromptClient final
++    : public extensions::ExtensionInstallPromptClient {
++ public:
++  IOSExtensionInstallPromptClient(
++      gfx::NativeWindow native_window,
++      std::unique_ptr<extensions::InstallPromptData> prompt)
++      : native_window_(native_window), prompt_(std::move(prompt)) {}
++
++  IOSExtensionInstallPromptClient(const IOSExtensionInstallPromptClient&) =
++      delete;
++  IOSExtensionInstallPromptClient& operator=(
++      const IOSExtensionInstallPromptClient&) = delete;
++
++  ~IOSExtensionInstallPromptClient() override {
++    weak_ptr_factory_.InvalidateWeakPtrs();
++    if (sentinel_) {
++      [sentinel_ disarm];
++      sentinel_ = nil;
++    }
++    if (UIAlertController* alert = presented_alert_;
++        alert && alert.presentingViewController) {
++      [alert dismissViewControllerAnimated:NO completion:nil];
++    }
++    presented_alert_ = nil;
++  }
++
++  void OnInstallSuccess(scoped_refptr<const extensions::Extension> extension,
++                        SkBitmap* icon) override {}
++  void OnInstallFailure(const extensions::CrxInstallError& error) override {}
++  void SetUseAppInstalledBubble(bool use_bubble) override {}
++  void SetSkipPostInstallUI(bool skip_ui) override {}
++
++  void ConfirmInstall(DoneCallback install_callback,
++                      const extensions::Extension* extension) override {
++    std::unique_ptr<const extensions::PermissionSet> perms;
++    if (extension && extension->permissions_data()) {
++      perms = extension->permissions_data()->active_permissions().Clone();
++    }
++    ShowDialogInternal(std::move(install_callback), extension,
++                       std::move(perms));
++  }
++
++  void ConfirmReEnable(DoneCallback install_callback,
++                       const extensions::Extension* extension,
++                       content::BrowserContext* browser_context) override {
++    ConfirmInstall(std::move(install_callback), extension);
++  }
++
++  void ConfirmPermissions(
++      DoneCallback done_callback,
++      const extensions::Extension* extension,
++      std::unique_ptr<const extensions::PermissionSet> custom_permissions)
++      override {
++    ShowDialogInternal(std::move(done_callback), extension,
++                       std::move(custom_permissions));
++  }
++
++  void ShowInstallDialog(DoneCallback install_callback,
++                         const extensions::Extension* extension,
++                         const SkBitmap* icon) override {
++    ConfirmInstall(std::move(install_callback), extension);
++  }
++
++ private:
++  void ShowDialogInternal(
++      DoneCallback done_callback,
++      const extensions::Extension* extension,
++      std::unique_ptr<const extensions::PermissionSet> permissions) {
++    DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++    done_callback_ = std::move(done_callback);
++
++    if (!prompt_) {
++      prompt_ = std::make_unique<extensions::InstallPromptData>(
++          extensions::InstallPromptData::PERMISSIONS_PROMPT);
++    }
++    if (extension) {
++      prompt_->set_extension(extension);
++    }
++    if (permissions && !permissions->IsEmpty()) {
++      prompt_->AddPermissionSet(*permissions);
++    }
++
++    NSString* ext_name =
++        (extension && !extension->name().empty())
++            ? base::SysUTF8ToNSString(extension->name())
++            : @"This extension";
++
++    std::u16string title_16 =
++        extension ? prompt_->GetDialogTitle() : std::u16string();
++    NSString* title =
++        !title_16.empty()
++            ? base::SysUTF16ToNSString(title_16)
++            : [NSString stringWithFormat:
++                            @"Allow “%@” to access additional site data?",
++                            ext_name];
++
++    NSMutableArray<NSString*>* lines = [NSMutableArray array];
++    const size_t perm_count = prompt_->GetPermissionCount();
++    if (perm_count > 0) {
++      std::u16string heading_16 = prompt_->GetPermissionsHeading();
++      if (!heading_16.empty()) {
++        [lines addObject:base::SysUTF16ToNSString(heading_16)];
++      }
++      for (size_t i = 0; i < perm_count; ++i) {
++        std::u16string perm_16 = prompt_->GetPermission(i);
++        if (!perm_16.empty()) {
++          [lines addObject:[NSString stringWithFormat:@"• %@",
++                                                      base::SysUTF16ToNSString(
++                                                          perm_16)]];
++        }
++      }
++    }
++    if (permissions && !permissions->IsEmpty()) {
++      constexpr size_t kMaxListedHosts = 5;
++      size_t host_count = 0;
++      size_t total_hosts = 0;
++      bool matches_all_urls = false;
++      for (const URLPattern& pattern : permissions->effective_hosts()) {
++        ++total_hosts;
++        if (pattern.match_all_urls()) {
++          matches_all_urls = true;
++          break;
++        }
++        if (host_count < kMaxListedHosts) {
++          [lines addObject:[NSString stringWithFormat:@"• %@",
++                                                      base::SysUTF8ToNSString(
++                                                          pattern.GetAsString())]];
++          ++host_count;
++        }
++      }
++      if (matches_all_urls) {
++        [lines addObject:@"• All websites"];
++      } else if (total_hosts > kMaxListedHosts) {
++        [lines addObject:[NSString
++                             stringWithFormat:@"• …and %zu more sites",
++                                              total_hosts - kMaxListedHosts]];
++      }
++      for (const extensions::APIPermission* api_perm : permissions->apis()) {
++        if (api_perm && api_perm->name() && api_perm->name()[0] != '\0') {
++          [lines addObject:[NSString stringWithFormat:@"• API: %s",
++                                                      api_perm->name()]];
++        }
++      }
++    }
++    NSString* message =
++        lines.count > 0
++            ? [lines componentsJoinedByString:@"\n"]
++            : @"This extension is requesting optional permissions to read and "
++              @"change data on websites.";
++
++    std::u16string accept_16 = prompt_->GetAcceptButtonLabel();
++    NSString* accept_title =
++        !accept_16.empty() ? base::SysUTF16ToNSString(accept_16) : @"Allow";
++    std::u16string abort_16 = prompt_->GetAbortButtonLabel();
++    NSString* cancel_title =
++        !abort_16.empty() ? base::SysUTF16ToNSString(abort_16) : @"Deny";
++
++    UIAlertController* alert =
++        [UIAlertController alertControllerWithTitle:title
++                                            message:message
++                                     preferredStyle:UIAlertControllerStyleAlert];
++
++    base::WeakPtr<IOSExtensionInstallPromptClient> weak_self =
++        weak_ptr_factory_.GetWeakPtr();
++
++    // Guarantees `done_callback_` settles with USER_CANCELED if UIKit drops
++    // presentation or dismisses the alert externally (e.g. parent popup sheet
++    // closes on backgrounding) so PermissionsRequestFunction never hangs.
++    CrIOSExtensionInstallPromptSentinel* sentinel =
++        [[CrIOSExtensionInstallPromptSentinel alloc]
++            initWithOnDealloc:base::BindOnce(
++                                  &IOSExtensionInstallPromptClient::Complete,
++                                  weak_self, Result::USER_CANCELED)];
++    sentinel_ = sentinel;
++    objc_setAssociatedObject(alert, &kCrIOSInstallPromptSentinelKey, sentinel,
++                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++
++    [alert addAction:[UIAlertAction
++                         actionWithTitle:cancel_title
++                                   style:UIAlertActionStyleCancel
++                                 handler:^(UIAlertAction*) {
++                                   if (weak_self) {
++                                     weak_self->Complete(Result::USER_CANCELED);
++                                   }
++                                 }]];
++    [alert addAction:[UIAlertAction
++                         actionWithTitle:accept_title
++                                   style:UIAlertActionStyleDefault
++                                 handler:^(UIAlertAction*) {
++                                   if (weak_self) {
++                                     weak_self->Complete(Result::ACCEPTED);
++                                   }
++                                 }]];
++
++    presented_alert_ = alert;
++    PresentAlertWithRetry(alert, /*remaining_attempts=*/3);
++  }
++
++  void PresentAlertWithRetry(UIAlertController* alert, int remaining_attempts) {
++    if (!done_callback_) {
++      return;
++    }
++    UIWindow* window = FindActivePresentationWindow(native_window_);
++    UIViewController* presenter =
++        window ? FindTopmostViewController(window) : nil;
++    if (!presenter) {
++      CancelAsync();
++      return;
++    }
++
++    // Wait out an active dismissal (for example, an extension popup sheet
++    // closing right as it triggers chrome.permissions.request) so UIKit does
++    // not silently drop presentViewController:.
++    UIViewController* dismissing_child = presenter.presentedViewController;
++    if (dismissing_child || presenter.isBeingDismissed) {
++      if (remaining_attempts <= 0) {
++        CancelAsync();
++        return;
++      }
++      base::WeakPtr<IOSExtensionInstallPromptClient> weak_self =
++          weak_ptr_factory_.GetWeakPtr();
++      id<UIViewControllerTransitionCoordinator> coordinator =
++          dismissing_child.transitionCoordinator
++              ?: presenter.transitionCoordinator;
++      if (coordinator) {
++        [coordinator
++            animateAlongsideTransition:nil
++                            completion:^(
++                                id<UIViewControllerTransitionCoordinatorContext>) {
++                              dispatch_async(dispatch_get_main_queue(), ^{
++                                if (weak_self) {
++                                  weak_self->PresentAlertWithRetry(
++                                      alert, remaining_attempts - 1);
++                                }
++                              });
++                            }];
++      } else {
++        dispatch_after(
++            dispatch_time(DISPATCH_TIME_NOW,
++                          static_cast<int64_t>(0.15 * NSEC_PER_SEC)),
++            dispatch_get_main_queue(), ^{
++              if (weak_self) {
++                weak_self->PresentAlertWithRetry(alert, remaining_attempts - 1);
++              }
++            });
++      }
++      return;
++    }
++
++    if (prompt_) {
++      prompt_->OnDialogOpened();
++    }
++    [presenter presentViewController:alert animated:YES completion:nil];
++  }
++
++  void CancelAsync() {
++    base::WeakPtr<IOSExtensionInstallPromptClient> weak_self =
++        weak_ptr_factory_.GetWeakPtr();
++    dispatch_async(dispatch_get_main_queue(), ^{
++      if (weak_self) {
++        weak_self->Complete(Result::USER_CANCELED);
++      }
++    });
++  }
++
++  void Complete(Result result) {
++    if (!done_callback_) {
++      return;
++    }
++    if (sentinel_) {
++      [sentinel_ disarm];
++      sentinel_ = nil;
++    }
++    presented_alert_ = nil;
++    if (prompt_) {
++      if (result == Result::ACCEPTED) {
++        prompt_->OnDialogAccepted();
++      } else {
++        prompt_->OnDialogCanceled();
++      }
++    }
++    DoneCallback callback = std::move(done_callback_);
++    std::move(callback).Run(DoneCallbackPayload(result));
++  }
++
++  gfx::NativeWindow native_window_;
++  std::unique_ptr<extensions::InstallPromptData> prompt_;
++  DoneCallback done_callback_;
++  __weak UIAlertController* presented_alert_ = nil;
++  __weak CrIOSExtensionInstallPromptSentinel* sentinel_ = nil;
++  base::WeakPtrFactory<IOSExtensionInstallPromptClient> weak_ptr_factory_{this};
++};
++
++}  // namespace
++
+ void IOSExtensionsBrowserClient::CanInstallExtensionByPolicy(
+     content::BrowserContext* context,
+     const ExtensionId& extension_id,
+@@ -1462,6 +1845,28 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+                        : u"Only the bundled iOS probe extension is permitted.");
+ }
+ 
++gfx::NativeWindow IOSExtensionsBrowserClient::GetNativeWindowForFunction(
++    ExtensionFunction& function) {
++  if (content::WebContents* web_contents = function.GetSenderWebContents()) {
++    gfx::NativeWindow sender_window = web_contents->GetTopLevelNativeWindow();
++    if (UIWindow* w = sender_window.Get();
++        w && !w.hidden && w.alpha > 0.0 && w.rootViewController) {
++      return sender_window;
++    }
++  }
++  UIWindow* active_window = FindActivePresentationWindow(gfx::NativeWindow());
++  return active_window ? gfx::NativeWindow(active_window) : gfx::NativeWindow();
++}
++
++std::unique_ptr<ExtensionInstallPromptClient>
++IOSExtensionsBrowserClient::CreateInstallPromptForNativeWindow(
++    gfx::NativeWindow native_window,
++    content::BrowserContext& browser_context,
++    std::unique_ptr<InstallPromptData> prompt) {
++  return std::make_unique<IOSExtensionInstallPromptClient>(native_window,
++                                                           std::move(prompt));
++}
++
+ std::vector<content::BrowserContext*>
+ IOSExtensionsBrowserClient::GetRegisteredContextsSnapshot() const {
+   base::AutoLock lock(context_lock_);
+diff --git a/ios/web/content/init/extensions/BUILD.gn b/ios/web/content/init/extensions/BUILD.gn
+index aabb2770bbd7e1a4fdcb51ad68956c2de2a7caae..3b51ccbd74bc089b16fe3c00c38757761c092bf1 100644
+--- a/ios/web/content/init/extensions/BUILD.gn
++++ b/ios/web/content/init/extensions/BUILD.gn
+@@ -16,6 +16,13 @@ json_features("ios_api_features") {
+   visibility = [ ":clients" ]
+ }
+ 
++json_features("ios_permission_features") {
++  feature_type = "PermissionFeature"
++  method_name = "AddIOSPermissionFeatures"
++  sources = [ "ios_permission_features.json" ]
++  visibility = [ ":clients" ]
++}
++
+ generated_json_strings("ios_api_json_strings") {
+   sources = [
+     "//chrome/common/extensions/api/commands.json",
+@@ -48,6 +55,7 @@ source_set("clients") {
+   deps = [
+     ":ios_api_features",
+     ":ios_api_json_strings",
++    ":ios_permission_features",
+     "//base",
+     "//extensions/common:core_api_provider",
+     "//gin",
+diff --git a/ios/web/content/init/extensions/ios_extensions_api_provider.cc b/ios/web/content/init/extensions/ios_extensions_api_provider.cc
+index 8eb471e4a2ca00a8102d1fe8f3a9867fb6b400cf..1d8ca78c582d0d518c74497684dcc4276cc2e951 100644
+--- a/ios/web/content/init/extensions/ios_extensions_api_provider.cc
++++ b/ios/web/content/init/extensions/ios_extensions_api_provider.cc
+@@ -4,8 +4,13 @@
+ 
+ #include "ios/web/content/init/extensions/ios_extensions_api_provider.h"
+ 
++#include "extensions/common/alias.h"
++#include "extensions/common/mojom/api_permission_id.mojom-shared.h"
++#include "extensions/common/permissions/api_permission.h"
++#include "extensions/common/permissions/permissions_info.h"
+ #include "ios/web/content/init/extensions/generated_schemas.h"
+ #include "ios/web/content/init/extensions/ios_api_features.h"
++#include "ios/web/content/init/extensions/ios_permission_features.h"
+ 
+ namespace web {
+ 
+@@ -21,7 +26,9 @@ void IOSExtensionsAPIProvider::AddManifestFeatures(
+     extensions::FeatureProvider* provider) {}
+ 
+ void IOSExtensionsAPIProvider::AddPermissionFeatures(
+-    extensions::FeatureProvider* provider) {}
++    extensions::FeatureProvider* provider) {
++  extensions::AddIOSPermissionFeatures(provider);
++}
+ 
+ void IOSExtensionsAPIProvider::AddBehaviorFeatures(
+     extensions::FeatureProvider* provider) {}
+@@ -39,7 +46,14 @@ std::string_view IOSExtensionsAPIProvider::GetAPISchema(
+ }
+ 
+ void IOSExtensionsAPIProvider::RegisterPermissions(
+-    extensions::PermissionsInfo* permissions_info) {}
++    extensions::PermissionsInfo* permissions_info) {
++  static constexpr extensions::APIPermissionInfo::InitInfo kPermissions[] = {
++      {extensions::mojom::APIPermissionID::kScripting, "scripting",
++       extensions::APIPermissionInfo::kFlagRequiresManagementUIWarning,
++       nullptr},
++  };
++  permissions_info->RegisterPermissions(kPermissions, {});
++}
+ 
+ void IOSExtensionsAPIProvider::RegisterManifestHandlers(
+     extensions::ManifestHandlerRegistry* registry) {}
+diff --git a/ios/web/content/init/extensions/ios_permission_features.json b/ios/web/content/init/extensions/ios_permission_features.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8403ee6503c903f49ed0da17c2df7d7aca25273
+--- /dev/null
++++ b/ios/web/content/init/extensions/ios_permission_features.json
+@@ -0,0 +1,7 @@
++{
++  "scripting": {
++    "channel": "stable",
++    "extension_types": ["extension"],
++    "min_manifest_version": 3
++  }
++}
+diff --git a/ios/web/content/init/extensions/tabs.json b/ios/web/content/init/extensions/tabs.json
+index 705a63fa379a44c36510feb6204d26162220b284..2f76e85425addc97293bb0f7804c820d3b59a610 100644
+--- a/ios/web/content/init/extensions/tabs.json
++++ b/ios/web/content/init/extensions/tabs.json
+@@ -2,6 +2,13 @@
+   {
+     "namespace": "tabs",
+     "description": "Read and observe tabs in the extension's iOS profile.",
++    "properties": {
++      "TAB_ID_NONE": {
++        "value": -1,
++        "type": "integer",
++        "description": "An ID that represents the absence of a browser tab."
++      }
++    },
+     "types": [
+       {
+         "id": "TabStatus",

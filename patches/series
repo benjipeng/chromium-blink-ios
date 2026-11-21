@@ -90,3 +90,10 @@
 0095-ios-curium-safari-style-top-inset.patch
 0096-ios-curium-run-without-google-account-services.patch
 0097-ios-curium-navigation-commit-event.patch
+0098-ios-save-unstripped-symbols.patch
+0099-ios-extensions-single-process-coexistence.patch
+0100-ios-extensions-scripting-tabs-and-permissions-prompt.patch
+0101-ios-blink-clipboard-uti-and-trusted-paste.patch
+0102-ios-blink-multitouch-cancel-guard.patch
+0103-ios-blink-hide-accessory-for-hardware-keyboard.patch
+0104-ios-curium-pip-start-when-ready.patch

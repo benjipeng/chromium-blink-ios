@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink input: hide inputAccessoryView when a hardware keyboard is connected
+
+With a hardware keyboard attached on iOS, UIKit docks RenderWidgetUIView's
+inputAccessoryView toolbar alone at the bottom edge where it overlaps browser
+chrome while Tab/Shift-Tab/Escape already cover its actions. Suppress
+inputAccessoryView when GCKeyboard.coalescedKeyboard is present, reload input
+views on connect/disconnect notifications, clean up observers in removeView and
+dealloc, and link GameController.framework in //content/browser.
+
+---
+ content/browser/BUILD.gn                           |  5 ++-
+ .../render_widget_host_view_ios_uiview.mm          | 48 +++++++++++++++++++---
+ 2 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index dfb3b59e7979e143b69cb658f9757d0feebc11a2..115f664f4eb1df73cdb553073796a7dd3d231bee 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -2842,7 +2842,10 @@ source_set("browser") {
+         "renderer_host/render_widget_host_view_ios_uiview.h",
+         "renderer_host/render_widget_host_view_ios_uiview.mm",
+       ]
+-      frameworks += [ "BrowserEngineKit.framework" ]
++      frameworks += [
++        "BrowserEngineKit.framework",
++        "GameController.framework",
++      ]
+     } else {
+       sources += [
+         "child_process_launcher_helper_tvos.mm",
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index 56147e43213d8f4f67c4cfc1f573865e0974e104..99f66653ac05253e2a12a3b8f9b50ba85a54dcf1 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -4,6 +4,8 @@
+ 
+ #include "content/browser/renderer_host/render_widget_host_view_ios_uiview.h"
+ 
++#import <GameController/GameController.h>
++
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -194,10 +196,24 @@ - (instancetype)initWithWidget:
+            selector:@selector(keyboardWillChangeFrame:)
+                name:UIKeyboardWillChangeFrameNotification
+              object:nil];
++    [[NSNotificationCenter defaultCenter]
++        addObserver:self
++           selector:@selector(hardwareKeyboardDidChange:)
++               name:GCKeyboardDidConnectNotification
++             object:nil];
++    [[NSNotificationCenter defaultCenter]
++        addObserver:self
++           selector:@selector(hardwareKeyboardDidChange:)
++               name:GCKeyboardDidDisconnectNotification
++             object:nil];
+   }
+   return self;
+ }
+ 
++- (void)dealloc {
++  [[NSNotificationCenter defaultCenter] removeObserver:self];
++}
++
+ - (void)setFrame:(CGRect)frame {
+   [self prepareForSize:frame.size];
+   [super setFrame:frame];
+@@ -356,7 +372,23 @@ - (UIView*)inputView {
+ }
+ 
+ - (UIView*)inputAccessoryView {
+-  return _isEditable ? _inputAccessoryContainerView : nil;
++  if (!_isEditable || [GCKeyboard coalescedKeyboard] != nil) {
++    return nil;
++  }
++  return _inputAccessoryContainerView;
++}
++
++- (void)hardwareKeyboardDidChange:(NSNotification*)notification {
++  if (![NSThread isMainThread]) {
++    __weak RenderWidgetUIView* weakSelf = self;
++    dispatch_async(dispatch_get_main_queue(), ^{
++      [weakSelf hardwareKeyboardDidChange:notification];
++    });
++    return;
++  }
++  if (self.isFirstResponder) {
++    [self reloadInputViews];
++  }
+ }
+ 
+ - (void)initializeInputAccessory {
+@@ -541,10 +573,16 @@ - (void)observeValueForKeyPath:(NSString*)keyPath
+ 
+ - (void)removeView {
+   input::WebTouchEventBuilder::ClearTouchesForView(self);
+-  [[NSNotificationCenter defaultCenter]
+-      removeObserver:self
+-                name:UIKeyboardWillChangeFrameNotification
+-              object:nil];
++  NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
++  [center removeObserver:self
++                    name:UIKeyboardWillChangeFrameNotification
++                  object:nil];
++  [center removeObserver:self
++                    name:GCKeyboardDidConnectNotification
++                  object:nil];
++  [center removeObserver:self
++                    name:GCKeyboardDidDisconnectNotification
++                  object:nil];
+   UIScrollView* view = (UIScrollView*)[self superview];
+   [view removeObserver:self
+             forKeyPath:NSStringFromSelector(@selector(contentInset))];

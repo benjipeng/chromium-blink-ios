@@ -1,0 +1,537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Blink input: guard multi-touch cancellation and stale touches against SIGTRAP
+
+RenderWidgetUIView previously forwarded touchesCancelled:withEvent: one UITouch
+at a time to WebTouchEventBuilder::Build(kTouchCancel, ...), which appended
+remaining touches as kStateStationary and tripped MotionEventWeb's
+CHECK(AllTouchPointsHaveState(kStateCancelled)). Duplicate, untracked, or stale
+touches from detached views also triggered CHECK/NOTREACHED traps.
+
+Track active touches with weak view ownership inside base::NoDestructor storage,
+drain stale touches, clear a view's touches on removeView, and in
+WebTouchEventBuilder::BuildTouchEvents lift preceding or partial-cancel touches
+as kTouchEnd (kStateReleased) before emitting kTouchCancel only for the sole
+remaining cancelled touch.
+
+---
+ components/input/web_input_event_builders_ios.h    |   23 ++
+ components/input/web_input_event_builders_ios.mm   |  270 ++++++++++++++++++--
+ .../render_widget_host_view_ios_uiview.mm          |   72 ++++-
+ 3 files changed, 316 insertions(+), 49 deletions(-)
+
+diff --git a/components/input/web_input_event_builders_ios.h b/components/input/web_input_event_builders_ios.h
+index 850fae80b7fbb02568484f8f27fb459519fec483..829e2be3b4b64b2c0f5ca4e3e15afbc24e962989 100644
+--- a/components/input/web_input_event_builders_ios.h
++++ b/components/input/web_input_event_builders_ios.h
+@@ -5,6 +5,11 @@
+ #ifndef COMPONENTS_INPUT_WEB_INPUT_EVENT_BUILDERS_IOS_H_
+ #define COMPONENTS_INPUT_WEB_INPUT_EVENT_BUILDERS_IOS_H_
+ 
++#import <Foundation/Foundation.h>
++
++#include <optional>
++#include <vector>
++
+ #include "base/component_export.h"
+ #include "third_party/blink/public/common/input/web_gesture_event.h"
+ #include "third_party/blink/public/common/input/web_input_event.h"
+@@ -37,6 +42,24 @@ class COMPONENT_EXPORT(INPUT) WebTouchEventBuilder {
+       UIEvent* event,
+       UIView* view,
+       const std::optional<gfx::Vector2dF>& view_offset);
++
++  // Builds a sequence of WebTouchEvents for a UIKit touch callback while
++  // guarding MotionEventWeb's invariants (every point in a kTouchCancel event
++  // must have kStateCancelled; stale, duplicate, or untracked touches are
++  // drained or ignored instead of trapping).
++  static std::vector<blink::WebTouchEvent> BuildTouchEvents(
++      blink::WebInputEvent::Type type,
++      NSSet<UITouch*>* touches,
++      UIEvent* event,
++      UIView* view,
++      const std::optional<gfx::Vector2dF>& view_offset);
++
++  // Clears any tracked touches associated with `view` (or with a nil view),
++  // e.g. when the RenderWidgetUIView is removed from its superview.
++  static void ClearTouchesForView(UIView* view);
++
++  // Returns true if any tracked touch is still associated with `view`.
++  static bool HasActiveTouchesForView(UIView* view);
+ };
+ 
+ }  // namespace input
+diff --git a/components/input/web_input_event_builders_ios.mm b/components/input/web_input_event_builders_ios.mm
+index f2fc462c9b6a724b9633626df26538ae3e051703..a518f17bb98b76a80e117f4db94204a39a0dfb61 100644
+--- a/components/input/web_input_event_builders_ios.mm
++++ b/components/input/web_input_event_builders_ios.mm
+@@ -6,8 +6,13 @@
+ 
+ #import <UIKit/UIKit.h>
+ 
++#include <array>
++#include <optional>
++#include <vector>
++
+ #include "base/apple/foundation_util.h"
+ #include "base/compiler_specific.h"
++#include "base/no_destructor.h"
+ #include "base/notimplemented.h"
+ #include "base/notreached.h"
+ #include "build/build_config.h"
+@@ -28,35 +33,72 @@
+ namespace {
+ 
+ constexpr size_t MAX_POINTERS = blink::WebTouchEvent::kTouchesLengthCap;
+-static UITouch* g_active_touches[MAX_POINTERS] = {};
++
++struct ActiveTouchSlot {
++  UITouch* touch = nil;
++  __weak UIView* view = nil;
++};
++
++std::array<ActiveTouchSlot, MAX_POINTERS>& GetActiveTouches() {
++  static base::NoDestructor<std::array<ActiveTouchSlot, MAX_POINTERS>> touches;
++  return *touches;
++}
+ 
+ size_t GetTouchPointerId(UITouch* touch) {
++  auto& active = GetActiveTouches();
+   for (size_t i = 0; i < MAX_POINTERS; ++i) {
+-    if (UNSAFE_TODO(g_active_touches[i]) == touch) {
++    if (active[i].touch == touch) {
+       return i + 1;
+     }
+   }
+   return 0;
+ }
+ 
+-void AddUITouch(UITouch* touch) {
+-  CHECK(GetTouchPointerId(touch) == 0);
++size_t GetActiveTouchCount() {
++  auto& active = GetActiveTouches();
++  size_t count = 0;
++  for (const auto& slot : active) {
++    if (slot.touch) {
++      ++count;
++    }
++  }
++  return count;
++}
++
++bool IsTouchStale(const ActiveTouchSlot& slot) {
++  if (!slot.touch) {
++    return false;
++  }
++  const UITouchPhase phase = [slot.touch phase];
++  return !slot.view || slot.touch.window == nil ||
++         phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled;
++}
++
++bool AddUITouch(UITouch* touch, UIView* view) {
++  if (!touch || GetTouchPointerId(touch) != 0) {
++    return false;
++  }
++  auto& active = GetActiveTouches();
+   for (size_t i = 0; i < MAX_POINTERS; ++i) {
+-    if (!UNSAFE_TODO(g_active_touches[i])) {
+-      UNSAFE_TODO(g_active_touches[i]) = touch;
+-      return;
++    if (!active[i].touch) {
++      active[i].touch = touch;
++      active[i].view = view;
++      return true;
+     }
+   }
++  return false;
+ }
+ 
+-void RemoveUITouch(UITouch* touch) {
++bool RemoveUITouch(UITouch* touch) {
++  auto& active = GetActiveTouches();
+   for (size_t i = 0; i < MAX_POINTERS; ++i) {
+-    if (UNSAFE_TODO(g_active_touches[i]) == touch) {
+-      UNSAFE_TODO(g_active_touches[i]) = nil;
+-      return;
++    if (active[i].touch == touch) {
++      active[i].touch = nil;
++      active[i].view = nil;
++      return true;
+     }
+   }
+-  NOTREACHED();
++  return false;
+ }
+ 
+ int ModifiersFromEvent(UIKeyModifierFlags modifier_flags) {
+@@ -125,7 +167,8 @@ void SetWebPointerPropertiesFromMotionEventData(
+     UIView* view,
+     UITouch* event,
+     bool was_changed,
+-    const std::optional<gfx::Vector2dF>& view_offset) {
++    const std::optional<gfx::Vector2dF>& view_offset,
++    std::optional<blink::WebTouchPoint::State> forced_state = std::nullopt) {
+   blink::WebTouchPoint touch;
+ 
+   size_t pointer_index = GetTouchPointerId(event);
+@@ -134,7 +177,7 @@ void SetWebPointerPropertiesFromMotionEventData(
+   SetWebPointerPropertiesFromMotionEventData(touch, pointer_index,
+                                              [event force]);
+ 
+-  touch.state = ToWebTouchPointState(event, was_changed);
++  touch.state = forced_state.value_or(ToWebTouchPointState(event, was_changed));
+   gfx::PointF window_location = gfx::PointF([event locationInView:nil]);
+   touch.SetPositionInScreen(window_location);
+ 
+@@ -313,12 +356,15 @@ bool IsSystemKeyEvent(const blink::WebKeyboardEvent& event) {
+   return blink::WebGestureEvent();
+ }
+ 
+-blink::WebTouchEvent WebTouchEventBuilder::Build(
++namespace {
++
++blink::WebTouchEvent BuildSingleTrackedTouchEvent(
+     blink::WebInputEvent::Type type,
+     UITouch* touch,
+     UIEvent* event,
+     UIView* view,
+-    const std::optional<gfx::Vector2dF>& view_offset) {
++    const std::optional<gfx::Vector2dF>& view_offset,
++    std::optional<blink::WebTouchPoint::State> forced_state) {
+   blink::WebTouchEvent result(type, ModifiersFromEvent(event.modifierFlags),
+                               ui::EventTimeStampFromSeconds([event timestamp]));
+   // TODO(dtapuska): Enable
+@@ -331,11 +377,8 @@ bool IsSystemKeyEvent(const blink::WebKeyboardEvent& event) {
+   result.unique_touch_event_id = ui::GetNextTouchEventId();
+ 
+   size_t touch_index = 0;
+-  if (type == blink::WebInputEvent::Type::kTouchStart) {
+-    AddUITouch(touch);
+-  }
+-  UNSAFE_TODO(result.touches[touch_index]) =
+-      CreateWebTouchPoint(view, touch, /*was_changed=*/true, view_offset);
++  UNSAFE_TODO(result.touches[touch_index]) = CreateWebTouchPoint(
++      view, touch, /*was_changed=*/true, view_offset, forced_state);
+   ++touch_index;
+   if (type == blink::WebInputEvent::Type::kTouchCancel ||
+       type == blink::WebInputEvent::Type::kTouchEnd) {
+@@ -345,14 +388,13 @@ bool IsSystemKeyEvent(const blink::WebKeyboardEvent& event) {
+   // We can't use `event.allTouches` here, because we need to generate a
+   // WebTouchEvent for each touch point changing. But event.allTouches will have
+   // it all already.
++  auto& active = GetActiveTouches();
+   for (size_t i = 0; i < MAX_POINTERS; ++i) {
+-    if (!UNSAFE_TODO(g_active_touches[i]) ||
+-        UNSAFE_TODO(g_active_touches[i]) == touch) {
++    if (!active[i].touch || active[i].touch == touch) {
+       continue;
+     }
+-    UNSAFE_TODO(result.touches[touch_index]) =
+-        CreateWebTouchPoint(view, UNSAFE_TODO(g_active_touches[i]),
+-                            /*was_changed=*/false, view_offset);
++    UNSAFE_TODO(result.touches[touch_index]) = CreateWebTouchPoint(
++        view, active[i].touch, /*was_changed=*/false, view_offset);
+     ++touch_index;
+   }
+   result.touches_length = touch_index;
+@@ -361,4 +403,180 @@ bool IsSystemKeyEvent(const blink::WebKeyboardEvent& event) {
+   return result;
+ }
+ 
++void DrainStaleTouches(NSSet<UITouch*>* excluded_touches,
++                       UIEvent* event,
++                       UIView* view,
++                       const std::optional<gfx::Vector2dF>& view_offset,
++                       std::vector<blink::WebTouchEvent>* out_events) {
++  std::vector<UITouch*> stale;
++  auto& active = GetActiveTouches();
++  for (const auto& slot : active) {
++    if (slot.touch && ![excluded_touches containsObject:slot.touch] &&
++        IsTouchStale(slot)) {
++      stale.push_back(slot.touch);
++    }
++  }
++  for (UITouch* touch : stale) {
++    if (GetTouchPointerId(touch) == 0) {
++      continue;
++    }
++    out_events->push_back(BuildSingleTrackedTouchEvent(
++        blink::WebInputEvent::Type::kTouchEnd, touch, event, view, view_offset,
++        blink::WebTouchPoint::State::kStateReleased));
++  }
++}
++
++}  // namespace
++
++blink::WebTouchEvent WebTouchEventBuilder::Build(
++    blink::WebInputEvent::Type type,
++    UITouch* touch,
++    UIEvent* event,
++    UIView* view,
++    const std::optional<gfx::Vector2dF>& view_offset) {
++  if (type == blink::WebInputEvent::Type::kTouchStart) {
++    AddUITouch(touch, view);
++  }
++  if (GetTouchPointerId(touch) == 0) {
++    // Untracked or capacity-exceeded touch; return a benign empty event rather
++    // than trapping on CHECK(pointer_index != 0).
++    return blink::WebTouchEvent(
++        type, ModifiersFromEvent(event.modifierFlags),
++        ui::EventTimeStampFromSeconds([event timestamp]));
++  }
++  // MotionEventWeb requires every touch point in a kTouchCancel event to have
++  // kStateCancelled. If another touch remains active or the touch's phase is
++  // not UITouchPhaseCancelled, emit kTouchEnd (ACTION_POINTER_UP) instead.
++  if (type == blink::WebInputEvent::Type::kTouchCancel &&
++      (GetActiveTouchCount() > 1 || [touch phase] != UITouchPhaseCancelled)) {
++    return BuildSingleTrackedTouchEvent(
++        blink::WebInputEvent::Type::kTouchEnd, touch, event, view, view_offset,
++        blink::WebTouchPoint::State::kStateReleased);
++  }
++  std::optional<blink::WebTouchPoint::State> forced_state;
++  if (type == blink::WebInputEvent::Type::kTouchCancel) {
++    forced_state = blink::WebTouchPoint::State::kStateCancelled;
++  } else if (type == blink::WebInputEvent::Type::kTouchEnd) {
++    forced_state = blink::WebTouchPoint::State::kStateReleased;
++  }
++  return BuildSingleTrackedTouchEvent(type, touch, event, view, view_offset,
++                                      forced_state);
++}
++
++std::vector<blink::WebTouchEvent> WebTouchEventBuilder::BuildTouchEvents(
++    blink::WebInputEvent::Type type,
++    NSSet<UITouch*>* touches,
++    UIEvent* event,
++    UIView* view,
++    const std::optional<gfx::Vector2dF>& view_offset) {
++  std::vector<blink::WebTouchEvent> result;
++  if (!event || !view) {
++    return result;
++  }
++
++  if (type == blink::WebInputEvent::Type::kTouchStart) {
++    DrainStaleTouches(touches, event, view, view_offset, &result);
++    for (UITouch* touch in touches) {
++      if (!AddUITouch(touch, view)) {
++        continue;
++      }
++      result.push_back(BuildSingleTrackedTouchEvent(
++          blink::WebInputEvent::Type::kTouchStart, touch, event, view,
++          view_offset, blink::WebTouchPoint::State::kStatePressed));
++    }
++    return result;
++  }
++
++  if (type == blink::WebInputEvent::Type::kTouchMove) {
++    for (UITouch* touch in touches) {
++      if (GetTouchPointerId(touch) == 0) {
++        continue;
++      }
++      result.push_back(BuildSingleTrackedTouchEvent(
++          blink::WebInputEvent::Type::kTouchMove, touch, event, view,
++          view_offset, blink::WebTouchPoint::State::kStateMoved));
++    }
++    return result;
++  }
++
++  if (type == blink::WebInputEvent::Type::kTouchEnd) {
++    for (UITouch* touch in touches) {
++      if (GetTouchPointerId(touch) == 0) {
++        continue;
++      }
++      result.push_back(BuildSingleTrackedTouchEvent(
++          blink::WebInputEvent::Type::kTouchEnd, touch, event, view,
++          view_offset, blink::WebTouchPoint::State::kStateReleased));
++    }
++    return result;
++  }
++
++  if (type == blink::WebInputEvent::Type::kTouchCancel) {
++    std::vector<UITouch*> to_cancel;
++    to_cancel.reserve(touches.count);
++    for (UITouch* touch in touches) {
++      if (GetTouchPointerId(touch) != 0) {
++        to_cancel.push_back(touch);
++      }
++    }
++    DrainStaleTouches(touches, event, view, view_offset, &result);
++    if (to_cancel.empty()) {
++      return result;
++    }
++
++    // MotionEventWeb CHECKs AllTouchPointsHaveState(kStateCancelled) for every
++    // kTouchCancel event. That holds iff removing the touch empties the active
++    // touch table and the touch has UITouchPhaseCancelled. Lift any preceding
++    // touches (or all touches in a partial cancel) as kTouchEnd first.
++    const size_t active_count = GetActiveTouchCount();
++    UITouch* last_touch = to_cancel.back();
++    const bool can_emit_final_cancel =
++        (to_cancel.size() == active_count) &&
++        ([last_touch phase] == UITouchPhaseCancelled);
++
++    if (can_emit_final_cancel) {
++      for (size_t i = 0; i + 1 < to_cancel.size(); ++i) {
++        result.push_back(BuildSingleTrackedTouchEvent(
++            blink::WebInputEvent::Type::kTouchEnd, to_cancel[i], event, view,
++            view_offset, blink::WebTouchPoint::State::kStateReleased));
++      }
++      result.push_back(BuildSingleTrackedTouchEvent(
++          blink::WebInputEvent::Type::kTouchCancel, last_touch, event, view,
++          view_offset, blink::WebTouchPoint::State::kStateCancelled));
++    } else {
++      for (UITouch* touch : to_cancel) {
++        result.push_back(BuildSingleTrackedTouchEvent(
++            blink::WebInputEvent::Type::kTouchEnd, touch, event, view,
++            view_offset, blink::WebTouchPoint::State::kStateReleased));
++      }
++    }
++    return result;
++  }
++
++  return result;
++}
++
++void WebTouchEventBuilder::ClearTouchesForView(UIView* view) {
++  auto& active = GetActiveTouches();
++  for (auto& slot : active) {
++    if (slot.touch && (!slot.view || slot.view == view)) {
++      slot.touch = nil;
++      slot.view = nil;
++    }
++  }
++}
++
++bool WebTouchEventBuilder::HasActiveTouchesForView(UIView* view) {
++  if (!view) {
++    return false;
++  }
++  auto& active = GetActiveTouches();
++  for (const auto& slot : active) {
++    if (slot.touch && slot.view == view) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ }  // namespace input
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+index 40361bc8186174b775d7ffa38c6df4413f692182..56147e43213d8f4f67c4cfc1f573865e0974e104 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios_uiview.mm
+@@ -439,59 +439,84 @@ - (BOOL)resignFirstResponder {
+ }
+ 
+ - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+-  CHECK(_view);
++  if (!_view || !self.window) {
++    return;
++  }
+   // Workaround for focus corner cases, like Android's Action::DOWN in
+   // RenderWidgetHostViewAndroid::OnTouchEvent.
+   if (!self.isFirstResponder) {
+     [self becomeFirstResponder];
+   }
+-  for (UITouch* touch in touches) {
+-    blink::WebTouchEvent webTouchEvent = input::WebTouchEventBuilder::Build(
+-        blink::WebInputEvent::Type::kTouchStart, touch, event, self,
+-        _viewOffsetDuringTouchSequence);
+-    if (!_viewOffsetDuringTouchSequence) {
++  for (blink::WebTouchEvent& webTouchEvent :
++       input::WebTouchEventBuilder::BuildTouchEvents(
++           blink::WebInputEvent::Type::kTouchStart, touches, event, self,
++           _viewOffsetDuringTouchSequence)) {
++    if (!_viewOffsetDuringTouchSequence &&
++        webTouchEvent.GetType() == blink::WebInputEvent::Type::kTouchStart &&
++        webTouchEvent.touches_length > 0) {
+       _viewOffsetDuringTouchSequence =
+           webTouchEvent.touches[0].PositionInWidget() -
+           webTouchEvent.touches[0].PositionInScreen();
+     }
+-    _view->OnTouchEvent(std::move(webTouchEvent));
++    if (_view) {
++      _view->OnTouchEvent(std::move(webTouchEvent));
++    }
+   }
+ }
+ 
+ - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+-  CHECK(_view);
+-  for (UITouch* touch in touches) {
+-    _view->OnTouchEvent(input::WebTouchEventBuilder::Build(
+-        blink::WebInputEvent::Type::kTouchEnd, touch, event, self,
+-        _viewOffsetDuringTouchSequence));
++  if (!_view) {
++    input::WebTouchEventBuilder::ClearTouchesForView(self);
++    return;
+   }
+-  if (event.allTouches.count == 1) {
++  for (blink::WebTouchEvent& webTouchEvent :
++       input::WebTouchEventBuilder::BuildTouchEvents(
++           blink::WebInputEvent::Type::kTouchEnd, touches, event, self,
++           _viewOffsetDuringTouchSequence)) {
++    if (_view) {
++      _view->OnTouchEvent(std::move(webTouchEvent));
++    }
++  }
++  if (event.allTouches.count <= 1 ||
++      !input::WebTouchEventBuilder::HasActiveTouchesForView(self)) {
+     _viewOffsetDuringTouchSequence.reset();
+     [self longPressDidEndShowingMenu:YES];
+   }
+ }
+ 
+ - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+-  CHECK(_view);
++  if (!_view) {
++    return;
++  }
+   // [ios-blink-sideload] While a long press shows the loupe, moving the finger
+   // changes the selection, not the page's scroll position.
+   if (_longPressLoupe) {
+     [self longPressDidMoveToPoint:[touches.anyObject locationInView:self]];
+     return;
+   }
+-  for (UITouch* touch in touches) {
+-    _view->OnTouchEvent(input::WebTouchEventBuilder::Build(
+-        blink::WebInputEvent::Type::kTouchMove, touch, event, self,
+-        _viewOffsetDuringTouchSequence));
++  for (blink::WebTouchEvent& webTouchEvent :
++       input::WebTouchEventBuilder::BuildTouchEvents(
++           blink::WebInputEvent::Type::kTouchMove, touches, event, self,
++           _viewOffsetDuringTouchSequence)) {
++    if (_view) {
++      _view->OnTouchEvent(std::move(webTouchEvent));
++    }
+   }
+ }
+ 
+ - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+-  CHECK(_view);
+-  for (UITouch* touch in touches) {
+-    _view->OnTouchEvent(input::WebTouchEventBuilder::Build(
+-        blink::WebInputEvent::Type::kTouchCancel, touch, event, self,
+-        _viewOffsetDuringTouchSequence));
++  if (!_view) {
++    input::WebTouchEventBuilder::ClearTouchesForView(self);
++    _viewOffsetDuringTouchSequence.reset();
++    return;
++  }
++  for (blink::WebTouchEvent& webTouchEvent :
++       input::WebTouchEventBuilder::BuildTouchEvents(
++           blink::WebInputEvent::Type::kTouchCancel, touches, event, self,
++           _viewOffsetDuringTouchSequence)) {
++    if (_view) {
++      _view->OnTouchEvent(std::move(webTouchEvent));
++    }
+   }
+   _viewOffsetDuringTouchSequence.reset();
+   [self longPressDidEndShowingMenu:NO];
+@@ -515,6 +540,7 @@ - (void)observeValueForKeyPath:(NSString*)keyPath
+ }
+ 
+ - (void)removeView {
++  input::WebTouchEventBuilder::ClearTouchesForView(self);
+   [[NSNotificationCenter defaultCenter]
+       removeObserver:self
+                 name:UIKeyboardWillChangeFrameNotification

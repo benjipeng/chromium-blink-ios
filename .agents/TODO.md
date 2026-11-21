@@ -9,9 +9,10 @@ the pinned engine first, translate to `patches/` once proven.
 
 - **Engine:** build 35, `Kernel.lock` → `3b973e0` (Chromium 160.0.8171.0), patches
   through 0097. Patch 0095 (page scrolls under the floating top chrome) is live.
-- **On `ac_duo`:** 0.1.10-b11 Release (`Curium-0.1.10-b11-arm64.ipa`),
-  also archived in LiveContainer `Documents/` and published via Pipeline 2
-  (`.github/workflows/build-curium.yml` + `scripts/build_curium_ipa.sh`).
+- **On `ac_duo`:** `Curium-0.1.10-b14-arm64.ipa` (adds `CuriumClipboardHook.m`
+  fixing Blink paste UTI conformance + trusted synchronous pasteboard snapshot,
+  on top of b13's Clear Address overlay and pre-`ChromeMain` V8 TXM JIT probe)
+  staged in LiveContainer `Documents/` for manual install.
 
 ## App (on the pinned engine)
 
@@ -46,6 +47,24 @@ the pinned engine first, translate to `patches/` once proven.
   while Dark Reader dynamic mode darkens the background to `rgb(27, 29, 30)`;
   cross-extension and webpage fetches to either extension's private resources
   fail with `net::ERR_BLOCKED_BY_CLIENT`. Shipped to `ac_duo` in 0.1.8 (9) / 0.1.9 (10).
+- [x] **Blink web-page paste silently inserts nothing.** Tapping Paste in Blink
+  inputs (`<input>`, `<textarea>`, `contenteditable`, Google search) inserted
+  zero characters even though copying out of Blink worked. Root cause in Build 35:
+  (1) `ClipboardIOS::GetAllAvailableFormats` matches `[[UIPasteboard generalPasteboard] items]`
+  dictionary keys by exact string equality against `ClipboardFormatType::PlainTextType()`
+  (`"public.plain-text"`), whereas iOS stores copied text under `"public.utf8-plain-text"`
+  (conforming subtype), so `IsFormatAvailable` and `ReadAvailableTypes` returned empty
+  and Blink aborted `Editor::Paste` before calling `ReadText`; (2) `-[RenderWidgetUIView paste:]`
+  dispatches `handleEditCommands:{"paste"}` asynchronously over Mojo IPC, exiting
+  UIKit's trusted `-paste:` authorization scope before `ClipboardIOS` reads the
+  pasteboard. `CuriumClipboardHook.m` snapshots `UIPasteboard.generalPasteboard`
+  synchronously inside `-[RenderWidgetUIView paste:]` (with `changeCount` + 2 s TTL
+  validation and empty-dict fallback to `pb.string`/`pb.URL`), normalizes conforming
+  UTIs (`public.plain-text`, `public.html`, `public.rtf`, `public.png`, `public.svg-xml`,
+  `public.image`), and intercepts `_UIConcretePasteboard` reads strictly for callers
+  inside `chrome_framework`'s `__TEXT` segment (zero Build 35 offset coupling).
+  Verified on `iphone_duo_27_2` Simulator (`sdk 27.2`, 11/11 unit tests, live DOM
+  `paste` event with `types: ["text/plain"]` and hands-on paste test).
 - [x] **Multi-touch cancellation `SIGTRAP` on `ac_duo`.** On `ac_duo` in 0.1.8 (9),
   `RenderWidgetUIView -touchesCancelled:withEvent:` crashed with `SIGTRAP` at
   `content/browser/renderer_host/input/motion_event_web.cc:42`
@@ -128,40 +147,61 @@ the engine's layout differs from what it expects (`CuriumHookSupport.h`).
 | `-[CuriumPiPBridge startPiPForGeneration:]` and its `failedToStartPictureInPictureWithError:` (`CuriumPictureInPictureHooks.m`) | Holds the start up to 0.6 s until the controller is 150 ms old, possible, and rendering; retries one reported failure after 0.25 s. | The upstream form in the Engine wave, once `ac_duo` proves it. |
 | `-[RenderWidgetUIView inputAccessoryView]` (`CuriumInputAccessoryHook.m`) | Returns no accessory while `GCKeyboard.coalescedKeyboard` is set; reloads input views on keyboard connect or disconnect. | Upstream the same condition in `render_widget_host_view_ios_uiview.mm`. |
 | `-[RenderWidgetUIView touchesBegan/Moved/Ended/Cancelled:withEvent:]` (`CuriumTouchCancelHook.m`) | Mirrors `WebTouchEventBuilder`'s 16-slot global touch table so multi-touch, partial, stale, and untracked cancellations never violate `MotionEventWeb`'s `AllTouchPointsHaveState(kStateCancelled)` `DCHECK` or `WebTouchEventBuilder` traps. | Fix `WebTouchEventBuilder::Build(kTouchCancel, ...)` and `RenderWidgetUIView -touchesCancelled:` in the Engine wave. |
-| Build 35 `__DATA_CONST` vtable & schema slots (`CuriumExtensionCoexistenceHook.m`, 28 vtable slots + `tabs` schema) | Authorizes single-process extension subresources, messaging, MV3 service worker lifecycle, API dispatch, and event listeners by browser-verified document origin/worker identity (preserving private resource isolation); implements `GetNativeWindowForFunction` + native `UIAlertController` consent for `CreateInstallPromptForNativeWindow` (`chrome.permissions.request`); adds `chrome.tabs.TAB_ID_NONE = -1` to `IOSGeneratedSchemas`. Pinned to UUID `4C4C4483-5555-3144-A14F-B2F89F30C28A`, fail-closed. | Upstream per-context authorization, `permissions.request` prompt support, and `TAB_ID_NONE` in `tabs.json` in the Engine wave, then delete once `Kernel.lock` repins. |
+| `-[RenderWidgetUIView paste:]` + `-[_UIConcretePasteboard items / dataForPasteboardType:inItemSet: / image]` (`CuriumClipboardHook.m`) | Captures a `changeCount`-validated synchronous pasteboard snapshot inside UIKit's trusted `-paste:` call and aliases conforming UTIs (`public.utf8-plain-text` → `public.plain-text`, UTF-16, bare URL, HTML/RTF/PNG/SVG/raster images) strictly for `chrome_framework` `__TEXT` callers so Blink paste and `navigator.clipboard.readText()` work without repeated iOS paste-permission prompts. | Fix UTI conformance in `ClipboardIOS::GetAllAvailableFormats` and capture synchronous pasteboard state in `-[RenderWidgetUIView paste:]` in the Engine wave. |
+| Build 35 `__DATA_CONST` vtable & schema slots (`CuriumExtensionCoexistenceHook.m`, 28 coexistence slots + `tabs` schema + 2 `IOSExtensionsAPIProvider` slots) | Authorizes single-process extension subresources, messaging, MV3 service worker lifecycle, API dispatch, and event listeners by browser-verified document origin/worker identity (preserving private resource isolation); implements `GetNativeWindowForFunction` + native `UIAlertController` consent for `CreateInstallPromptForNativeWindow` (`chrome.permissions.request`); adds `chrome.tabs.TAB_ID_NONE = -1` to `IOSGeneratedSchemas`; registers `APIPermissionID::kScripting` (`230`) and the MV3 stable `"scripting"` permission feature on `IOSExtensionsAPIProvider` so `chrome.scripting.registerContentScripts` (`MAIN`-world scriptlets + cosmetic CSS) works in uBlock Origin Lite and Dark Reader. Pinned to UUID `4C4C4483-5555-3144-A14F-B2F89F30C28A`, fail-closed. | Upstream per-context authorization, `permissions.request` prompt support, `TAB_ID_NONE` in `tabs.json`, and `"scripting"` permission registration in `IOSExtensionsAPIProvider` in the Engine wave, then delete once `Kernel.lock` repins. |
 
-## Engine wave (banked, not built)
+## Engine wave (patches 0098–0104 written, awaiting Build 36 & `Kernel.lock` repin)
 
-Build once the wave is complete and approved. Gate it with `graph-diagnose.yml`
-before `build-ipa.yml`.
+Gate with `graph-diagnose.yml` (`compile_extensions=true`, `comparison_mode=report`)
+before triggering `build-ipa.yml`. Retire the matching `Curium/Engine/` runtime hooks
+once `Kernel.lock` repins to the new engine and `ac_duo` verifies each item.
 
-- [ ] **Authorize extension operations by their originating context.** In
-  single-process mode, Chromium reuses one renderer host, but `ProcessMap`
-  stores one extension ID per renderer ID. The Build 35 runtime hook
-  (`CuriumExtensionCoexistenceHook.m`, Live hooks) proves the five browser-side
-  decision points that need context-scoped authorization: subresource factory
-  origin binding (`extension_protocols.cc` / `ios_content_browser_client.cc`),
-  extension messaging (`message_service_bindings.cc`, where the prior resource
-  experiment hit `EMF_INVALID_MESSAGE_FROM_SANDBOXED_PROCESS` = 38 →
-  `ShutdownForBadMessage`), MV3 worker lifecycle (`service_worker_host.cc`),
-  API dispatch (`extension_function_dispatcher.cc`), and event listener
-  validation / dispatch classification (`event_router.cc` / `process_map.cc`).
-  Translate those checks into `patches/` using browser-verified document origins
-  and worker identities without broadening `ProcessMap` globally, then retire
-  the vtable hook once `Kernel.lock` repins. Not written.
-- [x] **PiP close crash** (`fb14c22`, on `main`). The bridge's `-dealloc` no longer
-  captures `self` in a render-queue block. Upstream form of the `dealloc` hook.
-- [ ] **PiP in one tap, upstream form.** Proven on `ac_duo` in 0.1.7 (8). Move the
-  start hook's readiness gate and single retry into `CuriumPiPBridge`
-  (`-startPiPForGeneration:` and the failure delegate), then delete the hook.
-  Not written.
-- [ ] **Symbolicated crashes.** `args/device.gn` sets `enable_dsyms = false`, which no
-  app change can reach. Emit dSYMs as a separate artifact, never inside the IPA.
-  Not written.
+- [x] **Unstripped framework symbols artifact (`0098-ios-save-unstripped-symbols.patch`).**
+  `build/toolchain/apple/toolchain.gni` already declares `.unstripped` outputs when
+  `save_unstripped_output` is true (`enable_stripping && !enable_dsyms`) and
+  `scripts/stages/link.sh` already uploads `chrome_framework*.unstripped`, while
+  Linux Stage 4 Link cannot run macOS-only `dsymutil`. Added `-Wcrl,unstripped,`
+  with `rebase_path(root_out_dir, root_build_dir)` to `build/config/ios/BUILD.gn`
+  for zero-overhead full `LC_SYMTAB` crash symbolication without bloating compile
+  shards or the IPA.
+- [x] **Single-process extension coexistence (`0099-ios-extensions-single-process-coexistence.patch`).**
+  Translated all 6 context-scoped authorization boundaries under
+  `content::RenderProcessHost::run_renderer_in_process()` (`extension_protocols`,
+  `url_request_util`, `extension_function_dispatcher`, `message_service_bindings`,
+  `extension_message_port`, `service_worker_host`, `event_router`, `web_request_api`,
+  and `process_map`, guarding speculative RFHs before `IsErrorDocument()` and
+  scoping `ProcessHasWebUIBindings` in `GetMostLikelyContextType`). Retires
+  `CuriumExtensionCoexistenceHook.m` once `Kernel.lock` repins.
+- [x] **Extension APIs & native permissions prompt (`0100-ios-extensions-scripting-tabs-and-permissions-prompt.patch`).**
+  Added `tabs.TAB_ID_NONE = -1` to `tabs.json`, registered `APIPermissionID::kScripting`
+  and `ios_permission_features.json` in `IOSExtensionsAPIProvider`, and implemented
+  `GetNativeWindowForFunction` + `CreateInstallPromptForNativeWindow` (`UIAlertController`
+  with requested host/API listing, `transitionCoordinator` retry, and dealloc sentinel)
+  in `IOSExtensionsBrowserClient`.
+- [x] **Blink clipboard UTI conformance & trusted paste (`0101-ios-blink-clipboard-uti-and-trusted-paste.patch`).**
+  Added `UniformTypeIdentifiers.framework` to `ui/base/clipboard/BUILD.gn`,
+  `UTType` conformance matching across `ClipboardIOS`, `Clipboard::PrepareForPaste()`
+  called synchronously in `-[RenderWidgetUIView paste:]`, and `hasURLs || hasImages`
+  in `canPerformAction:`. Retires `CuriumClipboardHook.m` once `Kernel.lock` repins.
+- [x] **Multi-touch cancellation `SIGTRAP` guard (`0102-ios-blink-multitouch-cancel-guard.patch`).**
+  Replaced raw global `UITouch*` tracking in `WebTouchEventBuilder` with
+  `base::NoDestructor` weak-view slots, stale-touch draining, `ClearTouchesForView`
+  in `removeView`, and `BuildTouchEvents` lifting preceding/partial-cancel touches
+  as `kTouchEnd` (`kStateReleased`) before emitting `kTouchCancel` solely for the
+  last remaining cancelled touch. Retires `CuriumTouchCancelHook.m` once `Kernel.lock` repins.
+- [x] **Hide `inputAccessoryView` for hardware keyboards (`0103-ios-blink-hide-accessory-for-hardware-keyboard.patch`).**
+  Linked `GameController.framework` in `content/browser/BUILD.gn`, suppressed
+  `inputAccessoryView` while `GCKeyboard.coalescedKeyboard` is present, and reloaded
+  input views on connect/disconnect notifications. Retires `CuriumInputAccessoryHook.m`
+  once `Kernel.lock` repins.
+- [x] **PiP close crash (`fb14c22`) & start-when-ready (`0104-ios-curium-pip-start-when-ready.patch`).**
+  Moved the 0.15 s settle + 0.6 s readiness gate and single 0.25 s failure retry
+  into `CuriumPiPBridge` (and added an auto-skip guard in `CuriumPictureInPictureHooks.m`).
+  Retires `CuriumPictureInPictureHooks.m` once `Kernel.lock` repins.
 - [ ] **Drop `helpers/extensions_ui` from packaging.** It hooks Chrome's Settings
   screen, which Curium never shows, and `scripts/sync_curium_engine.py` does not
   carry it into `Vendor/CuriumEngine/`. Retire the extension steps in
-  `docs/simulator.md` with it. Not written.
+  `docs/simulator.md` with it. Deferred.
 
 ## Environment
 

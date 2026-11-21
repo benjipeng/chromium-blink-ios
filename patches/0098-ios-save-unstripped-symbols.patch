@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS build: emit -Wcrl,unstripped when save_unstripped_output is enabled
+
+build/toolchain/apple/toolchain.gni already declares the .unstripped linker
+output when save_unstripped_output is true (enable_stripping && !enable_dsyms),
+and build/config/mac/BUILD.gn passes -Wcrl,unstripped, but build/config/ios/BUILD.gn
+omits the flag. Pass -Wcrl,unstripped with a build-dir-relative root_out_dir so
+Linux-hosted iOS links preserve full LC_SYMTAB symbols for crash symbolication
+without requiring macOS-only dsymutil or inflating compile shards.
+
+---
+ build/config/ios/BUILD.gn | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/build/config/ios/BUILD.gn b/build/config/ios/BUILD.gn
+index e67a9cfcd2ad7565379ebd82255a058aafda26c6..14383e60c16a8c60e211ac754a212a00c64534d8 100644
+--- a/build/config/ios/BUILD.gn
++++ b/build/config/ios/BUILD.gn
+@@ -5,6 +5,7 @@
+ import("//build/buildflag_header.gni")
+ import("//build/config/apple/arch.gni")
+ import("//build/config/apple/mobile_config.gni")
++import("//build/config/apple/symbols.gni")
+ import("//build/config/ios/config.gni")
+ import("//build/config/ios/ios_sdk.gni")
+ import("//build/toolchain/apple/toolchain.gni")
+@@ -85,6 +86,10 @@ config("compiler") {
+ 
+   ldflags = common_flags
+ 
++  if (save_unstripped_output) {
++    ldflags += [ "-Wcrl,unstripped," + rebase_path(root_out_dir, root_build_dir) ]
++  }
++
+   # This is on by default in ld64 for our deployment target, but not yet
+   # in ld64.lld. Force it on.
+   if (ios_deployment_target != "11.0" && ios_deployment_target != "12.0" &&

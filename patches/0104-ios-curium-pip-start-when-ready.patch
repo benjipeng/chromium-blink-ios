@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium PiP: settle controller and retry transient AVKit start failures
+
+Starting a freshly created AVPictureInPictureController immediately often fails
+before Pegasus confirms readiness or the display layer receives its first frame
+(PGPegasusErrorDomain -1003 or silent status = 0). Wait until the controller has
+settled (0.15 s) and reports pictureInPicturePossible while the sample buffer
+renderer is rendering (up to a 0.6 s readiness deadline), and retry once after
+0.25 s on delegate-reported start failure while keeping the 6 s start timeout.
+
+---
+ .../picture_in_picture/ios_video_overlay_window.mm | 175 +++++++++++++++++++--
+ 1 file changed, 159 insertions(+), 16 deletions(-)
+
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+index 0dc81545ba826e49666c546b406357604fba7542..db70043e23152a1a8626a8b50dd9e01294f8c02d 100644
+--- a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+@@ -39,6 +39,11 @@
+ constexpr int kMaxSwPoolBuffers = 6;
+ constexpr int kMaxConsecutiveDecodeFailures = 3;
+ constexpr double kStartTimeoutSeconds = 6.0;
++constexpr CFTimeInterval kStartSettleSeconds = 0.15;
++constexpr CFTimeInterval kStartReadyDeadlineSeconds = 0.6;
++constexpr CFTimeInterval kStartReadyPollSeconds = 0.03;
++constexpr CFTimeInterval kStartRetryDelaySeconds = 0.25;
++constexpr NSUInteger kMaxStartRetries = 1;
+ 
+ UIWindow* FindTargetWindow(
+     content::VideoPictureInPictureWindowController* controller) {
+@@ -409,6 +414,10 @@ @implementation CuriumPiPBridge {
+   BOOL _pipActive;
+   BOOL _startAttemptActive;
+   uint64_t _startAttemptGeneration;
++  CFTimeInterval _pipControllerCreatedAt;
++  uint64_t _startRetryGeneration;
++  NSUInteger _startRetryCount;
++  BOOL _startRetryPending;
+   BOOL _mainPlaybackPaused;
+   double _mainDurationSeconds;
+   double _mainPlaybackRate;
+@@ -493,6 +502,9 @@ - (void)teardownObserversAndViews {
+   [self detachObservers];
+   _waitingForPossible = NO;
+   _startAttemptActive = NO;
++  _pipControllerCreatedAt = 0;
++  _startRetryCount = 0;
++  _startRetryPending = NO;
+   _pipController.delegate = nil;
+   _pipController = nil;
+   _displayLayer = nil;
+@@ -516,6 +528,9 @@ - (void)prepareHostInWindow:(UIWindow*)window
+   _activeGeneration = generation;
+   _atomicGeneration.store(generation, std::memory_order_release);
+   _startAttemptActive = NO;
++  _startRetryGeneration = generation;
++  _startRetryCount = 0;
++  _startRetryPending = NO;
+ 
+   if (!window || !window.rootViewController.view) {
+     return;
+@@ -577,6 +592,7 @@ - (void)prepareHostInWindow:(UIWindow*)window
+                             playbackDelegate:self];
+     _pipController =
+         [[AVPictureInPictureController alloc] initWithContentSource:source];
++    _pipControllerCreatedAt = CACurrentMediaTime();
+     _pipController.delegate = self;
+     _pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
+     _pipController.requiresLinearPlayback = YES;
+@@ -634,6 +650,60 @@ - (void)prepareHostInWindow:(UIWindow*)window
+   }
+ }
+ 
++// Ready means the freshly created AVPictureInPictureController has settled with
++// Pegasus, reports pictureInPicturePossible, and the display layer has received
++// at least one frame so Pegasus does not fail with PGPegasusErrorDomain -1003.
++- (BOOL)isReadyToStartPiPForGeneration:(uint64_t)generation
++                              nextWait:(CFTimeInterval*)outWait {
++  if (outWait) {
++    *outWait = kStartReadyPollSeconds;
++  }
++  if (!_pipController || !_displayLayer ||
++      _pipController.isPictureInPictureActive ||
++      _activeGeneration != generation) {
++    return YES;
++  }
++  const CFTimeInterval remainingSettle =
++      kStartSettleSeconds - (CACurrentMediaTime() - _pipControllerCreatedAt);
++  if (remainingSettle > 0) {
++    if (outWait) {
++      *outWait = std::max(remainingSettle, kStartReadyPollSeconds);
++    }
++    return NO;
++  }
++  return _pipController.isPictureInPicturePossible &&
++         _displayLayer.sampleBufferRenderer.status ==
++             AVQueuedSampleBufferRenderingStatusRendering;
++}
++
++- (void)runWhenReadyForGeneration:(uint64_t)generation
++                        startedAt:(CFTimeInterval)startedAt
++                           action:(void (^)(CuriumPiPBridge* bridge))action {
++  const CFTimeInterval waited = CACurrentMediaTime() - startedAt;
++  CFTimeInterval nextWait = kStartReadyPollSeconds;
++  const BOOL ready = [self isReadyToStartPiPForGeneration:generation
++                                                 nextWait:&nextWait];
++  if (ready || waited >= kStartReadyDeadlineSeconds) {
++    action(self);
++    return;
++  }
++  const CFTimeInterval remainingDeadline =
++      std::max<CFTimeInterval>(0.0, kStartReadyDeadlineSeconds - waited);
++  nextWait = std::min(nextWait, remainingDeadline);
++  __weak CuriumPiPBridge* weakSelf = self;
++  dispatch_after(
++      dispatch_time(DISPATCH_TIME_NOW,
++                    static_cast<int64_t>(nextWait * NSEC_PER_SEC)),
++      dispatch_get_main_queue(), ^{
++        CuriumPiPBridge* strongSelf = weakSelf;
++        if (strongSelf) {
++          [strongSelf runWhenReadyForGeneration:generation
++                                      startedAt:startedAt
++                                         action:action];
++        }
++      });
++}
++
+ - (void)startPiPForGeneration:(uint64_t)generation {
+   if (_activeGeneration != generation || !_pipController) {
+     [self notifyFailedToStartForGeneration:generation];
+@@ -646,19 +716,9 @@ - (void)startPiPForGeneration:(uint64_t)generation {
+ 
+   _startAttemptGeneration = generation;
+   _startAttemptActive = YES;
+-  [_pipController invalidatePlaybackState];
+-
+-  if (_pipController.isPictureInPictureActive) {
+-    [self notifyDidStartForGeneration:generation];
+-    return;
+-  }
+-
+-  if (_pipController.isPictureInPicturePossible) {
+-    _waitingForPossible = NO;
+-    [_pipController startPictureInPicture];
+-  } else {
+-    _waitingForPossible = YES;
+-  }
++  _startRetryGeneration = generation;
++  _startRetryCount = 0;
++  _startRetryPending = NO;
+ 
+   __weak CuriumPiPBridge* weakSelf = self;
+   dispatch_after(
+@@ -666,14 +726,49 @@ - (void)startPiPForGeneration:(uint64_t)generation {
+                     static_cast<int64_t>(kStartTimeoutSeconds * NSEC_PER_SEC)),
+       dispatch_get_main_queue(), ^{
+         CuriumPiPBridge* strongSelf = weakSelf;
+-        if (!strongSelf || strongSelf->_activeGeneration != generation) {
++        if (!strongSelf || strongSelf->_activeGeneration != generation ||
++            !strongSelf->_startAttemptActive ||
++            strongSelf->_startAttemptGeneration != generation) {
+           return;
+         }
+         if (!strongSelf->_pipActive) {
+           strongSelf->_waitingForPossible = NO;
++          strongSelf->_startAttemptActive = NO;
++          strongSelf->_startRetryPending = NO;
+           [strongSelf notifyFailedToStartForGeneration:generation];
+         }
+       });
++
++  [self runWhenReadyForGeneration:generation
++                        startedAt:CACurrentMediaTime()
++                           action:^(CuriumPiPBridge* bridge) {
++                             if (bridge->_activeGeneration != generation ||
++                                 !bridge->_startAttemptActive ||
++                                 bridge->_startAttemptGeneration !=
++                                     generation) {
++                               return;
++                             }
++                             if (!bridge->_pipController) {
++                               bridge->_startAttemptActive = NO;
++                               [bridge
++                                   notifyFailedToStartForGeneration:generation];
++                               return;
++                             }
++                             [bridge->_pipController invalidatePlaybackState];
++                             if (bridge->_pipController
++                                     .isPictureInPictureActive) {
++                               bridge->_startAttemptActive = NO;
++                               [bridge notifyDidStartForGeneration:generation];
++                               return;
++                             }
++                             if (bridge->_pipController
++                                     .isPictureInPicturePossible) {
++                               bridge->_waitingForPossible = NO;
++                               [bridge->_pipController startPictureInPicture];
++                             } else {
++                               bridge->_waitingForPossible = YES;
++                             }
++                           }];
+ }
+ 
+ - (void)stopPiPAndDetach:(BOOL)removeImage {
+@@ -682,6 +777,8 @@ - (void)stopPiPAndDetach:(BOOL)removeImage {
+   _atomicGeneration.store(nextGen, std::memory_order_release);
+   _waitingForPossible = NO;
+   _startAttemptActive = NO;
++  _startRetryCount = 0;
++  _startRetryPending = NO;
+   _pipActive = NO;
+ 
+   {
+@@ -961,6 +1058,7 @@ - (void)pictureInPictureControllerDidStartPictureInPicture:
+     return;
+   }
+   _startAttemptActive = NO;
++  _startRetryPending = NO;
+   [self notifyDidStartForGeneration:_startAttemptGeneration];
+ }
+ 
+@@ -970,11 +1068,56 @@ - (void)pictureInPictureController:
+   LOG(WARNING) << "AVPictureInPictureController failed to start: "
+                << (error ? error.localizedDescription.UTF8String : "unknown");
+   if (pictureInPictureController != _pipController || !_startAttemptActive ||
+-      _activeGeneration != _startAttemptGeneration) {
++      _activeGeneration != _startAttemptGeneration || _pipActive ||
++      pictureInPictureController.isPictureInPictureActive) {
++    return;
++  }
++  const uint64_t generation = _startAttemptGeneration;
++  if (_startRetryGeneration != generation) {
++    _startRetryGeneration = generation;
++    _startRetryCount = 0;
++    _startRetryPending = NO;
++  }
++  if (_startRetryPending) {
++    return;
++  }
++  if (_startRetryCount < kMaxStartRetries) {
++    _startRetryCount += 1;
++    _startRetryPending = YES;
++    AVPictureInPictureController* targetController = pictureInPictureController;
++    __weak CuriumPiPBridge* weakSelf = self;
++    dispatch_after(
++        dispatch_time(
++            DISPATCH_TIME_NOW,
++            static_cast<int64_t>(kStartRetryDelaySeconds * NSEC_PER_SEC)),
++        dispatch_get_main_queue(), ^{
++          CuriumPiPBridge* strongSelf = weakSelf;
++          if (!strongSelf) {
++            return;
++          }
++          [strongSelf
++              runWhenReadyForGeneration:generation
++                              startedAt:CACurrentMediaTime()
++                                 action:^(CuriumPiPBridge* readyBridge) {
++                                   readyBridge->_startRetryPending = NO;
++                                   if (readyBridge->_pipController ==
++                                           targetController &&
++                                       readyBridge->_activeGeneration ==
++                                           generation &&
++                                       readyBridge->_startAttemptActive &&
++                                       readyBridge->_startAttemptGeneration ==
++                                           generation &&
++                                       !readyBridge->_pipActive &&
++                                       !targetController
++                                            .isPictureInPictureActive) {
++                                     [targetController startPictureInPicture];
++                                   }
++                                 }];
++        });
+     return;
+   }
+   _startAttemptActive = NO;
+-  [self notifyFailedToStartForGeneration:_startAttemptGeneration];
++  [self notifyFailedToStartForGeneration:generation];
+ }
+ 
+ - (void)pictureInPictureControllerDidStopPictureInPicture:

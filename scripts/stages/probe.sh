@@ -86,7 +86,17 @@ obj/extensions/browser/browser_sources/extension_webkit_preferences.o
 obj/extensions/common/common/options_page_info.o
 obj/ios/web/content/init/extensions/clients/ios_extensions_api_provider.o
 obj/ios/web/content/init/extensions/ios_api_features/ios_api_features.o
+obj/ios/web/content/init/extensions/ios_permission_features/ios_permission_features.o
 obj/ios/web/content/init/extensions/ios_api_json_strings/generated_schemas.o
+obj/extensions/browser/browser_sources/event_router.o
+obj/extensions/browser/browser_sources/extension_function_dispatcher.o
+obj/extensions/browser/browser_sources/extension_protocols.o
+obj/extensions/browser/browser_sources/process_map.o
+obj/extensions/browser/browser_sources/url_request_util.o
+obj/extensions/browser/api/messaging/messaging/extension_message_port.o
+obj/extensions/browser/api/messaging/messaging/message_service_bindings.o
+obj/ui/base/clipboard/clipboard/clipboard_ios.o
+obj/components/input/input/web_input_event_builders_ios.o
 obj/ios/chrome/browser/extensions/model/model/ios_commands_api.o
 obj/ios/chrome/browser/extensions/model/model/ios_extensions_browser_api_provider.o
 obj/ios/chrome/browser/extensions/model/model/ios_tabs_api.o
