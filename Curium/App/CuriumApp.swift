@@ -7,8 +7,17 @@ import UIKit
 enum CuriumApp {
     static func main() {
         #if CURIUM_LINKED_ENGINE
-        if CuriumRegisterShell(CuriumShellBootstrap()) {
-            exit(ChromeMain(CommandLine.argc, CommandLine.unsafeArgv))
+        let launchOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch()
+        switch launchOutcome {
+        case .rejected:
+            // Fail closed: never silently open the default cookie jar when an
+            // explicitly selected profile failed validation or directory binding.
+            CuriumStandbyApp.main()
+            return
+        case .defaultBuild39, .configured:
+            if CuriumRegisterShell(CuriumShellBootstrap()) {
+                exit(ChromeMain(CommandLine.argc, CommandLine.unsafeArgv))
+            }
         }
         #endif
         CuriumStandbyApp.main()
@@ -17,7 +26,52 @@ enum CuriumApp {
 
 private struct CuriumStandbyApp: App {
     var body: some Scene {
-        WindowGroup { CuriumStandbyWindow() }
+        WindowGroup {
+            if case .rejected(let profileID, let reason) = CuriumFingerprintBootstrap.lastOutcome {
+                CuriumProfileLaunchRecoveryView(profileID: profileID, reason: reason)
+            } else {
+                CuriumStandbyWindow()
+            }
+        }
+    }
+}
+
+private struct CuriumProfileLaunchRecoveryView: View {
+    let profileID: String
+    let reason: String
+    @State private var resetCompleted = false
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "shield.lefthalf.filled.trianglebadge.exclamationmark")
+                .font(.system(size: 44))
+                .foregroundStyle(.orange)
+            Text("Profile Launch Blocked")
+                .font(.title2.weight(.semibold))
+            Text("Profile \"\(profileID)\" could not be opened safely, so Curium stopped before loading the default profile.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text(reason)
+                .font(.caption.monospaced())
+                .foregroundStyle(.primary)
+                .padding(12)
+                .frame(maxWidth: 420)
+                .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            if resetCompleted {
+                Text("Reset to Default (Build 39) saved. Close and relaunch Curium.")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.green)
+            } else {
+                Button("Reset to Default Profile for Next Launch") {
+                    let store = CuriumFingerprintStore.loadShared()
+                    store.resetToBuild39Default()
+                    resetCompleted = true
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
     }
 }
 

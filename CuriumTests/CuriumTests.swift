@@ -443,3 +443,151 @@ struct CuriumDiagnosticsAndLayoutTests {
         #expect(CuriumNormalizedAcceptLanguages(["bad;header"]) == "en-US,en")
     }
 }
+
+@Suite("Modular Fingerprint Profiles & Validation")
+struct CuriumFingerprintTests {
+    @Test("All built-in presets pass structural validation and preserve native hardware unless opted in")
+    func builtInPresetsValidate() throws {
+        for preset in CuriumFingerprintPresets.allBuiltIns {
+            let report = CuriumFingerprintValidator.validate(preset)
+            #expect(report.isValid, "Preset \(preset.id) errors: \(report.errors)")
+            let wireData = try preset.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US", "zh-Hans-CN"])
+            #expect(wireData.count <= CuriumFingerprintSchema.maxPayloadBytes)
+            let obj = try #require(JSONSerialization.jsonObject(with: wireData) as? [String: Any])
+            #expect((obj["schemaVersion"] as? Int) == 1)
+            #expect((obj["profileId"] as? String) == preset.id)
+            // UI-only keys must never leak into the strict engine wire payload.
+            #expect(obj["displayName"] == nil)
+            #expect(obj["notes"] == nil)
+            #expect(obj["isBuiltIn"] == nil)
+        }
+        #expect(CuriumFingerprintPresets.defaultAuthenticChrome.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.iosBlinkAuthentic.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.macosDesktopFirst.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.privacyHardened.usesNativeHardwareAndGPU)
+        #expect(!CuriumFingerprintPresets.windowsWorkstation.usesNativeHardwareAndGPU)
+    }
+
+    @Test("Validator rejects unsafe profile IDs, bad W3C deviceMemory buckets, invalid proxies, and bad timezones")
+    func validatorRejectsInvalidConfigs() {
+        #expect(CuriumFingerprintValidator.isValidProfileID("default"))
+        #expect(CuriumFingerprintValidator.isValidProfileID("work_01-us"))
+        #expect(!CuriumFingerprintValidator.isValidProfileID("Default"))
+        #expect(!CuriumFingerprintValidator.isValidProfileID("../escape"))
+        #expect(!CuriumFingerprintValidator.isValidProfileID("-leading-dash"))
+        #expect(!CuriumFingerprintValidator.isValidProfileID(String(repeating: "a", count: 33)))
+
+        var bad = CuriumFingerprintPresets.defaultAuthenticChrome
+        bad.id = "bad/slash"
+        bad.hardware.hardwareConcurrency = 0
+        bad.hardware.deviceMemoryGB = 6
+        bad.hardware.timezone = "Mars/Olympus"
+        bad.proxy = .fixed(rules: "   ", bypassRules: nil)
+        bad.languages = ["en-US,fr-FR"]
+        let report = CuriumFingerprintValidator.validate(bad)
+        #expect(!report.isValid)
+        #expect(report.errors.count >= 6)
+
+        // Fixed proxy syntax parity with C++ ProxyRules::ParseFromString.
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("socks5://127.0.0.1:1080"))
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080;https=socks5://[::1]:1080"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("direct://"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("bad_scheme://127.0.0.1:99999"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("socks5://127.0.0.1:70000"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080,direct://"))
+    }
+
+    @Test("Validator emits coherence warnings for mismatched Windows/Apple GPU or Android > 8 GB RAM")
+    func validatorCoherenceWarnings() {
+        var winNativeGPU = CuriumFingerprintPresets.windowsWorkstation
+        winNativeGPU.desktop.webglVendor = nil
+        winNativeGPU.desktop.webglRenderer = nil
+        winNativeGPU.mobile.webglVendor = nil
+        winNativeGPU.mobile.webglRenderer = nil
+        let winReport = CuriumFingerprintValidator.validate(winNativeGPU)
+        #expect(winReport.isValid)
+        #expect(winReport.warnings.contains { $0.contains("Windows identity with native Apple Metal GPU") })
+
+        var android16 = CuriumFingerprintPresets.defaultAuthenticChrome
+        android16.hardware.deviceMemoryGB = 16
+        let androidReport = CuriumFingerprintValidator.validate(android16)
+        #expect(androidReport.isValid)
+        #expect(androidReport.warnings.contains { $0.contains("caps navigator.deviceMemory at 8 GB") })
+    }
+
+    @Test("Proxy wire encoding stays strictly mutually exclusive across system, direct, and fixed modes")
+    func proxyEncodingMutuallyExclusive() throws {
+        var profile = CuriumFingerprintPresets.defaultAuthenticChrome
+        profile.proxy = .system
+        let sysObj = try #require(JSONSerialization.jsonObject(with: try profile.makeEngineLaunchJSON()) as? [String: Any])
+        let sysProxy = try #require(sysObj["proxy"] as? [String: Any])
+        #expect((sysProxy["mode"] as? String) == "system")
+        #expect(sysProxy["rules"] == nil)
+
+        profile.proxy = .direct
+        let dirObj = try #require(JSONSerialization.jsonObject(with: try profile.makeEngineLaunchJSON()) as? [String: Any])
+        let dirProxy = try #require(dirObj["proxy"] as? [String: Any])
+        #expect((dirProxy["mode"] as? String) == "direct")
+        #expect(dirProxy["rules"] == nil)
+
+        profile.proxy = .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost;127.0.0.1")
+        let fixObj = try #require(JSONSerialization.jsonObject(with: try profile.makeEngineLaunchJSON()) as? [String: Any])
+        let fixProxy = try #require(fixObj["proxy"] as? [String: Any])
+        #expect((fixProxy["mode"] as? String) == "fixed")
+        #expect((fixProxy["rules"] as? String) == "socks5://127.0.0.1:1080")
+        #expect((fixProxy["bypassRules"] as? String) == "localhost;127.0.0.1")
+    }
+
+    @Test("Fingerprint store persists selection, duplicates, bumps revisions, exports/imports, and protects default")
+    func storePersistenceAndLifecycle() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-fp-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let store = CuriumFingerprintStore(fileURL: fileURL)
+        #expect(store.selectedProfileID == nil)
+        #expect(!store.deleteProfile(id: "default"))
+
+        let custom = try #require(store.duplicateProfile(from: "win11-workstation", newID: "office-win", displayName: "Office Win"))
+        #expect(custom.id == "office-win")
+        #expect(store.selectProfile(id: "office-win"))
+
+        var edited = custom
+        edited.hardware.timezone = "America/New_York"
+        let upsertReport = store.upsert(edited)
+        #expect(upsertReport.isValid)
+
+        let reloaded = CuriumFingerprintStore(fileURL: fileURL)
+        #expect(reloaded.selectedProfileID == "office-win")
+        let loadedCustom = try #require(reloaded.profiles.first { $0.id == "office-win" })
+        #expect(loadedCustom.revision == 2)
+        #expect(loadedCustom.hardware.timezone == "America/New_York")
+
+        let exported = try reloaded.exportProfileJSON(id: "office-win")
+        #expect(try reloaded.importProfileJSON(exported).isValid)
+
+        #expect(reloaded.deleteProfile(id: "office-win"))
+        #expect(reloaded.selectedProfileID == nil)
+    }
+
+    @Test("Bootstrap fails closed when an explicit profile is selected without a Build 40+ engine")
+    @MainActor
+    func bootstrapFailsClosedWithoutEngineSupport() {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-fp-boot-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let store = CuriumFingerprintStore(fileURL: fileURL)
+        #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
+
+        #expect(store.selectProfile(id: "macos-desktop"))
+        let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(store: store)
+        if case .rejected(let profileID, _) = outcome {
+            #expect(profileID == "macos-desktop")
+        } else {
+            Issue.record("Expected fail-closed rejection when engine lacks Build 40 fingerprint contract, got \(outcome)")
+        }
+    }
+}

@@ -153,6 +153,13 @@ obj/ios/web/content/content/content_browser_context.o
 obj/ios/web/content/content/content_navigation_manager.o
 obj/ios/web/content/init/init/ios_main_delegate.o
 obj/third_party/blink/renderer/core/core/navigator_base.o
+obj/content/renderer/renderer/render_frame_impl.o
+obj/ios/chrome/browser/shared/model/paths/paths/paths.o
+obj/third_party/blink/common/common/approximated_device_memory.o
+obj/third_party/blink/common/common/curium_fingerprint_config.o
+obj/third_party/blink/renderer/core/core/navigator_concurrent_hardware.o
+obj/third_party/blink/renderer/core/core/timezone_controller.o
+obj/third_party/blink/renderer/modules/webgl/webgl/webgl_rendering_context_base.o
 EOF
   python3 - <<'PY'
 import os

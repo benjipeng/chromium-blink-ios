@@ -1,0 +1,2907 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Subject: [PATCH] iOS Curium: modular launch-scoped fingerprint config, profile
+ isolation, Zstd baseline, and OOPIF desktop inheritance
+
+---
+ components/embedder_support/BUILD.gn          |    2 +-
+ .../embedder_support/user_agent_utils.cc      |  248 ++++
+ .../embedder_support/user_agent_utils.h       |    9 +-
+ content/renderer/render_frame_impl.cc         |   91 +-
+ ios/chrome/browser/curium/BUILD.gn            |    9 +-
+ ios/chrome/browser/curium/DEPS                |    1 +
+ .../browser/curium/cr_ios_engine_bootstrap.mm |  203 ++++
+ .../curium/curium_engine_contract_internal.h  |   18 +
+ ios/chrome/browser/shared/model/paths/paths.h |   14 +
+ .../browser/shared/model/paths/paths.mm       |  222 +++-
+ .../browser/web/model/chrome_web_client.mm    |    4 +-
+ ios/web/content/DEPS                          |    1 +
+ ios/web/content/init/DEPS                     |    5 +
+ .../init/ios_content_browser_client.cc        |  118 +-
+ ios/web/content/init/ios_main_delegate.mm     |    7 +-
+ .../navigation/content_navigation_manager.mm  |   49 +-
+ .../content/web_state/content_web_state.mm    |   20 +-
+ third_party/blink/common/BUILD.gn             |    1 +
+ .../curium/curium_fingerprint_config.cc       | 1052 +++++++++++++++++
+ .../approximated_device_memory.cc             |   35 +
+ third_party/blink/public/common/BUILD.gn      |    1 +
+ .../common/curium/curium_fingerprint_config.h |  207 ++++
+ .../core/execution_context/navigator_base.cc  |   15 +-
+ .../frame/navigator_concurrent_hardware.cc    |   10 +
+ .../core/timezone/timezone_controller.cc      |   18 +
+ .../webgl/webgl_rendering_context_base.cc     |   20 +
+ 26 files changed, 2293 insertions(+), 87 deletions(-)
+ create mode 100644 third_party/blink/common/curium/curium_fingerprint_config.cc
+ create mode 100644 third_party/blink/public/common/curium/curium_fingerprint_config.h
+
+diff --git a/components/embedder_support/BUILD.gn b/components/embedder_support/BUILD.gn
+index 4fcfc89..47721a1 100644
+--- a/components/embedder_support/BUILD.gn
++++ b/components/embedder_support/BUILD.gn
+@@ -60,7 +60,7 @@ static_library("user_agent") {
+     "//build:branding_buildflags",
+     "//components/version_info",
+     "//net",
+-    "//third_party/blink/public/common:headers",
++    "//third_party/blink/public/common",
+     "//ui/base",
+   ]
+ }
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 0f414ba..e1d1932 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -30,6 +30,9 @@
+ #include "net/http/http_util.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
+@@ -226,6 +229,176 @@ std::string GetCuriumMobileModel() {
+   }
+   return std::string();
+ }
++
++std::string DefaultDesktopMacPlatformVersion() {
++  int32_t major = 0, minor = 0, bugfix = 0;
++  base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
++  if (major >= 26) {
++    return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
++  }
++  return "15.5.0";
++}
++
++std::string GetCuriumLegacyDesktopPlatformVersion() {
++  const base::CommandLine* cmd = CurrentCommandLine();
++  if (cmd && cmd->HasSwitch("curium-desktop-platform-version")) {
++    const std::string ver =
++        cmd->GetSwitchValueASCII("curium-desktop-platform-version");
++    if (IsValidClientHintToken(ver)) {
++      return ver;
++    }
++  }
++  return DefaultDesktopMacPlatformVersion();
++}
++
++struct CuriumSlotVersions {
++  std::string major_version;
++  std::string full_version;
++};
++
++CuriumSlotVersions ResolveCuriumSlotVersions(
++    const blink::curium::IdentitySlotConfig& slot) {
++  const std::string default_major = version_info::GetMajorVersionNumber();
++  const std::string default_full(version_info::GetVersionNumber());
++
++  std::string major;
++  if (slot.major_version.has_value() && !slot.major_version->empty()) {
++    major = *slot.major_version;
++  } else if (slot.full_version.has_value() && !slot.full_version->empty()) {
++    const size_t dot = slot.full_version->find('.');
++    std::string_view prefix = dot == std::string::npos
++                                  ? std::string_view(*slot.full_version)
++                                  : std::string_view(*slot.full_version).substr(0, dot);
++    int parsed = 0;
++    const bool all_digits =
++        !prefix.empty() && prefix.size() <= 4 &&
++        std::all_of(prefix.begin(), prefix.end(), [](unsigned char c) {
++          return base::IsAsciiDigit(c);
++        });
++    if (all_digits && base::StringToInt(prefix, &parsed) && parsed >= 1) {
++      major = std::string(prefix);
++    } else {
++      major = default_major;
++    }
++  } else {
++    major = default_major;
++  }
++
++  std::string full;
++  if (slot.full_version.has_value() && !slot.full_version->empty()) {
++    full = *slot.full_version;
++  } else if (slot.major_version.has_value() && major != default_major) {
++    full = base::StrCat({major, ".0.0.0"});
++  } else {
++    full = default_full;
++  }
++
++  return {std::move(major), std::move(full)};
++}
++
++std::string DefaultPlatformVersionForCuriumPlatform(std::string_view platform) {
++  if (platform == "macOS") {
++    return DefaultDesktopMacPlatformVersion();
++  }
++  if (platform == "iOS") {
++    int32_t major = 0, minor = 0, bugfix = 0;
++    base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
++    return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
++  }
++  if (platform == "Linux" || platform == "Chrome OS" ||
++      platform == "Chromium OS") {
++    return std::string();
++  }
++  return "15.0.0";
++}
++
++std::string BuildUserAgentForCuriumSlot(
++    const blink::curium::IdentitySlotConfig& slot,
++    bool is_desktop_fallback) {
++  if (slot.ua_string.has_value() && !slot.ua_string->empty()) {
++    return *slot.ua_string;
++  }
++  std::string product;
++  if (slot.product_version.has_value()) {
++    product = *slot.product_version;
++  } else if (slot.major_version.has_value() || slot.full_version.has_value()) {
++    const CuriumSlotVersions versions = ResolveCuriumSlotVersions(slot);
++    product = base::StrCat({"Chrome/", versions.major_version, ".0.0.0"});
++  } else {
++    product = GetProductAndVersion();
++  }
++  const bool is_mobile = slot.mobile.value_or(!is_desktop_fallback);
++  if (slot.append_mobile_token.value_or(is_mobile)) {
++    product += " Mobile";
++  }
++  const std::string os_cpu =
++      slot.os_cpu.has_value()
++          ? *slot.os_cpu
++          : (is_desktop_fallback ? std::string("Macintosh; Intel Mac OS X 10_15_7")
++                                 : std::string("Linux; Android 10; K"));
++  return BuildUserAgentFromOSAndProduct(os_cpu, product);
++}
++
++blink::UserAgentMetadata BuildMetadataForCuriumSlot(
++    const blink::curium::IdentitySlotConfig& slot,
++    bool is_desktop_fallback,
++    bool only_low_entropy_ch) {
++  blink::UserAgentMetadata metadata;
++  const CuriumSlotVersions versions = ResolveCuriumSlotVersions(slot);
++  const std::string& major_version = versions.major_version;
++  const std::string& full_version = versions.full_version;
++  int major_seed = 0;
++  if (!base::StringToInt(major_version, &major_seed) || major_seed < 0) {
++    base::StringToInt(version_info::GetMajorVersionNumber(), &major_seed);
++  }
++  const std::optional<std::string> brand =
++      slot.has_primary_brand ? slot.primary_brand
++                             : std::optional<std::string>("Google Chrome");
++
++  if (slot.brands.has_value()) {
++    metadata.brand_version_list = *slot.brands;
++  } else {
++    metadata.brand_version_list = GenerateBrandVersionList(
++        major_seed, brand, major_version,
++        blink::UserAgentBrandVersionType::kMajorVersion, std::nullopt);
++  }
++  metadata.mobile = slot.mobile.value_or(!is_desktop_fallback);
++  metadata.platform =
++      slot.platform.value_or(is_desktop_fallback ? "macOS" : "Android");
++
++  if (only_low_entropy_ch) {
++    return metadata;
++  }
++
++  if (slot.full_version_brands.has_value()) {
++    metadata.brand_full_version_list = *slot.full_version_brands;
++  } else if (slot.brands.has_value()) {
++    metadata.brand_full_version_list = *slot.brands;
++    for (auto& bv : metadata.brand_full_version_list) {
++      if (bv.version == major_version) {
++        bv.version = full_version;
++      } else if (bv.version.find('.') == std::string::npos) {
++        bv.version += ".0.0.0";
++      }
++    }
++  } else {
++    metadata.brand_full_version_list = GenerateBrandVersionList(
++        major_seed, brand, full_version,
++        blink::UserAgentBrandVersionType::kFullVersion, std::nullopt);
++  }
++
++  metadata.full_version = full_version;
++  metadata.platform_version = slot.platform_version.value_or(
++      DefaultPlatformVersionForCuriumPlatform(metadata.platform));
++  metadata.architecture =
++      slot.architecture.value_or(is_desktop_fallback ? "arm" : "");
++  metadata.bitness = slot.bitness.value_or(is_desktop_fallback ? "64" : "");
++  metadata.model = slot.model.value_or("");
++  metadata.wow64 = slot.wow64.value_or(false);
++  metadata.form_factors =
++      slot.form_factors.value_or(GetFormFactorsClientHint(metadata, metadata.mobile));
++  return metadata;
++}
+ #endif  // BUILDFLAG(IS_IOS)
+ 
+ const blink::UserAgentBrandList GetUserAgentBrandList(
+@@ -574,6 +747,15 @@ std::string GetUserAgent() {
+     return custom_ua.value();
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    return BuildUserAgentForCuriumSlot(
++        cfg->DefaultIdentity(),
++        cfg->default_slot == blink::curium::DefaultSlot::kDesktop);
++  }
++#endif
++
+   return GetUserAgentInternal();
+ }
+ 
+@@ -729,6 +911,21 @@ std::string GetPlatformForUAMetadata() {
+ }
+ 
+ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
++#if BUILDFLAG(IS_IOS)
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
++    if (custom_ua.has_value() &&
++        base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)) {
++      return blink::UserAgentMetadata();
++    }
++    return BuildMetadataForCuriumSlot(
++        cfg->DefaultIdentity(),
++        cfg->default_slot == blink::curium::DefaultSlot::kDesktop,
++        only_low_entropy_ch || custom_ua.has_value());
++  }
++#endif
++
+   blink::UserAgentMetadata metadata;
+ 
+   // Low entropy client hints.
+@@ -1020,6 +1217,14 @@ void EnsureCuriumMobileUserAgentSwitch() {
+   if (cmd->HasSwitch(kUseMobileUserAgent)) {
+     return;
+   }
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    if (cfg->default_slot == blink::curium::DefaultSlot::kMobile &&
++        cfg->mobile.mobile.value_or(true)) {
++      cmd->AppendSwitch(kUseMobileUserAgent);
++    }
++    return;
++  }
+   if (UseAndroidMobileIdentity() ||
+       ui::GetDeviceFormFactor() != ui::DEVICE_FORM_FACTOR_TABLET) {
+     cmd->AppendSwitch(kUseMobileUserAgent);
+@@ -1027,6 +1232,10 @@ void EnsureCuriumMobileUserAgentSwitch() {
+ }
+ 
+ std::string GetCuriumAcceptLanguages() {
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    return cfg->AcceptLanguagesCSV();
++  }
+   const base::CommandLine* cmd = CurrentCommandLine();
+   if (cmd && cmd->HasSwitch("curium-accept-lang")) {
+     const std::string raw = cmd->GetSwitchValueASCII("curium-accept-lang");
+@@ -1058,6 +1267,45 @@ std::string GetCuriumAcceptLanguages() {
+   }
+   return "en-US,en";
+ }
++
++std::string GetCuriumDesktopUserAgent() {
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    return BuildUserAgentForCuriumSlot(cfg->desktop,
++                                       /*is_desktop_fallback=*/true);
++  }
++  return BuildUserAgentFromOSAndProduct("Macintosh; Intel Mac OS X 10_15_7",
++                                        GetProductAndVersion());
++}
++
++blink::UserAgentOverride GetCuriumDesktopUserAgentOverride() {
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    blink::UserAgentOverride ua_override;
++    ua_override.ua_string_override =
++        BuildUserAgentForCuriumSlot(cfg->desktop, /*is_desktop_fallback=*/true);
++    ua_override.ua_metadata_override = BuildMetadataForCuriumSlot(
++        cfg->desktop, /*is_desktop_fallback=*/true,
++        /*only_low_entropy_ch=*/false);
++    return ua_override;
++  }
++  const blink::UserAgentMetadata metadata = GetUserAgentMetadata();
++  blink::UserAgentOverride ua_override;
++  ua_override.ua_string_override = BuildUserAgentFromOSAndProduct(
++      "Macintosh; Intel Mac OS X 10_15_7", GetProductAndVersion());
++  ua_override.ua_metadata_override = metadata;
++  ua_override.ua_metadata_override->platform = "macOS";
++  ua_override.ua_metadata_override->platform_version =
++      GetCuriumLegacyDesktopPlatformVersion();
++  ua_override.ua_metadata_override->model = std::string();
++  ua_override.ua_metadata_override->mobile = false;
++  ua_override.ua_metadata_override->form_factors =
++      GetFormFactorsClientHint(metadata, /*is_mobile=*/false);
++  ua_override.ua_metadata_override->architecture = "arm";
++  ua_override.ua_metadata_override->bitness = "64";
++  ua_override.ua_metadata_override->wow64 = false;
++  return ua_override;
++}
+ #endif  // BUILDFLAG(IS_IOS)
+ 
+ }  // namespace embedder_support
+diff --git a/components/embedder_support/user_agent_utils.h b/components/embedder_support/user_agent_utils.h
+index d78974c..a7ed738 100644
+--- a/components/embedder_support/user_agent_utils.h
++++ b/components/embedder_support/user_agent_utils.h
+@@ -155,8 +155,15 @@ bool IsWoW64();
+ void EnsureCuriumMobileUserAgentSwitch();
+ 
+ // [ios-blink-sideload] Returns the sanitized Accept-Language list configured
+-// for Curium (--curium-accept-lang when valid, defaulting to "en-US,en").
++// for Curium (launch fingerprint config when set, else --curium-accept-lang or
++// "en-US,en").
+ std::string GetCuriumAcceptLanguages();
++
++// [ios-blink-sideload] Returns the active Desktop slot User-Agent string and
++// full UserAgentOverride (launch fingerprint config when set, else Build 39
++// macOS arm64 Chrome defaults).
++std::string GetCuriumDesktopUserAgent();
++blink::UserAgentOverride GetCuriumDesktopUserAgentOverride();
+ #endif  // BUILDFLAG(IS_IOS)
+ 
+ }  // namespace embedder_support
+diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
+index bdbf391..0a36454 100644
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -4878,20 +4878,87 @@ RenderFrameImpl::UserAgentMetadataOverride() {
+ 
+ bool RenderFrameImpl::ShouldUseUserAgentOverride() const {
+   auto* web_view = GetWebView();
+-  // TODO(nasko): When the top-level frame is remote, there is no
+-  // WebDocumentLoader associated with it, so the checks below are not valid.
+-  // Temporarily return early and fix properly as part of
+-  // https://crbug.com/426555.
+-  if (web_view->MainFrame()->IsWebRemoteFrame()) {
++  if (!web_view || !web_view->MainFrame()) {
+     return false;
+   }
+-  const WebLocalFrame* main_frame = web_view->MainFrame()->ToWebLocalFrame();
+-
+-  WebDocumentLoader* document_loader = main_frame->GetDocumentLoader();
+-  DocumentState* document_state =
+-      document_loader ? DocumentState::FromDocumentLoader(document_loader)
+-                      : nullptr;
+-  return document_state && document_state->is_overriding_user_agent();
++  const auto is_overriding = [](const WebLocalFrame* frame) -> bool {
++    if (!frame) {
++      return false;
++    }
++    WebDocumentLoader* loader = frame->GetDocumentLoader();
++    DocumentState* state =
++        loader ? DocumentState::FromDocumentLoader(loader) : nullptr;
++    return state && state->is_overriding_user_agent();
++  };
++  if (web_view->MainFrame()->IsWebLocalFrame()) {
++    const WebLocalFrame* main_frame = web_view->MainFrame()->ToWebLocalFrame();
++    if (is_overriding(main_frame)) {
++      return true;
++    }
++    // Synchronous initial empty documents (e.g. `window.open('')` observed
++    // before its first navigation commits) use parameterless
++    // BuildDocumentState(), leaving is_overriding_user_agent() false so
++    // DidCommitProvisionalLoadParams invariants stay intact. Walk local
++    // openers while still on a synchronous initial document.
++    const WebLocalFrame* cursor = main_frame;
++    for (int hops = 0; hops < 4; ++hops) {
++      WebDocumentLoader* loader = cursor->GetDocumentLoader();
++      DocumentState* state =
++          loader ? DocumentState::FromDocumentLoader(loader) : nullptr;
++      const bool is_sync_empty_doc =
++          state &&
++          (state->navigation_state()
++               ? state->navigation_state()->IsForSynchronousCommit()
++               : (state->request_id() == -1 &&
++                  WebDocumentLoader::WillLoadUrlAsEmpty(loader->GetUrl())));
++      if (!is_sync_empty_doc) {
++        break;
++      }
++      blink::WebFrame* opener = cursor->Opener();
++      if (!opener || !opener->IsWebLocalFrame()) {
++        break;
++      }
++      const WebLocalFrame* opener_local = opener->ToWebLocalFrame();
++      if (opener_local == cursor) {
++        break;
++      }
++      if (is_overriding(opener_local)) {
++        return true;
++      }
++      const WebLocalFrame* opener_root = opener_local->LocalRoot();
++      if (opener_root && opener_root != opener_local &&
++          is_overriding(opener_root)) {
++        return true;
++      }
++      if (WebView* opener_view = opener_local->View();
++          opener_view && opener_view->MainFrame() &&
++          opener_view->MainFrame()->IsWebLocalFrame()) {
++        const WebLocalFrame* opener_main =
++            opener_view->MainFrame()->ToWebLocalFrame();
++        if (is_overriding(opener_main)) {
++          return true;
++        }
++        cursor = opener_main;
++      } else {
++        break;
++      }
++    }
++    return false;
++  }
++  // When the top-level frame is remote (OOPIF), the browser already propagated
++  // the tab's override decision via CommitNavigationParams onto this frame
++  // and/or its local root (covering nested about:blank / srcdoc subframes)
++  // without altering subframe DidCommitProvisionalLoadParams.
++  if (is_overriding(frame_)) {
++    return true;
++  }
++  if (frame_) {
++    const WebLocalFrame* local_root = frame_->LocalRoot();
++    if (local_root && local_root != frame_ && is_overriding(local_root)) {
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ blink::mojom::RendererAudioInputStreamFactory*
+diff --git a/ios/chrome/browser/curium/BUILD.gn b/ios/chrome/browser/curium/BUILD.gn
+index 79a8ba8..d2bfd24 100644
+--- a/ios/chrome/browser/curium/BUILD.gn
++++ b/ios/chrome/browser/curium/BUILD.gn
+@@ -15,7 +15,14 @@ source_set("bootstrap") {
+     "cr_ios_engine_bootstrap.mm",
+   ]
+   public_deps = [ ":contract_headers" ]
+-  deps = [ "//base" ]
++  deps = [
++    "//base",
++    "//build:blink_buildflags",
++    "//ios/chrome/browser/shared/model/paths",
++  ]
++  if (use_blink) {
++    deps += [ "//third_party/blink/public/common" ]
++  }
+   frameworks = [ "UIKit.framework" ]
+ }
+ 
+diff --git a/ios/chrome/browser/curium/DEPS b/ios/chrome/browser/curium/DEPS
+index d0e2cce..4008976 100644
+--- a/ios/chrome/browser/curium/DEPS
++++ b/ios/chrome/browser/curium/DEPS
+@@ -3,6 +3,7 @@ include_rules = [
+   "+extensions/buildflags",
+   "+ios/chrome/browser/curium",
+   "+ios/chrome/browser/shared/model/browser",
++  "+ios/chrome/browser/shared/model/paths",
+   "+ios/chrome/browser/shared/model/profile",
+   "+ios/chrome/browser/shared/model/web_state_list",
+   "+ios/chrome/browser/shared/public/commands",
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+index 94b20cb..70728f2 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -4,10 +4,69 @@
+ 
+ #import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ 
++#import <string>
++#import <string_view>
++
++#import "base/apple/foundation_util.h"
+ #import "base/check.h"
++#import "base/strings/string_view_util.h"
++#import "base/strings/sys_string_conversions.h"
++#import "build/blink_buildflags.h"
++#import "ios/chrome/browser/shared/model/paths/paths.h"
++#if BUILDFLAG(USE_BLINK)
++#import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ 
+ namespace {
+ id<CrIOSShellBootstrapDelegate> g_shell_bootstrap_delegate = nil;
++
++NSError* MakeFingerprintError(NSInteger code, const std::string& message) {
++  NSString* description =
++      message.empty() ? @"Fingerprint configuration rejected."
++                      : base::SysUTF8ToNSString(message);
++  return [NSError errorWithDomain:CrIOSFingerprintErrorDomain
++                             code:code
++                         userInfo:@{NSLocalizedDescriptionKey : description}];
++}
++
++#if BUILDFLAG(USE_BLINK)
++blink::curium::ErrorCode MapPathErrorCode(std::string_view code) {
++  if (code == "invalid_profile_id") {
++    return blink::curium::ErrorCode::kInvalidProfileID;
++  }
++  if (code == "profile_locked") {
++    return blink::curium::ErrorCode::kProfileLocked;
++  }
++  if (code == "already_opened") {
++    return blink::curium::ErrorCode::kAlreadyFrozen;
++  }
++  return blink::curium::ErrorCode::kProfileUnavailable;
++}
++
++NSString* ConfigStateName(blink::curium::ConfigState state) {
++  switch (state) {
++    case blink::curium::ConfigState::kUnconfigured:
++      return @"unconfigured";
++    case blink::curium::ConfigState::kDefault0105:
++      return @"default_0105";
++    case blink::curium::ConfigState::kConfigured:
++      return @"configured";
++    case blink::curium::ConfigState::kRejected:
++      return @"rejected";
++  }
++}
++
++NSString* ProxyModeName(blink::curium::ProxyMode mode) {
++  switch (mode) {
++    case blink::curium::ProxyMode::kSystem:
++      return @"system";
++    case blink::curium::ProxyMode::kDirect:
++      return @"direct";
++    case blink::curium::ProxyMode::kFixed:
++      return @"fixed";
++  }
++}
++#endif
+ }  // namespace
+ 
+ @implementation CrIOSEngineBootstrap
+@@ -23,4 +82,148 @@ + (void)registerShellBootstrapDelegate:
+   return g_shell_bootstrap_delegate;
+ }
+ 
+++ (NSDictionary<NSString*, id>*)fingerprintCapabilities {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  return @{
++    @"contractVersion" : @(blink::curium::kLaunchConfigSchemaVersion),
++    @"maxConfigBytes" : @(blink::curium::kMaxLaunchConfigBytes),
++    @"activationScopes" : @{
++      @"profileIsolation" : @"launch",
++      @"identitySpec" : @"launch_dual_slot_tab_toggle",
++      @"languages" : @"launch",
++      @"proxy" : @"launch",
++      @"webrtcPolicy" : @"launch",
++      @"hardwareConcurrency" : @"launch",
++      @"deviceMemory" : @"launch",
++      @"timezone" : @"launch",
++      @"webglStrings" : @"launch_per_slot",
++      @"inputCapabilities" : @"launch_per_slot",
++    },
++    @"features" : @{
++      @"zstdBaseline" : @YES,
++      @"oopifDesktopInheritance" : @YES,
++      @"dualIdentitySlots" : @YES,
++      @"profileDirectoryIsolation" : @YES,
++      @"fixedProxyFailClosed" : @YES,
++      @"optionalHardwareOverrides" : @YES,
++      @"nativeHardwareWhenUnset" : @YES,
++      @"androidDeviceMemoryCapFix" : @YES,
++    },
++  };
++#else
++  return @{
++    @"contractVersion" : @0,
++    @"features" : @{},
++  };
++#endif
++}
++
+++ (BOOL)configureLaunchFingerprintConfigJSON:(nullable NSData*)jsonData
++                                       error:(NSError* _Nullable* _Nullable)error {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  const blink::curium::ConfigState state =
++      blink::curium::GetLaunchConfigState();
++  if (state == blink::curium::ConfigState::kConfigured ||
++      state == blink::curium::ConfigState::kDefault0105 ||
++      ios::IsCuriumProfileDirectoryOpened()) {
++    const std::string msg =
++        "Launch fingerprint config is already frozen for this process";
++    if (error) {
++      *error = MakeFingerprintError(CrIOSFingerprintErrorAlreadyFrozen, msg);
++    }
++    return NO;
++  }
++  if (!jsonData || jsonData.length == 0) {
++    return YES;
++  }
++
++  std::string_view json_view =
++      base::as_string_view(base::apple::NSDataToSpan(jsonData));
++  blink::curium::LaunchConfig parsed_config;
++  blink::curium::ConfigError cfg_error;
++  if (!blink::curium::ParseAndValidateLaunchConfigJSON(
++          json_view, &parsed_config, &cfg_error)) {
++    blink::curium::RecordLaunchConfigRejection(cfg_error.code,
++                                               cfg_error.message);
++    if (error) {
++      *error = MakeFingerprintError(static_cast<NSInteger>(cfg_error.code),
++                                    cfg_error.message);
++    }
++    return NO;
++  }
++
++  std::string path_err_code;
++  std::string path_err_message;
++  if (!ios::ConfigureCuriumProfileDirectory(parsed_config.profile_id,
++                                            &path_err_code,
++                                            &path_err_message)) {
++    const blink::curium::ErrorCode mapped = MapPathErrorCode(path_err_code);
++    blink::curium::RecordLaunchConfigRejection(mapped, path_err_message);
++    if (error) {
++      *error = MakeFingerprintError(static_cast<NSInteger>(mapped),
++                                    path_err_message);
++    }
++    return NO;
++  }
++
++  if (!blink::curium::FreezeLaunchConfig(std::move(parsed_config),
++                                         &cfg_error)) {
++    if (error) {
++      *error = MakeFingerprintError(static_cast<NSInteger>(cfg_error.code),
++                                    cfg_error.message);
++    }
++    return NO;
++  }
++  return YES;
++#else
++  if (error) {
++    *error = MakeFingerprintError(CrIOSFingerprintErrorUnsupportedSchema,
++                                  "Blink fingerprint engine is unavailable");
++  }
++  return NO;
++#endif
++}
++
+++ (NSDictionary<NSString*, id>*)activeFingerprintStatus {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  const blink::curium::ConfigState state =
++      blink::curium::GetLaunchConfigState();
++  const blink::curium::LaunchConfig* cfg = blink::curium::GetLaunchConfig();
++  NSMutableDictionary<NSString*, id>* status = [NSMutableDictionary dictionary];
++  status[@"contractVersion"] = @(blink::curium::kLaunchConfigSchemaVersion);
++  status[@"state"] = ConfigStateName(state);
++  status[@"appliedProfileId"] =
++      base::SysUTF8ToNSString(ios::GetAppliedCuriumProfileId());
++  status[@"profileDirectoryOpened"] =
++      @(ios::IsCuriumProfileDirectoryOpened());
++  status[@"appliedConfigRevision"] = cfg ? @(cfg->revision) : @0ULL;
++  status[@"defaultSlot"] =
++      (cfg && cfg->default_slot == blink::curium::DefaultSlot::kDesktop)
++          ? @"desktop"
++          : @"mobile";
++  status[@"proxyMode"] =
++      cfg ? ProxyModeName(cfg->proxy_mode) : @"system";
++  status[@"hardwareOverridesActive"] =
++      @(cfg ? cfg->HasHardwareOverrides() : NO);
++  if (state == blink::curium::ConfigState::kRejected) {
++    const blink::curium::ConfigError err =
++        blink::curium::GetLastLaunchConfigError();
++    status[@"rejectionCode"] = @(static_cast<NSInteger>(err.code));
++    status[@"rejectionReason"] = base::SysUTF8ToNSString(err.message);
++  }
++  return [status copy];
++#else
++  return @{
++    @"contractVersion" : @0,
++    @"state" : @"unsupported",
++    @"appliedProfileId" : @"default",
++    @"profileDirectoryOpened" : @NO,
++    @"appliedConfigRevision" : @0ULL,
++  };
++#endif
++}
++
+ @end
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 54b5bd6..a98cd0d 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -33,6 +33,20 @@ typedef NS_ENUM(NSInteger, CrIOSDownloadState) {
+   CrIOSDownloadStateFailed = 4,
+ };
+ 
++typedef NS_ENUM(NSInteger, CrIOSFingerprintErrorCode) {
++  CrIOSFingerprintErrorInvalidJSON = 1,
++  CrIOSFingerprintErrorUnsupportedSchema = 2,
++  CrIOSFingerprintErrorPayloadTooLarge = 3,
++  CrIOSFingerprintErrorInvalidField = 4,
++  CrIOSFingerprintErrorInvalidProfileID = 5,
++  CrIOSFingerprintErrorProfileUnavailable = 6,
++  CrIOSFingerprintErrorProfileLocked = 7,
++  CrIOSFingerprintErrorAlreadyFrozen = 8,
++};
++
++__attribute__((unused)) static NSString* const CrIOSFingerprintErrorDomain =
++    @"com.appautomaton.curium.fingerprint";
++
+ @protocol CrIOSBrowserHostV1;
+ @protocol CrIOSExtensionManagingV1;
+ 
+@@ -50,6 +64,10 @@ __attribute__((visibility("default")))
+ + (void)registerShellBootstrapDelegate:
+     (nullable id<CrIOSShellBootstrapDelegate>)delegate;
+ + (nullable id<CrIOSShellBootstrapDelegate>)shellBootstrapDelegate;
+++ (NSDictionary<NSString*, id>*)fingerprintCapabilities;
+++ (BOOL)configureLaunchFingerprintConfigJSON:(nullable NSData*)jsonData
++                                       error:(NSError* _Nullable* _Nullable)error;
+++ (NSDictionary<NSString*, id>*)activeFingerprintStatus;
+ @end
+ 
+ @protocol CrIOSTabHostingV1 <NSObject>
+diff --git a/ios/chrome/browser/shared/model/paths/paths.h b/ios/chrome/browser/shared/model/paths/paths.h
+index eb38917..ce96316 100644
+--- a/ios/chrome/browser/shared/model/paths/paths.h
++++ b/ios/chrome/browser/shared/model/paths/paths.h
+@@ -5,6 +5,9 @@
+ #ifndef IOS_CHROME_BROWSER_SHARED_MODEL_PATHS_PATHS_H_
+ #define IOS_CHROME_BROWSER_SHARED_MODEL_PATHS_PATHS_H_
+ 
++#include <string>
++#include <string_view>
++
+ // This file declares path keys for the Chrome on iOS application.  These can be
+ // used with the PathService to access various special directories and files.
+ 
+@@ -32,6 +35,17 @@ enum {
+ // Call once to register the provider for the path keys defined above.
+ void RegisterPathProvider();
+ 
++// [ios-blink-sideload] Configures the isolated user-data profile directory
++// before ChromeMain resolves DIR_USER_DATA. Passing "" or "default" preserves
++// the legacy Chromium root; any other opaque slug resolves under
++// <Application Support>/ChromiumProfiles/<slug>, validates writability and
++// symlink safety, and acquires a non-blocking flock with can-suspend-locked.
++bool ConfigureCuriumProfileDirectory(std::string_view profile_id,
++                                     std::string* error_code_out,
++                                     std::string* error_message_out);
++std::string GetAppliedCuriumProfileId();
++bool IsCuriumProfileDirectoryOpened();
++
+ }  // namespace ios
+ 
+ #endif  // IOS_CHROME_BROWSER_SHARED_MODEL_PATHS_PATHS_H_
+diff --git a/ios/chrome/browser/shared/model/paths/paths.mm b/ios/chrome/browser/shared/model/paths/paths.mm
+index af711df..6c13c5f 100644
+--- a/ios/chrome/browser/shared/model/paths/paths.mm
++++ b/ios/chrome/browser/shared/model/paths/paths.mm
+@@ -4,11 +4,24 @@
+ 
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+ 
++#import <Foundation/Foundation.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <sys/xattr.h>
++#include <unistd.h>
++
++#import "base/apple/foundation_util.h"
+ #import "base/base_paths.h"
++#import "base/command_line.h"
+ #import "base/files/file_path.h"
+ #import "base/files/file_util.h"
++#import "base/no_destructor.h"
+ #import "base/notreached.h"
+ #import "base/path_service.h"
++#import "base/strings/string_util.h"
++#import "base/synchronization/lock.h"
+ #import "base/threading/thread_restrictions.h"
+ #import "build/branding_buildflags.h"
+ #import "components/gcm_driver/gcm_driver_constants.h"
+@@ -25,12 +38,153 @@
+     FILE_PATH_LITERAL("Chromium");
+ #endif
+ 
+-bool GetDefaultUserDataDirectory(base::FilePath* result) {
++const base::FilePath::CharType kProfilesRootDirName[] =
++    FILE_PATH_LITERAL("ChromiumProfiles");
++
++struct CuriumProfileState {
++  base::Lock lock;
++  std::string profile_id = "default";
++  bool use_custom_profile = false;
++  bool configured = false;
++  bool opened = false;
++  int lock_fd = -1;
++};
++
++CuriumProfileState& GetCuriumProfileState() {
++  static base::NoDestructor<CuriumProfileState> state;
++  return *state;
++}
++
++bool IsValidProfileSlug(std::string_view slug) {
++  if (slug.empty() || slug.size() > 32) {
++    return false;
++  }
++  if (base::EqualsCaseInsensitiveASCII(slug, "default")) {
++    return false;
++  }
++  if (!base::IsAsciiAlpha(slug.front()) && !base::IsAsciiDigit(slug.front())) {
++    return false;
++  }
++  for (unsigned char c : slug) {
++    if (!base::IsAsciiAlpha(c) && !base::IsAsciiDigit(c) && c != '-' &&
++        c != '_') {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool SetProfileError(std::string* code_out,
++                     std::string* msg_out,
++                     std::string code,
++                     std::string message) {
++  if (code_out) {
++    *code_out = std::move(code);
++  }
++  if (msg_out) {
++    *msg_out = std::move(message);
++  }
++  return false;
++}
++
++bool EnsureSafeDirectory(const base::FilePath& dir) {
++  struct stat st = {};
++  if (lstat(dir.value().c_str(), &st) == 0) {
++    if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
++      return false;
++    }
++  } else if (errno != ENOENT) {
++    return false;
++  } else if (!base::CreateDirectory(dir)) {
++    return false;
++  }
++  if (lstat(dir.value().c_str(), &st) != 0 || S_ISLNK(st.st_mode) ||
++      !S_ISDIR(st.st_mode)) {
++    return false;
++  }
++  return access(dir.value().c_str(), R_OK | W_OK | X_OK) == 0;
++}
++
++bool AcquireProfileLock(const base::FilePath& dir,
++                        int* fd_out,
++                        std::string* code_out,
++                        std::string* msg_out) {
++  const base::FilePath lock_path =
++      dir.Append(FILE_PATH_LITERAL(".curium_profile.lock"));
++  int fd = open(lock_path.value().c_str(),
++                O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
++  if (fd < 0) {
++    return SetProfileError(code_out, msg_out, "profile_unavailable",
++                           "Unable to open profile lock file");
++  }
++  // Prevent RunningBoard 0xdead10cc termination if iOS suspends the process
++  // while this advisory profile lock is held.
++  const uint8_t can_suspend = 1;
++  (void)fsetxattr(fd, "com.apple.runningboard.can-suspend-locked", &can_suspend,
++                  sizeof(can_suspend), 0, 0);
++  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
++    const int lock_errno = errno;
++    close(fd);
++    if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) {
++      return SetProfileError(code_out, msg_out, "profile_locked",
++                             "Profile directory is already open by another instance");
++    }
++    return SetProfileError(code_out, msg_out, "profile_unavailable",
++                           "Unable to lock profile directory");
++  }
++  *fd_out = fd;
++  return true;
++}
++
++bool GetDefaultUserDataDirectory(base::FilePath* result,
++                                 bool mark_opened = false) {
+   if (!base::PathService::Get(base::DIR_APP_DATA, result)) {
+     DUMP_WILL_BE_NOTREACHED();
+     return false;
+   }
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  if (state.use_custom_profile) {
++    *result = result->Append(kProfilesRootDirName).Append(state.profile_id);
++    if (mark_opened) {
++      state.opened = true;
++    }
++    return true;
++  }
++  if (!state.configured && base::CommandLine::InitializedForCurrentProcess()) {
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch("curium-profile-id")) {
++      const std::string slug = cmd->GetSwitchValueASCII("curium-profile-id");
++      if (!slug.empty() && slug != "default") {
++        if (!IsValidProfileSlug(slug)) {
++          return false;
++        }
++        base::FilePath profiles_root = result->Append(kProfilesRootDirName);
++        base::FilePath profile_dir = profiles_root.Append(slug);
++        if (!EnsureSafeDirectory(profiles_root) ||
++            !EnsureSafeDirectory(profile_dir)) {
++          return false;
++        }
++        int lock_fd = -1;
++        if (!AcquireProfileLock(profile_dir, &lock_fd, nullptr, nullptr)) {
++          return false;
++        }
++        state.profile_id = slug;
++        state.use_custom_profile = true;
++        state.configured = true;
++        state.lock_fd = lock_fd;
++        *result = profile_dir;
++        if (mark_opened) {
++          state.opened = true;
++        }
++        return true;
++      }
++    }
++  }
+   *result = result->Append(kProductDirName);
++  if (mark_opened) {
++    state.opened = true;
++  }
+   return true;
+ }
+ 
+@@ -42,7 +196,7 @@ bool PathProvider(int key, base::FilePath* result) {
+   base::FilePath cur;
+   switch (key) {
+     case DIR_USER_DATA:
+-      if (!GetDefaultUserDataDirectory(&cur)) {
++      if (!GetDefaultUserDataDirectory(&cur, /*mark_opened=*/true)) {
+         return false;
+       }
+       create_dir = true;
+@@ -116,6 +270,70 @@ void RegisterPathProvider() {
+   base::PathService::RegisterProvider(PathProvider, PATH_START, PATH_END);
+ }
+ 
++bool ConfigureCuriumProfileDirectory(std::string_view profile_id,
++                                     std::string* error_code_out,
++                                     std::string* error_message_out) {
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  if (state.opened || state.configured) {
++    return SetProfileError(error_code_out, error_message_out, "already_opened",
++                           "Profile directory is already locked for this launch");
++  }
++  if (profile_id.empty() || profile_id == "default") {
++    state.profile_id = "default";
++    state.use_custom_profile = false;
++    state.configured = true;
++    return true;
++  }
++  if (!IsValidProfileSlug(profile_id)) {
++    return SetProfileError(
++        error_code_out, error_message_out, "invalid_profile_id",
++        "Profile ID must be \"default\" or [A-Za-z0-9][A-Za-z0-9_-]{0,31}");
++  }
++  base::FilePath app_data_dir;
++  if (!base::apple::GetUserDirectory(NSApplicationSupportDirectory,
++                                     &app_data_dir) ||
++      app_data_dir.empty()) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "profile_unavailable",
++                           "Application Support directory is unavailable");
++  }
++  if (!EnsureSafeDirectory(app_data_dir)) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "profile_unavailable",
++                           "Application Support directory is not writable");
++  }
++  const base::FilePath profiles_root = app_data_dir.Append(kProfilesRootDirName);
++  const base::FilePath profile_dir = profiles_root.Append(profile_id);
++  if (!EnsureSafeDirectory(profiles_root) || !EnsureSafeDirectory(profile_dir)) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "profile_unavailable",
++                           "Unable to prepare isolated profile directory");
++  }
++  int lock_fd = -1;
++  if (!AcquireProfileLock(profile_dir, &lock_fd, error_code_out,
++                          error_message_out)) {
++    return false;
++  }
++  state.profile_id = std::string(profile_id);
++  state.use_custom_profile = true;
++  state.configured = true;
++  state.lock_fd = lock_fd;
++  return true;
++}
++
++std::string GetAppliedCuriumProfileId() {
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  return state.profile_id;
++}
++
++bool IsCuriumProfileDirectoryOpened() {
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  return state.opened;
++}
++
+ void GetUserCacheDirectory(const base::FilePath& profile_dir,
+                            base::FilePath* result) {
+   // If the profile directory is under ~/Library/Application Support,
+diff --git a/ios/chrome/browser/web/model/chrome_web_client.mm b/ios/chrome/browser/web/model/chrome_web_client.mm
+index 69e1dd8..4e19d7c 100644
+--- a/ios/chrome/browser/web/model/chrome_web_client.mm
++++ b/ios/chrome/browser/web/model/chrome_web_client.mm
+@@ -392,9 +392,7 @@ bool WillHandleWebBrowserJavascriptURLs(GURL* url, web::BrowserState*) {
+   // [ios-blink-sideload] Keep iOS web-client fetchers aligned with Blink's
+   // Chrome User-Agent instead of emitting WebKit CriOS alongside Blink.
+   if (type == web::UserAgentType::DESKTOP) {
+-    return embedder_support::BuildUserAgentFromOSAndProduct(
+-        "Macintosh; Intel Mac OS X 10_15_7",
+-        embedder_support::GetProductAndVersion());
++    return embedder_support::GetCuriumDesktopUserAgent();
+   }
+   return embedder_support::GetUserAgent();
+ #else
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index 753dd15..cd3e644 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -29,6 +29,7 @@ specific_include_rules = {
+     "+components/embedder_support/ios/delegate/file_chooser/file_select_helper_ios.h",
+     "+components/embedder_support/user_agent_utils.h",
+     "+net/http/http_util.h",
++    "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
+     "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+     "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+     "+third_party/blink/public/mojom/favicon/favicon_url.mojom.h",
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+index 74e723f..5f1bca8 100644
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -20,13 +20,18 @@ include_rules = [
+   "+net/base/net_errors.h",
+   "+net/http/http_util.h",
+   "+net/log/net_log_source.h",
++  "+net/proxy_resolution/proxy_config.h",
++  "+net/proxy_resolution/proxy_config_with_annotation.h",
+   "+net/socket/tcp_server_socket.h",
++  "+net/traffic_annotation/network_traffic_annotation.h",
+   "+services/device/public/cpp/geolocation",
+   "+services/service_manager/public/cpp",
++  "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
+   "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+   "+third_party/blink/public/common/switches.h",
+   "+third_party/blink/public/common/web_preferences/web_preferences.h",
+   "+third_party/blink/public/platform/web_url_error.h",
++  "+ui/base/pointer/pointer_device.h",
+   "+ui/base/resource/resource_bundle.h",
+   "+ui/base/webui/web_ui_util.h",
+   "+ui/native_theme/native_theme.h",
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index 5fb7d79..adfb1ee 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -47,6 +47,8 @@
+ #import "components/version_info/version_info.h"
+ #import "content/public/browser/browser_context.h"
+ #import "content/public/browser/devtools_manager_delegate.h"
++#import "content/public/browser/navigation_controller.h"
++#import "content/public/browser/navigation_entry.h"
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/browser/web_contents_view_delegate.h"
+@@ -59,14 +61,19 @@
+ #import "ios/web/content/ui/web_contents_view_delegate_impl.h"
+ #import "ios/web/public/browser_state.h"
+ #import "net/http/http_util.h"
++#import "net/proxy_resolution/proxy_config.h"
++#import "net/proxy_resolution/proxy_config_with_annotation.h"
++#import "net/traffic_annotation/network_traffic_annotation.h"
+ #import "services/network/public/cpp/resource_request.h"
+ #import "services/network/public/cpp/self_deleting_url_loader_factory.h"
+ #import "services/network/public/cpp/shared_url_loader_factory.h"
+ #import "services/network/public/mojom/network_context.mojom.h"
+ #import "services/network/public/mojom/url_loader.mojom.h"
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
++#include "ui/base/pointer/pointer_device.h"
+ #include "ui/native_theme/native_theme.h"
+ 
+ namespace web {
+@@ -222,9 +229,17 @@ std::string IOSContentBrowserClient::GetAcceptLangs(
+ void IOSContentBrowserClient::UpdateRendererPreferencesForWorker(
+     content::BrowserContext* browser_context,
+     blink::RendererPreferences* out_prefs) {
+-  if (out_prefs) {
+-    out_prefs->accept_languages =
+-        net::HttpUtil::ExpandLanguageList(GetAcceptLangs(browser_context));
++  if (!out_prefs) {
++    return;
++  }
++  out_prefs->accept_languages =
++      net::HttpUtil::ExpandLanguageList(GetAcceptLangs(browser_context));
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    out_prefs->webrtc_ip_handling_policy = cfg->webrtc_ip_handling_policy;
++    out_prefs->enable_do_not_track = cfg->enable_do_not_track;
++    out_prefs->is_global_privacy_control_setting_enabled =
++        cfg->enable_global_privacy_control;
+   }
+ }
+ 
+@@ -286,6 +301,56 @@ void IOSContentBrowserClient::OverrideWebPreferences(
+   // mode). They were always light.
+   prefs->preferred_color_scheme = GetWebColorScheme();
+   prefs->preferred_root_scrollbar_color_scheme = prefs->preferred_color_scheme;
++  // [ios-blink-sideload] Optional per-slot input capability overrides. Never
++  // toggle process-global touch_event_feature_detection_enabled per tab.
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    bool is_overriding_ua = false;
++    if (web_contents) {
++      if (content::NavigationEntry* entry =
++              web_contents->GetController().GetVisibleEntry()) {
++        is_overriding_ua = entry->GetIsOverridingUserAgent();
++      }
++    }
++    const blink::curium::IdentitySlotConfig& slot =
++        (cfg->default_slot == blink::curium::DefaultSlot::kDesktop ||
++         is_overriding_ua)
++            ? cfg->desktop
++            : cfg->mobile;
++    if (slot.max_touch_points.has_value()) {
++      prefs->pointer_events_max_touch_points = *slot.max_touch_points;
++    }
++    if (slot.pointer_type.has_value()) {
++      switch (*slot.pointer_type) {
++        case blink::curium::PointerTypeOverride::kNone:
++          prefs->available_pointer_types = ui::POINTER_TYPE_NONE;
++          prefs->primary_pointer_type = blink::mojom::PointerType::kPointerNone;
++          break;
++        case blink::curium::PointerTypeOverride::kCoarse:
++          prefs->available_pointer_types = ui::POINTER_TYPE_COARSE;
++          prefs->primary_pointer_type =
++              blink::mojom::PointerType::kPointerCoarseType;
++          break;
++        case blink::curium::PointerTypeOverride::kFine:
++          prefs->available_pointer_types = ui::POINTER_TYPE_FINE;
++          prefs->primary_pointer_type =
++              blink::mojom::PointerType::kPointerFineType;
++          break;
++      }
++    }
++    if (slot.hover_type.has_value()) {
++      switch (*slot.hover_type) {
++        case blink::curium::HoverTypeOverride::kNone:
++          prefs->available_hover_types = ui::HOVER_TYPE_NONE;
++          prefs->primary_hover_type = blink::mojom::HoverType::kHoverNone;
++          break;
++        case blink::curium::HoverTypeOverride::kHover:
++          prefs->available_hover_types = ui::HOVER_TYPE_HOVER;
++          prefs->primary_hover_type = blink::mojom::HoverType::kHoverHoverType;
++          break;
++      }
++    }
++  }
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   ApplyExtensionWebPreferences(web_contents, main_frame_site, prefs);
+ #endif
+@@ -307,13 +372,54 @@ void IOSContentBrowserClient::ConfigureNetworkContextParams(
+     network::mojom::NetworkContextParams* network_context_params,
+     cert_verifier::mojom::CertVerifierCreationParams*
+         cert_verifier_creation_params) {
+-  // [ios-blink-sideload] Populate User-Agent and Accept-Language on every
+-  // Blink NetworkContext; without accept_language, navigation and fetch
+-  // requests omit the Accept-Language header completely.
++  // [ios-blink-sideload] Populate User-Agent, Accept-Language, baseline Zstd
++  // transport support, and optional launch-scoped proxy policy on every Blink
++  // NetworkContext.
++  network_context_params->enable_zstd = true;
+   network_context_params->user_agent = GetUserAgent();
+   network_context_params->accept_language =
+       net::HttpUtil::GenerateAcceptLanguageHeader(
+           net::HttpUtil::ExpandLanguageList(GetAcceptLangs(context)));
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    switch (cfg->proxy_mode) {
++      case blink::curium::ProxyMode::kSystem:
++        // Leave initial_proxy_config unset so patch 0009/0018 system proxy
++        // resolution runs unchanged.
++        break;
++      case blink::curium::ProxyMode::kDirect:
++        network_context_params->initial_proxy_config =
++            net::ProxyConfigWithAnnotation::CreateDirect();
++        break;
++      case blink::curium::ProxyMode::kFixed: {
++        net::ProxyConfig proxy_config;
++        proxy_config.proxy_rules().ParseFromString(cfg->proxy_rules);
++        if (!cfg->proxy_bypass_rules.empty()) {
++          proxy_config.proxy_rules().bypass_rules.ParseFromString(
++              cfg->proxy_bypass_rules);
++        }
++        static constexpr net::NetworkTrafficAnnotationTag
++            kCuriumProfileProxyAnnotation = net::DefineNetworkTrafficAnnotation(
++                "curium_profile_proxy", R"(
++          semantics {
++            sender: "Curium Profile Proxy"
++            description: "Routes network requests through the fixed proxy configured for the active Curium browsing profile."
++            trigger: "Explicit user profile configuration."
++            data: "Web browsing requests for the active profile."
++            destination: OTHER
++          }
++          policy {
++            cookies_allowed: YES
++            setting: "Configured per profile in Curium settings."
++            policy_exception_justification: "User-configured profile proxy."
++          })");
++        network_context_params->initial_proxy_config =
++            net::ProxyConfigWithAnnotation(proxy_config,
++                                           kCuriumProfileProxyAnnotation);
++        break;
++      }
++    }
++  }
+   if (!in_memory) {
+     network_context_params->file_paths =
+         network::mojom::NetworkContextFilePaths::New();
+diff --git a/ios/web/content/init/ios_main_delegate.mm b/ios/web/content/init/ios_main_delegate.mm
+index e555bf1..3483cb0 100644
+--- a/ios/web/content/init/ios_main_delegate.mm
++++ b/ios/web/content/init/ios_main_delegate.mm
+@@ -13,6 +13,7 @@
+ #import "ios/web/content/init/ios_content_client.h"
+ #import "ios/web/content/init/ios_content_renderer_client.h"
+ #import "ios/web/public/web_client.h"
++#import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ 
+ namespace web {
+ 
+@@ -38,9 +39,9 @@
+ std::optional<int> IOSMainDelegate::PostEarlyInitialization(
+     InvokedIn invoked_in) {
+ #if BUILDFLAG(USE_BLINK)
+-  // [ios-blink-sideload] Ensure --use-mobile-user-agent is set before
+-  // BrowserMain / NetworkContext initialization so Mobile UA and Client Hints
+-  // include "Mobile", Sec-CH-UA-Mobile: ?1, and Form-Factors: "Mobile".
++  // [ios-blink-sideload] Seal launch fingerprint config (defaulting to Build 39
++  // 0105 behavior if unconfigured) before BrowserMain / NetworkContext startup.
++  blink::curium::FreezeDefault0105IfUnconfigured();
+   embedder_support::EnsureCuriumMobileUserAgentSwitch();
+   web::GetWebClient()->InitializeFieldTrialAndFeatureList();
+   content::InitializeMojoCore();
+diff --git a/ios/web/content/navigation/content_navigation_manager.mm b/ios/web/content/navigation/content_navigation_manager.mm
+index 6f855f5..4ba0c09 100644
+--- a/ios/web/content/navigation/content_navigation_manager.mm
++++ b/ios/web/content/navigation/content_navigation_manager.mm
+@@ -9,11 +9,8 @@
+ #import <sstream>
+ 
+ #import "base/apple/foundation_util.h"
+-#import "base/command_line.h"
+ #import "base/notimplemented.h"
+-#import "base/strings/stringprintf.h"
+ #import "base/strings/sys_string_conversions.h"
+-#import "base/system/sys_info.h"
+ #import "components/embedder_support/user_agent_utils.h"
+ #import "content/public/browser/navigation_controller.h"
+ #import "content/public/browser/navigation_entry.h"
+@@ -58,50 +55,10 @@
+   }
+ }
+ 
+-std::string DesktopMacPlatformVersion() {
+-  if (base::CommandLine::InitializedForCurrentProcess()) {
+-    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
+-    if (cmd->HasSwitch("curium-desktop-platform-version")) {
+-      const std::string ver =
+-          cmd->GetSwitchValueASCII("curium-desktop-platform-version");
+-      if (!ver.empty() && net::HttpUtil::IsValidHeaderValue(ver) &&
+-          ver.find('"') == std::string::npos &&
+-          ver.find('\\') == std::string::npos &&
+-          ver.find(';') == std::string::npos) {
+-        return ver;
+-      }
+-    }
+-  }
+-  int32_t major = 0, minor = 0, bugfix = 0;
+-  base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
+-  if (major >= 26) {
+-    return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
+-  }
+-  return "15.5.0";
+-}
+-
+-// [ios-blink-sideload] Chrome on the Mac's user agent, for Request Desktop
+-// Site (Chrome on Android uses Linux's), with client hints to match.
++// [ios-blink-sideload] Active Desktop slot UA + Client Hints override
++// (configured launch Desktop preset when set, else Build 39 macOS Chrome).
+ blink::UserAgentOverride DesktopUserAgentOverride() {
+-  const blink::UserAgentMetadata metadata =
+-      embedder_support::GetUserAgentMetadata();
+-  blink::UserAgentOverride ua_override;
+-  ua_override.ua_string_override =
+-      embedder_support::BuildUserAgentFromOSAndProduct(
+-          "Macintosh; Intel Mac OS X 10_15_7",
+-          embedder_support::GetProductAndVersion());
+-  ua_override.ua_metadata_override = metadata;
+-  ua_override.ua_metadata_override->platform = "macOS";
+-  ua_override.ua_metadata_override->platform_version =
+-      DesktopMacPlatformVersion();
+-  ua_override.ua_metadata_override->model = std::string();
+-  ua_override.ua_metadata_override->mobile = false;
+-  ua_override.ua_metadata_override->form_factors =
+-      embedder_support::GetFormFactorsClientHint(metadata, /*is_mobile=*/false);
+-  ua_override.ua_metadata_override->architecture = "arm";
+-  ua_override.ua_metadata_override->bitness = "64";
+-  ua_override.ua_metadata_override->wow64 = false;
+-  return ua_override;
++  return embedder_support::GetCuriumDesktopUserAgentOverride();
+ }
+ 
+ }  // namespace
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index 6fe50c1..2879916 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -71,6 +71,7 @@
+ #import "net/http/http_util.h"
+ #import "services/network/public/mojom/referrer_policy.mojom-shared.h"
+ #import "skia/ext/skia_utils_ios.h"
++#import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #import "third_party/blink/public/common/mediastream/media_stream_request.h"
+ #import "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #import "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+@@ -224,11 +225,20 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+   web_contents_->SetUserData(
+       &kContentTabIdentityKey,
+       std::make_unique<ContentTabIdentity>(unique_identifier_));
+-  // [ios-blink-sideload] Sync Blink renderer accept_languages so
+-  // navigator.languages matches the NetworkContext Accept-Language header.
+-  web_contents_->GetMutableRendererPrefs()->accept_languages =
+-      net::HttpUtil::ExpandLanguageList(
+-          embedder_support::GetCuriumAcceptLanguages());
++  // [ios-blink-sideload] Sync Blink renderer preferences (languages, WebRTC IP
++  // handling policy, DNT/GPC) so navigator.languages and WebRTC match the
++  // active launch profile.
++  blink::RendererPreferences* renderer_prefs =
++      web_contents_->GetMutableRendererPrefs();
++  renderer_prefs->accept_languages = net::HttpUtil::ExpandLanguageList(
++      embedder_support::GetCuriumAcceptLanguages());
++  if (const blink::curium::LaunchConfig* cfg =
++          blink::curium::GetLaunchConfig()) {
++    renderer_prefs->webrtc_ip_handling_policy = cfg->webrtc_ip_handling_policy;
++    renderer_prefs->enable_do_not_track = cfg->enable_do_not_track;
++    renderer_prefs->is_global_privacy_control_setting_enabled =
++        cfg->enable_global_privacy_control;
++  }
+   web_contents_->SyncRendererPrefs();
+   web_contents_->SetDelegate(this);
+   WebContentsObserver::Observe(web_contents_.get());
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index 9173363..786dedb 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -149,6 +149,7 @@ source_set("common") {
+     "context_menu_data/untrustworthy_context_menu_params.cc",
+     "crash_helpers.cc",
+     "crash_helpers.h",
++    "curium/curium_fingerprint_config.cc",
+     "custom_handlers/protocol_handler_utils.cc",
+     "device_memory/approximated_device_memory.cc",
+     "dom_storage/session_storage_namespace_id.cc",
+diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
+new file mode 100644
+index 0000000..e2542ec
+--- /dev/null
++++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
+@@ -0,0 +1,1052 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <set>
++#include <utility>
++
++#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "net/http/http_util.h"
++#include "net/proxy_resolution/proxy_config.h"
++
++namespace blink::curium {
++
++namespace {
++
++constexpr size_t kMaxUAStringLength = 1024;
++constexpr size_t kMaxTokenLength = 128;
++constexpr size_t kMaxWebGLStringLength = 256;
++constexpr size_t kMaxProxyRulesLength = 1024;
++constexpr size_t kMaxProxyBypassLength = 2048;
++constexpr size_t kMaxTimezoneLength = 64;
++constexpr size_t kMaxLanguages = 8;
++constexpr size_t kMaxBrands = 8;
++constexpr size_t kMaxFormFactors = 4;
++
++bool IsPrintableASCII(std::string_view value) {
++  for (unsigned char c : value) {
++    if (c < 0x20 || c > 0x7E) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool HasNoControlChars(std::string_view value) {
++  for (unsigned char c : value) {
++    if (c < 0x20 || c == 0x7F) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsValidTimezoneId(std::string_view tz) {
++  if (tz.empty() || tz.size() > kMaxTimezoneLength) {
++    return false;
++  }
++  if (tz.front() == '/' || tz.back() == '/' ||
++      tz.find("..") != std::string_view::npos) {
++    return false;
++  }
++  for (unsigned char c : tz) {
++    const bool ok = base::IsAsciiAlpha(c) || base::IsAsciiDigit(c) ||
++                    c == '/' || c == '_' || c == '-' || c == '+' || c == '.';
++    if (!ok) {
++      return false;
++    }
++  }
++  return true;
++}
++
++std::optional<std::string> CanonicalizeBCP47Tag(std::string_view raw) {
++  std::string cleaned(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
++  base::ReplaceChars(cleaned, "_", "-", &cleaned);
++  if (cleaned.empty() || cleaned.size() > 35) {
++    return std::nullopt;
++  }
++  std::vector<std::string_view> parts = base::SplitStringPiece(
++      cleaned, "-", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++  if (parts.empty() || parts.size() > 6) {
++    return std::nullopt;
++  }
++  std::vector<std::string> canonical;
++  canonical.reserve(parts.size());
++  bool seen_singleton = false;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    std::string_view subtag = parts[i];
++    if (subtag.empty() || subtag.size() > 8) {
++      return std::nullopt;
++    }
++    bool all_letters = true;
++    for (unsigned char c : subtag) {
++      const bool is_letter = base::IsAsciiAlpha(c);
++      const bool is_digit = base::IsAsciiDigit(c);
++      if (!is_letter && !is_digit) {
++        return std::nullopt;
++      }
++      if (!is_letter) {
++        all_letters = false;
++      }
++    }
++    if (i == 0) {
++      if (!all_letters || subtag.size() < 2) {
++        return std::nullopt;
++      }
++      canonical.push_back(base::ToLowerASCII(subtag));
++      continue;
++    }
++    if (seen_singleton) {
++      canonical.push_back(base::ToLowerASCII(subtag));
++    } else if (subtag.size() == 1) {
++      if (i + 1 == parts.size()) {
++        return std::nullopt;
++      }
++      seen_singleton = true;
++      canonical.push_back(base::ToLowerASCII(subtag));
++    } else if (subtag.size() == 4 && all_letters) {
++      std::string titled = base::ToLowerASCII(subtag);
++      titled[0] = base::ToUpperASCII(titled[0]);
++      canonical.push_back(std::move(titled));
++    } else if (subtag.size() == 2 && all_letters) {
++      canonical.push_back(base::ToUpperASCII(subtag));
++    } else {
++      canonical.push_back(base::ToLowerASCII(subtag));
++    }
++  }
++  return base::JoinString(canonical, "-");
++}
++
++bool HasNonDirectProxy(const net::ProxyList& list) {
++  for (const net::ProxyChain& chain : list.AllChains()) {
++    if (chain.IsValid() && !chain.is_direct()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool HasConfiguredProxy(const net::ProxyConfig::ProxyRules& rules) {
++  switch (rules.type) {
++    case net::ProxyConfig::ProxyRules::Type::EMPTY:
++      return false;
++    case net::ProxyConfig::ProxyRules::Type::PROXY_LIST:
++      return HasNonDirectProxy(rules.single_proxies);
++    case net::ProxyConfig::ProxyRules::Type::PROXY_LIST_PER_SCHEME:
++      return HasNonDirectProxy(rules.proxies_for_http) ||
++             HasNonDirectProxy(rules.proxies_for_https) ||
++             HasNonDirectProxy(rules.proxies_for_ftp) ||
++             HasNonDirectProxy(rules.fallback_proxies);
++  }
++}
++
++bool Fail(ConfigError* out_error, ErrorCode code, std::string message) {
++  if (out_error) {
++    out_error->code = code;
++    out_error->message = std::move(message);
++  }
++  return false;
++}
++
++bool ParseBrandList(const base::ListValue& list,
++                    std::string_view field_name,
++                    blink::UserAgentBrandList* out_brands,
++                    ConfigError* out_error) {
++  if (list.empty() || list.size() > kMaxBrands) {
++    return Fail(out_error, ErrorCode::kInvalidField,
++                std::string(field_name) + " must contain 1..8 entries");
++  }
++  blink::UserAgentBrandList result;
++  result.reserve(list.size());
++  for (const base::Value& entry : list) {
++    const base::DictValue* dict = entry.GetIfDict();
++    if (!dict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(field_name) + " entries must be objects");
++    }
++    for (const auto [k, v] : *dict) {
++      if (k != "brand" && k != "version") {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Unknown key in " + std::string(field_name) + ": " + k);
++      }
++    }
++    const std::string* brand = dict->FindString("brand");
++    const std::string* version = dict->FindString("version");
++    if (!brand || !version || brand->size() > kMaxTokenLength ||
++        version->size() > kMaxTokenLength || !IsValidClientHintToken(*brand) ||
++        !IsValidClientHintToken(*version)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(field_name) +
++                      " entries require valid brand and version tokens");
++    }
++    result.emplace_back(*brand, *version);
++  }
++  *out_brands = std::move(result);
++  return true;
++}
++
++bool ParseIdentitySlot(const base::DictValue& dict,
++                       std::string_view slot_name,
++                       IdentitySlotConfig* out_slot,
++                       ConfigError* out_error) {
++  static constexpr std::array<std::string_view, 23> kAllowedKeys = {
++      "uaString",        "osCpu",
++      "productVersion",  "appendMobileToken",
++      "primaryBrand",    "majorVersion",
++      "fullVersion",     "brands",
++      "fullVersionBrands", "platform",
++      "platformVersion", "architecture",
++      "bitness",         "model",
++      "mobile",          "wow64",
++      "formFactors",     "navigatorPlatform",
++      "maxTouchPoints",  "pointerType",
++      "hoverType",       "webglVendor",
++      "webglRenderer",
++  };
++  for (const auto [key, value] : dict) {
++    if (std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) ==
++        kAllowedKeys.end()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "Unknown key in " + std::string(slot_name) + ": " + key);
++    }
++  }
++
++  IdentitySlotConfig slot;
++
++  if (const base::Value* v = dict.Find("uaString"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > kMaxUAStringLength ||
++        !HasNoControlChars(*s) || !net::HttpUtil::IsValidHeaderValue(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".uaString is invalid");
++    }
++    slot.ua_string = *s;
++  }
++
++  if (const base::Value* v = dict.Find("osCpu"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > 256 || !IsPrintableASCII(*s) ||
++        s->find('(') != std::string::npos ||
++        s->find(')') != std::string::npos ||
++        !net::HttpUtil::IsValidHeaderValue(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".osCpu is invalid");
++    }
++    slot.os_cpu = *s;
++  }
++
++  if (const base::Value* v = dict.Find("productVersion"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > kMaxTokenLength ||
++        !IsPrintableASCII(*s) || !net::HttpUtil::IsValidHeaderValue(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".productVersion is invalid");
++    }
++    slot.product_version = *s;
++  }
++
++  if (const base::Value* v = dict.Find("appendMobileToken");
++      v && !v->is_none()) {
++    if (!v->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".appendMobileToken must be bool");
++    }
++    slot.append_mobile_token = v->GetBool();
++  }
++
++  if (const base::Value* v = dict.Find("primaryBrand")) {
++    slot.has_primary_brand = true;
++    if (v->is_none()) {
++      slot.primary_brand = std::nullopt;
++    } else if (const std::string* s = v->GetIfString()) {
++      if (s->empty()) {
++        slot.primary_brand = std::nullopt;
++      } else if (s->size() <= kMaxTokenLength && IsValidClientHintToken(*s)) {
++        slot.primary_brand = *s;
++      } else {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    std::string(slot_name) + ".primaryBrand is invalid");
++      }
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".primaryBrand must be string/null");
++    }
++  }
++
++  if (const base::Value* v = dict.Find("majorVersion"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    int parsed = 0;
++    const bool all_digits =
++        s && !s->empty() &&
++        std::all_of(s->begin(), s->end(), [](unsigned char c) {
++          return base::IsAsciiDigit(c);
++        });
++    if (!all_digits || s->size() > 4 || !base::StringToInt(*s, &parsed) ||
++        parsed < 1) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".majorVersion must be positive int");
++    }
++    slot.major_version = *s;
++  }
++
++  if (const base::Value* v = dict.Find("fullVersion"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > 32 || !IsValidClientHintToken(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".fullVersion is invalid");
++    }
++    slot.full_version = *s;
++  }
++
++  if (const base::Value* v = dict.Find("brands"); v && !v->is_none()) {
++    const base::ListValue* list = v->GetIfList();
++    if (!list) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".brands must be an array");
++    }
++    blink::UserAgentBrandList parsed_brands;
++    if (!ParseBrandList(*list, std::string(slot_name) + ".brands",
++                        &parsed_brands, out_error)) {
++      return false;
++    }
++    slot.brands = std::move(parsed_brands);
++  }
++
++  if (const base::Value* v = dict.Find("fullVersionBrands");
++      v && !v->is_none()) {
++    const base::ListValue* list = v->GetIfList();
++    if (!list) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".fullVersionBrands must be an array");
++    }
++    blink::UserAgentBrandList parsed_brands;
++    if (!ParseBrandList(*list, std::string(slot_name) + ".fullVersionBrands",
++                        &parsed_brands, out_error)) {
++      return false;
++    }
++    slot.full_version_brands = std::move(parsed_brands);
++  }
++
++  if (const base::Value* v = dict.Find("platform"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > 64 || !IsValidClientHintToken(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".platform is invalid");
++    }
++    slot.platform = *s;
++  }
++
++  if (const base::Value* v = dict.Find("platformVersion"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->size() > 64 || (!s->empty() && !IsValidClientHintToken(*s))) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".platformVersion is invalid");
++    }
++    slot.platform_version = *s;
++  }
++
++  if (const base::Value* v = dict.Find("architecture"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->size() > 32 || (!s->empty() && !IsValidClientHintToken(*s))) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".architecture is invalid");
++    }
++    slot.architecture = *s;
++  }
++
++  if (const base::Value* v = dict.Find("bitness"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || (*s != "" && *s != "32" && *s != "64")) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".bitness must be \"\", \"32\", or \"64\"");
++    }
++    slot.bitness = *s;
++  }
++
++  if (const base::Value* v = dict.Find("model"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->size() > kMaxTokenLength ||
++        (!s->empty() && !IsValidClientHintToken(*s))) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".model is invalid");
++    }
++    slot.model = *s;
++  }
++
++  if (const base::Value* v = dict.Find("mobile"); v && !v->is_none()) {
++    if (!v->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".mobile must be bool");
++    }
++    slot.mobile = v->GetBool();
++  }
++
++  if (const base::Value* v = dict.Find("wow64"); v && !v->is_none()) {
++    if (!v->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".wow64 must be bool");
++    }
++    slot.wow64 = v->GetBool();
++  }
++
++  if (const base::Value* v = dict.Find("formFactors"); v && !v->is_none()) {
++    const base::ListValue* list = v->GetIfList();
++    if (!list || list->empty() || list->size() > kMaxFormFactors) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".formFactors must be a non-empty array");
++    }
++    std::vector<std::string> factors;
++    factors.reserve(list->size());
++    for (const base::Value& item : *list) {
++      const std::string* s = item.GetIfString();
++      if (!s || !blink::UserAgentMetadata::IsValidFormFactor(*s)) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    std::string(slot_name) + ".formFactors has invalid entry");
++      }
++      factors.push_back(*s);
++    }
++    slot.form_factors = std::move(factors);
++  }
++
++  if (const base::Value* v = dict.Find("navigatorPlatform");
++      v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > 64 || !IsPrintableASCII(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".navigatorPlatform is invalid");
++    }
++    slot.navigator_platform = *s;
++  }
++
++  if (const base::Value* v = dict.Find("maxTouchPoints"); v && !v->is_none()) {
++    if (!v->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".maxTouchPoints must be integer");
++    }
++    const int n = v->GetInt();
++    if (n < 0 || n > 32) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".maxTouchPoints must be in [0, 32]");
++    }
++    slot.max_touch_points = n;
++  }
++
++  if (const base::Value* v = dict.Find("pointerType"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".pointerType must be string");
++    }
++    if (*s == "none") {
++      slot.pointer_type = PointerTypeOverride::kNone;
++    } else if (*s == "coarse") {
++      slot.pointer_type = PointerTypeOverride::kCoarse;
++    } else if (*s == "fine") {
++      slot.pointer_type = PointerTypeOverride::kFine;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".pointerType is invalid");
++    }
++  }
++
++  if (const base::Value* v = dict.Find("hoverType"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".hoverType must be string");
++    }
++    if (*s == "none") {
++      slot.hover_type = HoverTypeOverride::kNone;
++    } else if (*s == "hover") {
++      slot.hover_type = HoverTypeOverride::kHover;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".hoverType is invalid");
++    }
++  }
++
++  if (const base::Value* v = dict.Find("webglVendor"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > kMaxWebGLStringLength ||
++        !IsPrintableASCII(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".webglVendor is invalid");
++    }
++    slot.webgl_vendor = *s;
++  }
++
++  if (const base::Value* v = dict.Find("webglRenderer"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s || s->empty() || s->size() > kMaxWebGLStringLength ||
++        !IsPrintableASCII(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".webglRenderer is invalid");
++    }
++    slot.webgl_renderer = *s;
++  }
++
++  *out_slot = std::move(slot);
++  return true;
++}
++
++std::string DefaultNavigatorPlatformForUAPlatform(std::string_view platform) {
++  if (platform == "macOS") {
++    return "MacIntel";
++  }
++  if (platform == "Windows") {
++    return "Win32";
++  }
++  if (platform == "Android") {
++    return "Linux armv81";
++  }
++  if (platform == "Linux" || platform == "Chrome OS" ||
++      platform == "Chromium OS") {
++    return "Linux x86_64";
++  }
++  if (platform == "iOS") {
++    return "iPhone";
++  }
++  return std::string();
++}
++
++struct LaunchConfigStorage {
++  std::atomic<int> state{static_cast<int>(ConfigState::kUnconfigured)};
++  std::atomic<const LaunchConfig*> active{nullptr};
++  std::optional<LaunchConfig> owned_config;
++  ConfigError last_error;
++};
++
++LaunchConfigStorage& GetStorage() {
++  static base::NoDestructor<LaunchConfigStorage> storage;
++  return *storage;
++}
++
++}  // namespace
++
++ConfigError::ConfigError() = default;
++ConfigError::ConfigError(ErrorCode code, std::string message)
++    : code(code), message(std::move(message)) {}
++ConfigError::ConfigError(const ConfigError&) = default;
++ConfigError::ConfigError(ConfigError&&) noexcept = default;
++ConfigError& ConfigError::operator=(const ConfigError&) = default;
++ConfigError& ConfigError::operator=(ConfigError&&) noexcept = default;
++ConfigError::~ConfigError() = default;
++
++IdentitySlotConfig::IdentitySlotConfig() = default;
++IdentitySlotConfig::IdentitySlotConfig(const IdentitySlotConfig&) = default;
++IdentitySlotConfig::IdentitySlotConfig(IdentitySlotConfig&&) noexcept = default;
++IdentitySlotConfig& IdentitySlotConfig::operator=(const IdentitySlotConfig&) =
++    default;
++IdentitySlotConfig& IdentitySlotConfig::operator=(
++    IdentitySlotConfig&&) noexcept = default;
++IdentitySlotConfig::~IdentitySlotConfig() = default;
++
++LaunchConfig::LaunchConfig() = default;
++LaunchConfig::LaunchConfig(const LaunchConfig&) = default;
++LaunchConfig::LaunchConfig(LaunchConfig&&) noexcept = default;
++LaunchConfig& LaunchConfig::operator=(const LaunchConfig&) = default;
++LaunchConfig& LaunchConfig::operator=(LaunchConfig&&) noexcept = default;
++LaunchConfig::~LaunchConfig() = default;
++
++bool LaunchConfig::HasHardwareOverrides() const {
++  return hardware_concurrency.has_value() || device_memory_gb.has_value() ||
++         timezone.has_value() || mobile.webgl_vendor.has_value() ||
++         mobile.webgl_renderer.has_value() ||
++         desktop.webgl_vendor.has_value() ||
++         desktop.webgl_renderer.has_value();
++}
++
++std::string LaunchConfig::AcceptLanguagesCSV() const {
++  if (languages.empty()) {
++    return "en-US,en";
++  }
++  return base::JoinString(languages, ",");
++}
++
++const IdentitySlotConfig& LaunchConfig::DefaultIdentity() const {
++  return default_slot == DefaultSlot::kDesktop ? desktop : mobile;
++}
++
++const IdentitySlotConfig& LaunchConfig::SelectSlotForMetadata(
++    const blink::UserAgentMetadata& metadata) const {
++  if (default_slot == DefaultSlot::kDesktop) {
++    return desktop;
++  }
++  const bool desktop_mobile = desktop.mobile.value_or(false);
++  const bool mobile_mobile = mobile.mobile.value_or(true);
++  const std::string desktop_platform = desktop.platform.value_or("macOS");
++  const std::string mobile_platform = mobile.platform.value_or("Android");
++
++  if (metadata.mobile == desktop_mobile &&
++      metadata.platform == desktop_platform &&
++      (desktop_mobile != mobile_mobile ||
++       desktop_platform != mobile_platform)) {
++    return desktop;
++  }
++  if (!metadata.platform.empty() && !metadata.mobile &&
++      desktop_mobile == false && mobile_mobile == true) {
++    return desktop;
++  }
++  return mobile;
++}
++
++bool ValidateProfileId(std::string_view profile_id) {
++  if (profile_id == "default") {
++    return true;
++  }
++  if (profile_id.empty() || profile_id.size() > 32) {
++    return false;
++  }
++  if (base::EqualsCaseInsensitiveASCII(profile_id, "default")) {
++    return false;
++  }
++  if (!base::IsAsciiAlpha(profile_id.front()) &&
++      !base::IsAsciiDigit(profile_id.front())) {
++    return false;
++  }
++  for (unsigned char c : profile_id) {
++    if (!base::IsAsciiAlpha(c) && !base::IsAsciiDigit(c) && c != '-' &&
++        c != '_') {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsValidClientHintToken(std::string_view value) {
++  return !value.empty() && HasNoControlChars(value) &&
++         net::HttpUtil::IsValidHeaderValue(value) &&
++         value.find('"') == std::string_view::npos &&
++         value.find('\\') == std::string_view::npos &&
++         value.find(';') == std::string_view::npos;
++}
++
++bool ParseAndValidateLaunchConfigJSON(std::string_view json,
++                                      LaunchConfig* out_config,
++                                      ConfigError* out_error) {
++  if (json.size() > kMaxLaunchConfigBytes) {
++    return Fail(out_error, ErrorCode::kPayloadTooLarge,
++                "Fingerprint config exceeds 64 KiB limit");
++  }
++  auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++      json, base::JSON_PARSE_RFC);
++  if (!parsed.has_value()) {
++    return Fail(out_error, ErrorCode::kInvalidJSON,
++                "JSON parse error: " + parsed.error().message);
++  }
++  const base::DictValue* root = parsed->GetIfDict();
++  if (!root) {
++    return Fail(out_error, ErrorCode::kInvalidJSON,
++                "Root fingerprint config must be a JSON object");
++  }
++
++  static constexpr std::array<std::string_view, 12> kTopLevelKeys = {
++      "schemaVersion",
++      "revision",
++      "profileId",
++      "defaultSlot",
++      "mobile",
++      "desktop",
++      "languages",
++      "proxy",
++      "webrtcIpHandlingPolicy",
++      "enableDoNotTrack",
++      "enableGlobalPrivacyControl",
++      "hardware",
++  };
++  for (const auto [key, value] : *root) {
++    if (std::find(kTopLevelKeys.begin(), kTopLevelKeys.end(), key) ==
++        kTopLevelKeys.end()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "Unknown top-level fingerprint config key: " + key);
++    }
++  }
++
++  std::optional<int> schema_version = root->FindInt("schemaVersion");
++  if (!schema_version.has_value()) {
++    return Fail(out_error, ErrorCode::kInvalidField,
++                "schemaVersion integer is required");
++  }
++  if (*schema_version != kLaunchConfigSchemaVersion) {
++    return Fail(out_error, ErrorCode::kUnsupportedSchema,
++                "Unsupported schemaVersion: " +
++                    base::NumberToString(*schema_version));
++  }
++
++  LaunchConfig cfg;
++  cfg.schema_version = *schema_version;
++
++  if (const base::Value* rev = root->Find("revision"); rev && !rev->is_none()) {
++    if (rev->is_int()) {
++      const int v = rev->GetInt();
++      if (v < 0) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "revision must be non-negative");
++      }
++      cfg.revision = static_cast<uint64_t>(v);
++    } else if (rev->is_double()) {
++      const double d = rev->GetDouble();
++      if (!std::isfinite(d) || d < 0.0 || d > 9007199254740991.0 ||
++          std::floor(d) != d) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "revision must be a non-negative integer");
++      }
++      cfg.revision = static_cast<uint64_t>(d);
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "revision must be an integer");
++    }
++  }
++
++  if (const base::Value* pid = root->Find("profileId");
++      pid && !pid->is_none()) {
++    const std::string* s = pid->GetIfString();
++    if (!s || !ValidateProfileId(*s)) {
++      return Fail(out_error, ErrorCode::kInvalidProfileID,
++                  "profileId must be \"default\" or [A-Za-z0-9][A-Za-z0-9_-]{0,31}");
++    }
++    cfg.profile_id = *s;
++  }
++
++  if (const base::Value* ds = root->Find("defaultSlot"); ds && !ds->is_none()) {
++    const std::string* s = ds->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "defaultSlot must be \"mobile\" or \"desktop\"");
++    }
++    if (*s == "mobile") {
++      cfg.default_slot = DefaultSlot::kMobile;
++    } else if (*s == "desktop") {
++      cfg.default_slot = DefaultSlot::kDesktop;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "defaultSlot must be \"mobile\" or \"desktop\"");
++    }
++  }
++
++  if (const base::Value* m = root->Find("mobile"); m && !m->is_none()) {
++    const base::DictValue* dict = m->GetIfDict();
++    if (!dict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "mobile must be an object");
++    }
++    if (!ParseIdentitySlot(*dict, "mobile", &cfg.mobile, out_error)) {
++      return false;
++    }
++  }
++
++  if (const base::Value* d = root->Find("desktop"); d && !d->is_none()) {
++    const base::DictValue* dict = d->GetIfDict();
++    if (!dict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "desktop must be an object");
++    }
++    if (!ParseIdentitySlot(*dict, "desktop", &cfg.desktop, out_error)) {
++      return false;
++    }
++  }
++
++  if (const base::Value* langs = root->Find("languages");
++      langs && !langs->is_none()) {
++    const base::ListValue* list = langs->GetIfList();
++    if (!list || list->empty() || list->size() > kMaxLanguages) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "languages must be a non-empty array of 1..8 BCP-47 tags");
++    }
++    std::set<std::string> seen;
++    for (const base::Value& item : *list) {
++      const std::string* s = item.GetIfString();
++      if (!s) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "languages entries must be strings");
++      }
++      std::optional<std::string> canonical = CanonicalizeBCP47Tag(*s);
++      if (!canonical.has_value()) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Invalid BCP-47 language tag: " + *s);
++      }
++      std::string lower = base::ToLowerASCII(*canonical);
++      if (seen.insert(std::move(lower)).second) {
++        cfg.languages.push_back(std::move(*canonical));
++      }
++    }
++  } else {
++    cfg.languages = {"en-US", "en"};
++  }
++
++  if (const base::Value* proxy_val = root->Find("proxy");
++      proxy_val && !proxy_val->is_none()) {
++    const base::DictValue* proxy_dict = proxy_val->GetIfDict();
++    if (!proxy_dict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "proxy must be an object");
++    }
++    for (const auto [k, v] : *proxy_dict) {
++      if (k != "mode" && k != "rules" && k != "bypassRules") {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Unknown key in proxy: " + k);
++      }
++    }
++    const std::string* mode = proxy_dict->FindString("mode");
++    if (!mode) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "proxy.mode is required (\"system\", \"direct\", \"fixed\")");
++    }
++    const base::Value* rules_val = proxy_dict->Find("rules");
++    const base::Value* bypass_val = proxy_dict->Find("bypassRules");
++    const bool has_rules = rules_val && !rules_val->is_none();
++    const bool has_bypass = bypass_val && !bypass_val->is_none();
++
++    if (*mode == "system") {
++      if (has_rules || has_bypass) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "proxy.rules/bypassRules must be omitted when mode=system");
++      }
++      cfg.proxy_mode = ProxyMode::kSystem;
++    } else if (*mode == "direct") {
++      if (has_rules || has_bypass) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "proxy.rules/bypassRules must be omitted when mode=direct");
++      }
++      cfg.proxy_mode = ProxyMode::kDirect;
++    } else if (*mode == "fixed") {
++      const std::string* rules_str =
++          has_rules ? rules_val->GetIfString() : nullptr;
++      if (!rules_str || rules_str->empty() ||
++          rules_str->size() > kMaxProxyRulesLength ||
++          !HasNoControlChars(*rules_str)) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "proxy.rules must be a non-empty proxy rule string");
++      }
++      net::ProxyConfig::ProxyRules parsed_rules;
++      parsed_rules.ParseFromString(*rules_str);
++      if (!HasConfiguredProxy(parsed_rules)) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "proxy.rules did not parse into any valid proxy server");
++      }
++      cfg.proxy_mode = ProxyMode::kFixed;
++      cfg.proxy_rules = *rules_str;
++      if (has_bypass) {
++        const std::string* bypass_str = bypass_val->GetIfString();
++        if (!bypass_str || bypass_str->size() > kMaxProxyBypassLength ||
++            !HasNoControlChars(*bypass_str)) {
++          return Fail(out_error, ErrorCode::kInvalidField,
++                      "proxy.bypassRules is invalid");
++        }
++        cfg.proxy_bypass_rules = *bypass_str;
++      }
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "proxy.mode must be \"system\", \"direct\", or \"fixed\"");
++    }
++  }
++
++  if (const base::Value* webrtc = root->Find("webrtcIpHandlingPolicy");
++      webrtc && !webrtc->is_none()) {
++    const std::string* s = webrtc->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "webrtcIpHandlingPolicy must be a string");
++    }
++    if (*s == "default") {
++      cfg.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDefault;
++    } else if (*s == "default_public_and_private_interfaces") {
++      cfg.webrtc_ip_handling_policy = blink::mojom::WebRtcIpHandlingPolicy::
++          kDefaultPublicAndPrivateInterfaces;
++    } else if (*s == "default_public_interface_only") {
++      cfg.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDefaultPublicInterfaceOnly;
++    } else if (*s == "disable_non_proxied_udp") {
++      cfg.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDisableNonProxiedUdp;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "Invalid webrtcIpHandlingPolicy: " + *s);
++    }
++  }
++
++  if (const base::Value* dnt = root->Find("enableDoNotTrack");
++      dnt && !dnt->is_none()) {
++    if (!dnt->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "enableDoNotTrack must be bool");
++    }
++    cfg.enable_do_not_track = dnt->GetBool();
++  }
++
++  if (const base::Value* gpc = root->Find("enableGlobalPrivacyControl");
++      gpc && !gpc->is_none()) {
++    if (!gpc->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "enableGlobalPrivacyControl must be bool");
++    }
++    cfg.enable_global_privacy_control = gpc->GetBool();
++  }
++
++  if (const base::Value* hw_val = root->Find("hardware");
++      hw_val && !hw_val->is_none()) {
++    const base::DictValue* hw = hw_val->GetIfDict();
++    if (!hw) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "hardware must be an object");
++    }
++    for (const auto [k, v] : *hw) {
++      if (k != "hardwareConcurrency" && k != "deviceMemoryGB" &&
++          k != "timezone") {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Unknown key in hardware: " + k);
++      }
++    }
++    if (const base::Value* hc = hw->Find("hardwareConcurrency");
++        hc && !hc->is_none()) {
++      if (!hc->is_int()) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "hardware.hardwareConcurrency must be integer");
++      }
++      const int n = hc->GetInt();
++      if (n < 1 || n > 128) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "hardware.hardwareConcurrency must be in [1, 128]");
++      }
++      cfg.hardware_concurrency = static_cast<uint32_t>(n);
++    }
++    if (const base::Value* dm = hw->Find("deviceMemoryGB");
++        dm && !dm->is_none()) {
++      double gb = 0.0;
++      if (dm->is_int()) {
++        gb = static_cast<double>(dm->GetInt());
++      } else if (dm->is_double()) {
++        gb = dm->GetDouble();
++      } else {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "hardware.deviceMemoryGB must be a W3C bucket number");
++      }
++      static constexpr std::array<double, 8> kBuckets = {
++          0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0};
++      float matched = 0.0f;
++      for (double b : kBuckets) {
++        if (std::fabs(gb - b) < 1e-6) {
++          matched = static_cast<float>(b);
++          break;
++        }
++      }
++      if (matched <= 0.0f) {
++        return Fail(
++            out_error, ErrorCode::kInvalidField,
++            "hardware.deviceMemoryGB must be one of 0.25, 0.5, 1, 2, 4, 8, 16, 32");
++      }
++      cfg.device_memory_gb = matched;
++    }
++    if (const base::Value* tz = hw->Find("timezone"); tz && !tz->is_none()) {
++      const std::string* s = tz->GetIfString();
++      if (!s || !IsValidTimezoneId(*s)) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "hardware.timezone must be a valid IANA timezone ID");
++      }
++      cfg.timezone = *s;
++    }
++  }
++
++  if (out_config) {
++    *out_config = std::move(cfg);
++  }
++  return true;
++}
++
++bool FreezeLaunchConfig(LaunchConfig config, ConfigError* out_error) {
++  LaunchConfigStorage& storage = GetStorage();
++  const int current = storage.state.load(std::memory_order_acquire);
++  if (current == static_cast<int>(ConfigState::kConfigured) ||
++      current == static_cast<int>(ConfigState::kDefault0105)) {
++    return Fail(out_error, ErrorCode::kAlreadyFrozen,
++                "Launch fingerprint config is already frozen for this process");
++  }
++  storage.owned_config.emplace(std::move(config));
++  storage.last_error = ConfigError();
++  storage.active.store(&(*storage.owned_config), std::memory_order_release);
++  storage.state.store(static_cast<int>(ConfigState::kConfigured),
++                      std::memory_order_release);
++  return true;
++}
++
++void RecordLaunchConfigRejection(ErrorCode code, std::string message) {
++  LaunchConfigStorage& storage = GetStorage();
++  const int current = storage.state.load(std::memory_order_acquire);
++  if (current == static_cast<int>(ConfigState::kConfigured) ||
++      current == static_cast<int>(ConfigState::kDefault0105)) {
++    return;
++  }
++  storage.last_error = ConfigError(code, std::move(message));
++  storage.state.store(static_cast<int>(ConfigState::kRejected),
++                      std::memory_order_release);
++}
++
++void FreezeDefault0105IfUnconfigured() {
++  LaunchConfigStorage& storage = GetStorage();
++  int expected = static_cast<int>(ConfigState::kUnconfigured);
++  storage.state.compare_exchange_strong(
++      expected, static_cast<int>(ConfigState::kDefault0105),
++      std::memory_order_acq_rel);
++}
++
++const LaunchConfig* GetLaunchConfig() {
++  return GetStorage().active.load(std::memory_order_acquire);
++}
++
++ConfigState GetLaunchConfigState() {
++  return static_cast<ConfigState>(
++      GetStorage().state.load(std::memory_order_acquire));
++}
++
++ConfigError GetLastLaunchConfigError() {
++  return GetStorage().last_error;
++}
++
++std::string ResolveNavigatorPlatform(const blink::UserAgentMetadata& metadata) {
++  if (const LaunchConfig* cfg = GetLaunchConfig()) {
++    const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++    if (slot.navigator_platform.has_value() &&
++        !slot.navigator_platform->empty()) {
++      return *slot.navigator_platform;
++    }
++  }
++  return DefaultNavigatorPlatformForUAPlatform(metadata.platform);
++}
++
++std::optional<std::string> ResolveWebGLVendor(
++    const blink::UserAgentMetadata& metadata) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  return slot.webgl_vendor;
++}
++
++std::optional<std::string> ResolveWebGLRenderer(
++    const blink::UserAgentMetadata& metadata) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  return slot.webgl_renderer;
++}
++
++}  // namespace blink::curium
+diff --git a/third_party/blink/common/device_memory/approximated_device_memory.cc b/third_party/blink/common/device_memory/approximated_device_memory.cc
+index 7fd53eb..98f5d29 100644
+--- a/third_party/blink/common/device_memory/approximated_device_memory.cc
++++ b/third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -8,7 +8,13 @@
+ #include "base/check_op.h"
+ #include "base/feature_list.h"
+ #include "base/system/sys_info.h"
++#include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
++#if BUILDFLAG(IS_IOS)
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ 
+ namespace blink {
+ 
+@@ -27,6 +33,35 @@ void ApproximatedDeviceMemory::Initialize() {
+ 
+ // static
+ float ApproximatedDeviceMemory::GetApproximatedDeviceMemory() {
++#if BUILDFLAG(IS_IOS)
++  if (const curium::LaunchConfig* cfg = curium::GetLaunchConfig()) {
++    if (cfg->device_memory_gb.has_value()) {
++      return *cfg->device_memory_gb;
++    }
++    // Native hardware mode: keep Android Chrome's 8 GB W3C ceiling so 12/16 GB
++    // iOS devices presenting as Android do not emit an impossible 16 GB hint.
++    const std::string_view default_platform =
++        cfg->DefaultIdentity().platform.has_value()
++            ? std::string_view(*cfg->DefaultIdentity().platform)
++            : (cfg->default_slot == curium::DefaultSlot::kDesktop
++                   ? std::string_view("macOS")
++                   : std::string_view("Android"));
++    if (default_platform == "Android" && approximated_device_memory_gb_ > 8.0f) {
++      return 8.0f;
++    }
++    return approximated_device_memory_gb_;
++  }
++  if (approximated_device_memory_gb_ > 8.0f) {
++    const bool use_ios =
++        base::CommandLine::InitializedForCurrentProcess() &&
++        base::ToLowerASCII(
++            base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++                "curium-mobile-ua")) == "ios";
++    if (!use_ios) {
++      return 8.0f;
++    }
++  }
++#endif
+   return approximated_device_memory_gb_;
+ }
+ 
+diff --git a/third_party/blink/public/common/BUILD.gn b/third_party/blink/public/common/BUILD.gn
+index a12b6cf..edad897 100644
+--- a/third_party/blink/public/common/BUILD.gn
++++ b/third_party/blink/public/common/BUILD.gn
+@@ -140,6 +140,7 @@ source_set("headers") {
+     "css/page_orientation.h",
+     "css/page_size_type.h",
+     "css/scripting.h",
++    "curium/curium_fingerprint_config.h",
+     "custom_handlers/protocol_handler_utils.h",
+     "device_memory/approximated_device_memory.h",
+     "dom/dom_node_id.h",
+diff --git a/third_party/blink/public/common/curium/curium_fingerprint_config.h b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+new file mode 100644
+index 0000000..151844a
+--- /dev/null
++++ b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+@@ -0,0 +1,207 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
++#define THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "third_party/blink/public/common/common_export.h"
++#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
++#include "third_party/blink/public/mojom/peerconnection/webrtc_ip_handling_policy.mojom-shared.h"
++
++namespace blink::curium {
++
++inline constexpr int kLaunchConfigSchemaVersion = 1;
++inline constexpr size_t kMaxLaunchConfigBytes = 65536;
++
++enum class ErrorCode : int {
++  kNone = 0,
++  kInvalidJSON = 1,
++  kUnsupportedSchema = 2,
++  kPayloadTooLarge = 3,
++  kInvalidField = 4,
++  kInvalidProfileID = 5,
++  kProfileUnavailable = 6,
++  kProfileLocked = 7,
++  kAlreadyFrozen = 8,
++};
++
++enum class ConfigState : int {
++  kUnconfigured = 0,
++  kDefault0105 = 1,
++  kConfigured = 2,
++  kRejected = 3,
++};
++
++enum class DefaultSlot : int {
++  kMobile = 0,
++  kDesktop = 1,
++};
++
++enum class ProxyMode : int {
++  kSystem = 0,
++  kDirect = 1,
++  kFixed = 2,
++};
++
++enum class PointerTypeOverride : int {
++  kNone = 0,
++  kCoarse = 1,
++  kFine = 2,
++};
++
++enum class HoverTypeOverride : int {
++  kNone = 0,
++  kHover = 1,
++};
++
++struct BLINK_COMMON_EXPORT ConfigError {
++  ConfigError();
++  ConfigError(ErrorCode code, std::string message);
++  ConfigError(const ConfigError&);
++  ConfigError(ConfigError&&) noexcept;
++  ConfigError& operator=(const ConfigError&);
++  ConfigError& operator=(ConfigError&&) noexcept;
++  ~ConfigError();
++
++  ErrorCode code = ErrorCode::kNone;
++  std::string message;
++};
++
++struct BLINK_COMMON_EXPORT IdentitySlotConfig {
++  IdentitySlotConfig();
++  IdentitySlotConfig(const IdentitySlotConfig&);
++  IdentitySlotConfig(IdentitySlotConfig&&) noexcept;
++  IdentitySlotConfig& operator=(const IdentitySlotConfig&);
++  IdentitySlotConfig& operator=(IdentitySlotConfig&&) noexcept;
++  ~IdentitySlotConfig();
++
++  std::optional<std::string> ua_string;
++  std::optional<std::string> os_cpu;
++  std::optional<std::string> product_version;
++  std::optional<bool> append_mobile_token;
++
++  // Distinguishes omitted (default "Google Chrome") from explicit null/empty
++  // (Chromium-only 2-brand list) and custom brand strings.
++  bool has_primary_brand = false;
++  std::optional<std::string> primary_brand;
++  std::optional<std::string> major_version;
++  std::optional<std::string> full_version;
++  std::optional<blink::UserAgentBrandList> brands;
++  std::optional<blink::UserAgentBrandList> full_version_brands;
++
++  std::optional<std::string> platform;
++  std::optional<std::string> platform_version;
++  std::optional<std::string> architecture;
++  std::optional<std::string> bitness;
++  std::optional<std::string> model;
++  std::optional<bool> mobile;
++  std::optional<bool> wow64;
++  std::optional<std::vector<std::string>> form_factors;
++  std::optional<std::string> navigator_platform;
++
++  // Optional per-slot input capability overrides. When nullopt, Blink keeps
++  // native device touch/pointer capabilities.
++  std::optional<int> max_touch_points;
++  std::optional<PointerTypeOverride> pointer_type;
++  std::optional<HoverTypeOverride> hover_type;
++
++  // Optional per-slot WebGL debug strings. When nullopt, WebGL returns native
++  // Apple Metal GPU vendor/renderer strings.
++  std::optional<std::string> webgl_vendor;
++  std::optional<std::string> webgl_renderer;
++};
++
++struct BLINK_COMMON_EXPORT LaunchConfig {
++  LaunchConfig();
++  LaunchConfig(const LaunchConfig&);
++  LaunchConfig(LaunchConfig&&) noexcept;
++  LaunchConfig& operator=(const LaunchConfig&);
++  LaunchConfig& operator=(LaunchConfig&&) noexcept;
++  ~LaunchConfig();
++
++  int schema_version = kLaunchConfigSchemaVersion;
++  uint64_t revision = 0;
++  std::string profile_id = "default";
++  DefaultSlot default_slot = DefaultSlot::kMobile;
++  IdentitySlotConfig mobile;
++  IdentitySlotConfig desktop;
++  std::vector<std::string> languages;
++
++  ProxyMode proxy_mode = ProxyMode::kSystem;
++  std::string proxy_rules;
++  std::string proxy_bypass_rules;
++
++  blink::mojom::WebRtcIpHandlingPolicy webrtc_ip_handling_policy =
++      blink::mojom::WebRtcIpHandlingPolicy::kDefault;
++  bool enable_do_not_track = false;
++  bool enable_global_privacy_control = false;
++
++  // Optional launch-scoped hardware/environment overrides. When nullopt,
++  // Blink reports authentic native hardware & timezone with zero overhead.
++  std::optional<uint32_t> hardware_concurrency;
++  std::optional<float> device_memory_gb;
++  std::optional<std::string> timezone;
++
++  bool HasHardwareOverrides() const;
++  std::string AcceptLanguagesCSV() const;
++  const IdentitySlotConfig& DefaultIdentity() const;
++  const IdentitySlotConfig& SelectSlotForMetadata(
++      const blink::UserAgentMetadata& metadata) const;
++};
++
++// Validates an opaque profile ID ("default" or [A-Za-z0-9][A-Za-z0-9_-]{0,31},
++// rejecting case variants of "default").
++BLINK_COMMON_EXPORT bool ValidateProfileId(std::string_view profile_id);
++
++// Validates a Client Hint structured-header string token.
++BLINK_COMMON_EXPORT bool IsValidClientHintToken(std::string_view value);
++
++// Parses and validates bounded UTF-8 JSON without mutating process state.
++BLINK_COMMON_EXPORT bool ParseAndValidateLaunchConfigJSON(
++    std::string_view json,
++    LaunchConfig* out_config,
++    ConfigError* out_error);
++
++// Freezes a validated launch config once before ChromeMain spawns threads.
++// Subsequent calls fail closed with ErrorCode::kAlreadyFrozen.
++BLINK_COMMON_EXPORT bool FreezeLaunchConfig(LaunchConfig config,
++                                            ConfigError* out_error);
++
++// Records a pre-ChromeMain rejection so status queries report the failure.
++BLINK_COMMON_EXPORT void RecordLaunchConfigRejection(ErrorCode code,
++                                                     std::string message);
++
++// Seals the unconfigured state as Build 39 (0105) default behavior once
++// ChromeMain begins early initialization.
++BLINK_COMMON_EXPORT void FreezeDefault0105IfUnconfigured();
++
++// Lock-free read of the frozen launch config. Returns nullptr when running in
++// default Build 39 (0105) mode or before configuration is frozen.
++BLINK_COMMON_EXPORT const LaunchConfig* GetLaunchConfig();
++
++BLINK_COMMON_EXPORT ConfigState GetLaunchConfigState();
++BLINK_COMMON_EXPORT ConfigError GetLastLaunchConfigError();
++
++// Resolves navigator.platform for both Window and Worker contexts.
++BLINK_COMMON_EXPORT std::string ResolveNavigatorPlatform(
++    const blink::UserAgentMetadata& metadata);
++
++// Resolves optional per-slot WebGL UNMASKED_VENDOR_WEBGL /
++// UNMASKED_RENDERER_WEBGL overrides. Returns std::nullopt when native Apple
++// GPU strings should be preserved.
++BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLVendor(
++    const blink::UserAgentMetadata& metadata);
++BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLRenderer(
++    const blink::UserAgentMetadata& metadata);
++
++}  // namespace blink::curium
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index 08211f7..f9106ef 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -6,6 +6,9 @@
+ 
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+@@ -76,13 +79,11 @@ String NavigatorBase::platform() const {
+ #endif
+ #if BUILDFLAG(IS_IOS)
+   // [ios-blink-sideload] Keep navigator.platform aligned with the active
+-  // User-Agent Client Hints platform (macOS Desktop, Android Mobile, or iOS).
+-  const std::string& ua_platform = GetUserAgentMetadata().platform;
+-  if (ua_platform == "macOS") {
+-    return "MacIntel";
+-  }
+-  if (ua_platform == "Android") {
+-    return "Linux armv81";
++  // launch fingerprint slot (or Build 39 User-Agent Client Hints platform).
++  const std::string resolved =
++      curium::ResolveNavigatorPlatform(GetUserAgentMetadata());
++  if (!resolved.empty()) {
++    return String::FromUtf8(resolved);
+   }
+ #endif
+   return GetReducedNavigatorPlatform();
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2..63b88df 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -5,10 +5,20 @@
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
+ #include "base/system/sys_info.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++#if BUILDFLAG(IS_IOS)
++  if (const curium::LaunchConfig* cfg = curium::GetLaunchConfig();
++      cfg && cfg->hardware_concurrency.has_value()) {
++    return static_cast<unsigned>(*cfg->hardware_concurrency);
++  }
++#endif
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+ 
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 99c9a68..b6d440f 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -7,8 +7,12 @@
+ #include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/no_destructor.h"
++#include "build/build_config.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+@@ -118,6 +122,20 @@ void TimeZoneController::Init() {
+   Platform::Current()->GetBrowserInterfaceBroker()->GetInterface(
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
++#if BUILDFLAG(IS_IOS)
++  if (const curium::LaunchConfig* cfg = curium::GetLaunchConfig();
++      cfg && cfg->timezone.has_value() && !cfg->timezone->empty()) {
++    static base::NoDestructor<std::unique_ptr<TimeZoneOverride>>
++        curium_tz_override;
++    if (!*curium_tz_override) {
++      TimeZoneOverrideResult result =
++          SetTimeZoneOverride(String::FromUtf8(*cfg->timezone));
++      if (result.status == TimeZoneOverrideStatus::kSuccess) {
++        *curium_tz_override = std::move(result.handle);
++      }
++    }
++  }
++#endif
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index d3679e5..2f4ce19 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -65,6 +65,9 @@
+ #include "media/gfx/paint_canvas_video_renderer.h"
+ #include "media/gfx/video_frame_shared_image_cache.h"
+ #include "third_party/blink/public/common/features.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/mojom/gpu/gpu.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -4355,6 +4358,15 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++#if BUILDFLAG(IS_IOS)
++        if (ExecutionContext* context = ExecutionContext::From(script_state)) {
++          if (std::optional<std::string> renderer =
++                  curium::ResolveWebGLRenderer(
++                      context->GetUserAgentMetadata())) {
++            return WebGLAny(script_state, String::FromUtf8(*renderer));
++          }
++        }
++#endif
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_RENDERER)));
+       }
+@@ -4364,6 +4376,14 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++#if BUILDFLAG(IS_IOS)
++        if (ExecutionContext* context = ExecutionContext::From(script_state)) {
++          if (std::optional<std::string> vendor =
++                  curium::ResolveWebGLVendor(context->GetUserAgentMetadata())) {
++            return WebGLAny(script_state, String::FromUtf8(*vendor));
++          }
++        }
++#endif
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_VENDOR)));
+       }
+-- 
+2.54.0 (Apple Git-157)
+

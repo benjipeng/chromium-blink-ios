@@ -7,6 +7,20 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+typedef NS_ENUM(NSInteger, CrIOSFingerprintErrorCode) {
+  CrIOSFingerprintErrorInvalidJSON = 1,
+  CrIOSFingerprintErrorUnsupportedSchema = 2,
+  CrIOSFingerprintErrorPayloadTooLarge = 3,
+  CrIOSFingerprintErrorInvalidField = 4,
+  CrIOSFingerprintErrorInvalidProfileID = 5,
+  CrIOSFingerprintErrorProfileUnavailable = 6,
+  CrIOSFingerprintErrorProfileLocked = 7,
+  CrIOSFingerprintErrorAlreadyFrozen = 8,
+};
+
+__attribute__((unused)) static NSString *const CrIOSFingerprintErrorDomain =
+    @"com.appautomaton.curium.fingerprint";
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +52,22 @@ NS_SWIFT_UI_ACTOR
 /// Retains the delegate until it is replaced or cleared with nil.
 + (void)registerShellBootstrapDelegate:(nullable id<CrIOSShellBootstrapDelegate>)delegate;
 + (nullable id<CrIOSShellBootstrapDelegate>)shellBootstrapDelegate;
+
+/// Returns supported fingerprint contract schema version, activation scopes,
+/// and feature capabilities. Probe via respondsToSelector: on older engines.
++ (NSDictionary<NSString *, id> *)fingerprintCapabilities;
+
+/// Validates, binds the isolated profile directory, and freezes launch-scoped
+/// fingerprint configuration before ChromeMain starts. Passing nil or empty
+/// data preserves Build 39 (0105) default behavior. Fails closed with a
+/// CrIOSFingerprintErrorDomain error if invalid, unsupported, or unavailable.
++ (BOOL)configureLaunchFingerprintConfigJSON:(nullable NSData *)jsonData
+                                       error:(NSError *__autoreleasing _Nullable *_Nullable)error;
+
+/// Returns the engine's authoritative acknowledgement of the active profile ID,
+/// whether DIR_USER_DATA has opened, applied config revision, state, and any
+/// rejection details.
++ (NSDictionary<NSString *, id> *)activeFingerprintStatus;
 
 @end
 

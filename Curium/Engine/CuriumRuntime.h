@@ -10,6 +10,9 @@ uint64_t CuriumAvailableMemoryBytes(void);
 NSInteger CuriumActiveV8JitMode(void);
 NSArray<NSDictionary<NSString *, NSString *> *> *CuriumRuntimeHookStatuses(void);
 NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferred);
+NSDictionary<NSString *, id> *_Nullable CuriumEngineFingerprintCapabilitiesDict(void);
+BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Nullable *_Nullable error);
+NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveFingerprintStatusDict(void);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

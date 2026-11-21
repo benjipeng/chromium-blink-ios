@@ -65,3 +65,18 @@ thread to end observation. A nil ID in a notification means re-read all
 snapshots. The shell retains a popup while it is presented. When dismissing it,
 including in response to `onRequestClose`, clear the handler, detach the view,
 and call `close`.
+
+### Launch Fingerprint & Profile Bootstrap (Additive to V1)
+
+Probe `CrIOSEngineBootstrap` with `respondsToSelector:` for
+`fingerprintCapabilities`, `configureLaunchFingerprintConfigJSON:error:`, and
+`activeFingerprintStatus` before calling `ChromeMain`. Passing `nil` or empty
+bytes preserves Build 39 (`0105`) default behavior. Passing bounded UTF-8 JSON
+(`schemaVersion: 1`, <= 64 KiB) validates all fields, binds and locks the
+selected isolated profile root under `<Application Support>/ChromiumProfiles/<profileId>`
+(or `<Application Support>/Chromium` for `"default"`), and freezes the launch
+configuration once before threads start. Explicit invalid or unavailable
+profiles fail closed and return `NO` with a `CrIOSFingerprintErrorDomain` error
+rather than silently opening the default profile. Query `activeFingerprintStatus`
+after startup for the engine's authoritative `appliedProfileId`,
+`profileDirectoryOpened`, `appliedConfigRevision`, `state`, and `hardwareOverridesActive`.

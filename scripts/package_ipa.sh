@@ -375,7 +375,13 @@ for sym in ("_ChromeMain", "_V8IOSJitGetActiveMode"):
 objc_meta = subprocess.check_output(["otool", "-oV", bin_path], text=True)
 for cls in ("CrIOSEngineBootstrap", "CrIOSExtensionManagerV1"):
     assert cls in objc_meta, f"chrome_framework missing required ObjC class metadata: {cls}"
-print(f"  verified Curium ABI in {bin_path} (_ChromeMain, _V8IOSJitGetActiveMode, CrIOSEngineBootstrap, CrIOSExtensionManagerV1)")
+for sel in (
+    "fingerprintCapabilities",
+    "configureLaunchFingerprintConfigJSON:error:",
+    "activeFingerprintStatus",
+):
+    assert sel in objc_meta, f"chrome_framework missing CrIOSEngineBootstrap selector: {sel}"
+print(f"  verified Curium ABI in {bin_path} (_ChromeMain, _V8IOSJitGetActiveMode, CrIOSEngineBootstrap[+fingerprint], CrIOSExtensionManagerV1)")
 PY
 
 echo "==> Signing nested frameworks (without entitlements) then top-level app bundle"

@@ -78,6 +78,7 @@ static void CuriumNoOpLogLaunchMetrics(id self, SEL _cmd, id startupInfo, NSArra
 }
 
 static NSArray<NSString *> *gCuriumAugmentedArguments = nil;
+static BOOL gCuriumExplicitFingerprintConfigured = NO;
 
 // Adds a bare switch once.
 static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
@@ -218,6 +219,7 @@ static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *na
 // NSArgumentDomain can never re-enter a dispatch_once lock on the main thread.
 static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL supportsDisableSync,
+                                                 BOOL hasExplicitFingerprintConfig,
                                                  NSString *_Nullable jitPref,
                                                  NSString *_Nullable uaBrandPref,
                                                  NSString *_Nullable mobileUAPref,
@@ -252,12 +254,15 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumAddSwitch(args, @"--curium-enable-jit");
     }
 
-    // Browser identity & Accept-Language switches (consumed natively by patch 0105;
-    // safely ignored on older engines).
-    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-ua-brand", uaBrandPref);
-    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-ua", mobileUAPref);
-    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-accept-lang", acceptLangPref);
-    changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-model", mobileModelPref);
+    // Never merge legacy 0105 switches field-by-field into an explicit
+    // CuriumFingerprintConfigV1 profile; only synthesize them when running in
+    // unconfigured Build 39 default mode.
+    if (!hasExplicitFingerprintConfig) {
+        changed |= CuriumSetDefaultSwitchValue(args, @"--curium-ua-brand", uaBrandPref);
+        changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-ua", mobileUAPref);
+        changed |= CuriumSetDefaultSwitchValue(args, @"--curium-accept-lang", acceptLangPref);
+        changed |= CuriumSetDefaultSwitchValue(args, @"--curium-mobile-model", mobileModelPref);
+    }
 
     return changed ? [args copy] : base;
 }
@@ -286,9 +291,10 @@ static void CuriumInstallCommandLineGuard(void) {
             ? customAcceptLang
             : CuriumNormalizedAcceptLanguages([NSLocale preferredLanguages]);
         NSString *mobileModelPref = [[defaults stringForKey:@"curium.mobileModel"] copy];
+        BOOL hasExplicitConfig = gCuriumExplicitFingerprintConfigured;
         gCuriumAugmentedArguments = CuriumBuildArguments(
-            base, supportsDisableSync, jitPref, uaBrandPref, mobileUAPref,
-            acceptLangPref, mobileModelPref);
+            base, supportsDisableSync, hasExplicitConfig, jitPref, uaBrandPref,
+            mobileUAPref, acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
         SEL sel = @selector(arguments);
@@ -302,14 +308,19 @@ static void CuriumInstallCommandLineGuard(void) {
                              method_getTypeEncoding(method))) {
             method_setImplementation(method, (IMP)CuriumAugmentedProcessArguments);
         }
-        NSString *detail = [NSString stringWithFormat:
-                            @"%lu args (disable-sync=%d, jit=%@, brand=%@, mobile=%@, lang=%@)",
-                            (unsigned long)gCuriumAugmentedArguments.count,
-                            supportsDisableSync ? 1 : 0,
-                            jitPref.length > 0 ? jitPref : @"automatic",
-                            uaBrandPref.length > 0 ? uaBrandPref : @"chrome",
-                            mobileUAPref.length > 0 ? mobileUAPref : @"android",
-                            acceptLangPref];
+        NSString *detail = hasExplicitConfig
+            ? [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@, fingerprint=profile-json)",
+               (unsigned long)gCuriumAugmentedArguments.count,
+               supportsDisableSync ? 1 : 0,
+               jitPref.length > 0 ? jitPref : @"automatic"]
+            : [NSString stringWithFormat:
+               @"%lu args (disable-sync=%d, jit=%@, brand=%@, mobile=%@, lang=%@)",
+               (unsigned long)gCuriumAugmentedArguments.count,
+               supportsDisableSync ? 1 : 0,
+               jitPref.length > 0 ? jitPref : @"automatic",
+               uaBrandPref.length > 0 ? uaBrandPref : @"chrome",
+               mobileUAPref.length > 0 ? mobileUAPref : @"android",
+               acceptLangPref];
         CuriumRecordHookStatus(@"Command-Line Guard", @"active", detail);
     });
 }
@@ -487,6 +498,69 @@ NSInteger CuriumActiveV8JitMode(void) {
     }
     os_unfair_lock_unlock(&lock);
     return resolved ? (NSInteger)resolved() : 0;
+}
+
+NSDictionary<NSString *, id> *_Nullable CuriumEngineFingerprintCapabilitiesDict(void) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(fingerprintCapabilities)]) {
+        return nil;
+    }
+    return [(id)bootstrap fingerprintCapabilities];
+}
+
+BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Nullable *_Nullable error) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(configureLaunchFingerprintConfigJSON:error:)]) {
+        if (jsonData.length == 0) {
+            CuriumRecordHookStatus(@"Fingerprint Profile", @"skipped",
+                                   @"Default Build 39 mode (engine predates launch config contract)");
+            return YES;
+        }
+        if (error) {
+            *error = [NSError errorWithDomain:CrIOSFingerprintErrorDomain
+                                         code:CrIOSFingerprintErrorUnsupportedSchema
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    @"The embedded Blink engine does not support launch fingerprint profiles."}];
+        }
+        CuriumRecordHookStatus(@"Fingerprint Profile", @"failed",
+                               @"Engine missing configureLaunchFingerprintConfigJSON:error:");
+        return NO;
+    }
+
+    NSError *localError = nil;
+    BOOL ok = [(id)bootstrap configureLaunchFingerprintConfigJSON:jsonData error:&localError];
+    if (!ok) {
+        if (error) {
+            *error = localError;
+        }
+        CuriumRecordHookStatus(@"Fingerprint Profile", @"failed",
+                               localError.localizedDescription ?: @"Engine rejected fingerprint config");
+        return NO;
+    }
+    if (jsonData.length > 0) {
+        gCuriumExplicitFingerprintConfigured = YES;
+        NSDictionary<NSString *, id> *status = CuriumEngineActiveFingerprintStatusDict();
+        NSString *profileId = [status[@"appliedProfileId"] isKindOfClass:[NSString class]]
+            ? status[@"appliedProfileId"] : @"unknown";
+        NSNumber *rev = [status[@"appliedConfigRevision"] isKindOfClass:[NSNumber class]]
+            ? status[@"appliedConfigRevision"] : @0;
+        BOOL hwOverrides = [status[@"hardwareOverridesActive"] boolValue];
+        CuriumRecordHookStatus(@"Fingerprint Profile", @"active",
+                               [NSString stringWithFormat:@"profile=%@ rev=%llu hw=%@",
+                                profileId, rev.unsignedLongLongValue,
+                                hwOverrides ? @"override" : @"native-apple"]);
+    } else {
+        CuriumRecordHookStatus(@"Fingerprint Profile", @"active", @"default (Build 39 0105)");
+    }
+    return YES;
+}
+
+NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveFingerprintStatusDict(void) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(activeFingerprintStatus)]) {
+        return nil;
+    }
+    return [(id)bootstrap activeFingerprintStatus];
 }
 
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate) {

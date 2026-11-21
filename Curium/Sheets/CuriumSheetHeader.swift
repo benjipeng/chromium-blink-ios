@@ -76,6 +76,8 @@ struct CuriumSettingsSheet: View {
     @State private var hooksSummary = ""
     @State private var hasHookFailure = false
     @State private var diagnosticLineCount = 0
+    @State private var fingerprintStore = CuriumFingerprintStore.loadShared()
+    @State private var engineFingerprintStatus: CuriumEngineFingerprintStatus?
 
     private var activeV8RuntimeLabel: String {
         guard engineReady else { return "Standby" }
@@ -171,20 +173,62 @@ struct CuriumSettingsSheet: View {
                 }
 
                 Section {
-                    Picker("Browser Brand", selection: $uaBrandPreference) {
-                        ForEach(CuriumUABrandPreference.allCases) { option in
-                            Text(option.title).tag(option)
+                    Button {
+                        fingerprintStore.resetToBuild39Default()
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Default (Build 39 Authentic Chrome)")
+                                    .foregroundStyle(.primary)
+                                Text("Legacy Chromium profile · Native Apple hardware")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if fingerprintStore.selectedProfileID == nil {
+                                Image(systemName: "checkmark").foregroundStyle(.tint)
+                            }
                         }
                     }
-                    Picker("Mobile Profile", selection: $mobileUAPreference) {
-                        ForEach(CuriumMobileUAPreference.allCases) { option in
-                            Text(option.title).tag(option)
+                    ForEach(fingerprintStore.profiles) { profile in
+                        Button {
+                            fingerprintStore.selectProfile(id: profile.id)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(profile.displayName)
+                                        .foregroundStyle(.primary)
+                                    Text("\(profile.id) · \(profile.usesNativeHardwareAndGPU ? "Native Apple HW/GPU" : "Custom HW/GPU") · \(profile.proxy.summary)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if fingerprintStore.selectedProfileID == profile.id {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                    }
+                    if fingerprintStore.selectedProfileID == nil {
+                        Picker("Browser Brand", selection: $uaBrandPreference) {
+                            ForEach(CuriumUABrandPreference.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                        Picker("Mobile Profile", selection: $mobileUAPreference) {
+                            ForEach(CuriumMobileUAPreference.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
                         }
                     }
                 } header: {
-                    Text("Browser Identity")
+                    Text("Browser Identity & Profile")
                 } footer: {
-                    Text("Applies on next launch. Desktop tabs identify as macOS arm64 Chrome; Mobile tabs use the selected profile with system Accept-Language headers.")
+                    if let status = engineFingerprintStatus {
+                        Text("Active engine profile: \(status.appliedProfileId) (\(status.state), rev \(status.appliedConfigRevision), \(status.hardwareOverridesActive ? "hardware override" : "native Apple hardware")). Profile switches apply on next cold launch.")
+                    } else {
+                        Text("Profile switches apply on next cold launch with isolated cookies, storage, and preferences.")
+                    }
                 }
 
                 Section("Browser") {
@@ -234,6 +278,7 @@ struct CuriumSettingsSheet: View {
         hooksSummary = summary.summary
         hasHookFailure = summary.hasFailure
         diagnosticLineCount = diag.currentLines().count
+        engineFingerprintStatus = CuriumFingerprintBootstrap.activeEngineStatus()
     }
 }
 
