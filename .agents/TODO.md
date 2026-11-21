@@ -7,12 +7,11 @@ the pinned engine first, translate to `patches/` once proven.
 
 ## Pinned
 
-- **Engine:** build 35, `Kernel.lock` → `3b973e0` (Chromium 160.0.8171.0), patches
-  through 0097. Patch 0095 (page scrolls under the floating top chrome) is live.
-- **On `ac_duo`:** `Curium-0.1.10-b14-arm64.ipa` (adds `CuriumClipboardHook.m`
-  fixing Blink paste UTI conformance + trusted synchronous pasteboard snapshot,
-  on top of b13's Clear Address overlay and pre-`ChromeMain` V8 TXM JIT probe)
-  staged in LiveContainer `Documents/` for manual install.
+- **Engine:** build 37, `Kernel.lock` → `b25e8e3` (run `44875353052`, Chromium
+  160.0.8171.0), patches through `0104` + `fb14c22`, with separate 83.4 MB
+  unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`).
+- **On `ac_duo`:** `Curium-0.1.10-b14-arm64.ipa` (on Build 35); Build 37 app
+  `0.1.11 (15)` ready after Simulator verification and Sire's approval.
 
 ## App (on the pinned engine)
 
@@ -136,25 +135,22 @@ the pinned engine first, translate to `patches/` once proven.
 
 ## Live hooks
 
-Runtime hooks on the pinned engine, in `Curium/Engine/`. Each one fails closed when
-the engine's layout differs from what it expects (`CuriumHookSupport.h`).
+Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m`. All five
+temporary Build 35 engine hooks (`CuriumExtensionCoexistenceHook`,
+`CuriumClipboardHook`, `CuriumTouchCancelHook`, `CuriumInputAccessoryHook`, and
+`CuriumPictureInPictureHooks`) were upstreamed into `patches/0099`–`0104` (+
+`fb14c22`) and retired when `Kernel.lock` repinned to Build 37.
 
 | Hook | Effect | Exit |
 | --- | --- | --- |
 | `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync` when `CuriumEngineSupportsDisableSync` is set, JIT mode, and Skia Graphite off on Simulator. | Permanent: the app's channel for launch switches. |
+| `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
-| `-[CuriumPiPBridge dealloc]` (`CuriumPictureInPictureHooks.m`) | Replaces the dealloc that crashed on PiP close. Steps aside when the engine has `-detachObservers`. | `fb14c22`; delete once `Kernel.lock` pins it. |
-| `-[CuriumPiPBridge startPiPForGeneration:]` and its `failedToStartPictureInPictureWithError:` (`CuriumPictureInPictureHooks.m`) | Holds the start up to 0.6 s until the controller is 150 ms old, possible, and rendering; retries one reported failure after 0.25 s. | The upstream form in the Engine wave, once `ac_duo` proves it. |
-| `-[RenderWidgetUIView inputAccessoryView]` (`CuriumInputAccessoryHook.m`) | Returns no accessory while `GCKeyboard.coalescedKeyboard` is set; reloads input views on keyboard connect or disconnect. | Upstream the same condition in `render_widget_host_view_ios_uiview.mm`. |
-| `-[RenderWidgetUIView touchesBegan/Moved/Ended/Cancelled:withEvent:]` (`CuriumTouchCancelHook.m`) | Mirrors `WebTouchEventBuilder`'s 16-slot global touch table so multi-touch, partial, stale, and untracked cancellations never violate `MotionEventWeb`'s `AllTouchPointsHaveState(kStateCancelled)` `DCHECK` or `WebTouchEventBuilder` traps. | Fix `WebTouchEventBuilder::Build(kTouchCancel, ...)` and `RenderWidgetUIView -touchesCancelled:` in the Engine wave. |
-| `-[RenderWidgetUIView paste:]` + `-[_UIConcretePasteboard items / dataForPasteboardType:inItemSet: / image]` (`CuriumClipboardHook.m`) | Captures a `changeCount`-validated synchronous pasteboard snapshot inside UIKit's trusted `-paste:` call and aliases conforming UTIs (`public.utf8-plain-text` → `public.plain-text`, UTF-16, bare URL, HTML/RTF/PNG/SVG/raster images) strictly for `chrome_framework` `__TEXT` callers so Blink paste and `navigator.clipboard.readText()` work without repeated iOS paste-permission prompts. | Fix UTI conformance in `ClipboardIOS::GetAllAvailableFormats` and capture synchronous pasteboard state in `-[RenderWidgetUIView paste:]` in the Engine wave. |
-| Build 35 `__DATA_CONST` vtable & schema slots (`CuriumExtensionCoexistenceHook.m`, 28 coexistence slots + `tabs` schema + 2 `IOSExtensionsAPIProvider` slots) | Authorizes single-process extension subresources, messaging, MV3 service worker lifecycle, API dispatch, and event listeners by browser-verified document origin/worker identity (preserving private resource isolation); implements `GetNativeWindowForFunction` + native `UIAlertController` consent for `CreateInstallPromptForNativeWindow` (`chrome.permissions.request`); adds `chrome.tabs.TAB_ID_NONE = -1` to `IOSGeneratedSchemas`; registers `APIPermissionID::kScripting` (`230`) and the MV3 stable `"scripting"` permission feature on `IOSExtensionsAPIProvider` so `chrome.scripting.registerContentScripts` (`MAIN`-world scriptlets + cosmetic CSS) works in uBlock Origin Lite and Dark Reader. Pinned to UUID `4C4C4483-5555-3144-A14F-B2F89F30C28A`, fail-closed. | Upstream per-context authorization, `permissions.request` prompt support, `TAB_ID_NONE` in `tabs.json`, and `"scripting"` permission registration in `IOSExtensionsAPIProvider` in the Engine wave, then delete once `Kernel.lock` repins. |
 
-## Engine wave (patches 0098–0104 written, awaiting Build 36 & `Kernel.lock` repin)
+## Engine wave (Build 37 landed & pinned in `Kernel.lock`)
 
-Gate with `graph-diagnose.yml` (`compile_extensions=true`, `comparison_mode=report`)
-before triggering `build-ipa.yml`. Retire the matching `Curium/Engine/` runtime hooks
-once `Kernel.lock` repins to the new engine and `ac_duo` verifies each item.
+Built in run `44875353052` (`b25e8e3`) after green `graph-diagnose.yml` (`44874478610`).
+All five matching runtime hooks have been retired from `Curium/Engine/`.
 
 - [x] **Unstripped framework symbols artifact (`0098-ios-save-unstripped-symbols.patch`).**
   `build/toolchain/apple/toolchain.gni` already declares `.unstripped` outputs when

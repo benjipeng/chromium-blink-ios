@@ -1,10 +1,5 @@
 #import "CuriumRuntime.h"
-#import "CuriumClipboardHook.h"
-#import "CuriumExtensionCoexistenceHook.h"
 #import "CuriumHookSupport.h"
-#import "CuriumInputAccessoryHook.h"
-#import "CuriumPictureInPictureHooks.h"
-#import "CuriumTouchCancelHook.h"
 #import <TargetConditionals.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
@@ -316,11 +311,6 @@ static void CuriumInstallHeadlessRuntimeGuards(void) {
         [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
     CuriumInstallCommandLineGuard();
     CuriumPrepareEarlyV8Jit(jitPref);
-    CuriumInstallExtensionCoexistenceHooks();
-    CuriumInstallPictureInPictureHooks();
-    CuriumInstallInputAccessoryHook();
-    CuriumInstallTouchCancelHook();
-    CuriumInstallClipboardHook();
     Class metricsMediator = NSClassFromString(@"MetricsMediator");
     if (!metricsMediator) {
         CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",
