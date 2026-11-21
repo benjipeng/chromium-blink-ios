@@ -224,6 +224,7 @@ if [ -n "$OUTPUT_IPA" ]; then
   mkdir -p "$(dirname "$OUTPUT_IPA")"
 else
   mkdir -p "$OUTPUT_DIR"
+  OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
   OUTPUT_IPA="$OUTPUT_DIR/Curium-${MARKETING_VERSION}-b${BUILD_NUMBER}-arm64.ipa"
 fi
 
