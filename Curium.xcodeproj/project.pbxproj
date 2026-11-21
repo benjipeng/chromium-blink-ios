@@ -13,7 +13,7 @@
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		C09600010000000000000003 /* Target membership exceptions */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (Engine/embed-frameworks.sh, README.md);
+			membershipExceptions = (App/Curium-Engine-Info.plist, Engine/embed-frameworks.sh, README.md);
 			target = C09600010000000000000009 /* Curium */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */

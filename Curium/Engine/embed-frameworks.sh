@@ -4,20 +4,29 @@ set -eu
 destination="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 assets="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
 engine="${CURIUM_ENGINE_VENDOR}/EngineResources"
+mkdir -p "${TARGET_TEMP_DIR}"
 
 # Chromium resolves runtime assets relative to the main application bundle.
-# Track only the files this phase owns so switching back to standby removes them.
+# Track only the files this phase owns so switching back to standby removes them,
+# and skip copying files whose size and nanosecond mtime already match.
 /usr/bin/python3 - "$engine" "$assets" "$TARGET_TEMP_DIR/CuriumEngineResources.txt" "$CURIUM_USE_ENGINE_XCFRAMEWORK" <<'PY'
 from pathlib import Path
+import os
 import shutil
 import sys
 
 source, bundle, manifest = map(Path, sys.argv[1:4])
 enabled = sys.argv[4] == "YES"
-previous = set(manifest.read_text().splitlines()) if manifest.is_file() else set()
+previous = set(manifest.read_text(encoding="utf-8").splitlines()) if manifest.is_file() else set()
 if enabled and not all((source / name).is_file() for name in ("icudtl.dat", "resources.pak")):
     sys.exit(f"error: Missing Curium engine resources in {source}")
-files = {p.relative_to(source).as_posix() for p in source.rglob("*") if p.is_file()} if enabled else set()
+
+files = {
+    p.relative_to(source).as_posix()
+    for p in source.rglob("*")
+    if p.is_file() and not p.relative_to(source).as_posix().startswith("bundled_extensions/ios_probe/")
+} if enabled else set()
+
 for name in sorted(previous - files):
     file = bundle / name
     file.unlink(missing_ok=True)
@@ -28,27 +37,29 @@ for name in sorted(previous - files):
             if any(parent.iterdir()):
                 break
             parent.rmdir()
+
 for name in sorted(files):
-    output = bundle / name
-    output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source / name, output)
+    src = source / name
+    dst = bundle / name
+    src_st = os.stat(src)
+    if dst.is_file():
+        dst_st = os.stat(dst)
+        if dst_st.st_size == src_st.st_size and dst_st.st_mtime_ns == src_st.st_mtime_ns:
+            continue
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
 if enabled:
-    manifest.write_text("\n".join(sorted(files)) + "\n", encoding="utf-8")
+    content = "\n".join(sorted(files)) + "\n"
+    if not manifest.is_file() or manifest.read_text(encoding="utf-8") != content:
+        manifest.write_text(content, encoding="utf-8")
 else:
     manifest.unlink(missing_ok=True)
 PY
 
 remove_framework() {
-    /usr/bin/python3 -c 'from pathlib import Path; import shutil, sys; p = Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$destination/$1.framework"
+    rm -rf "$destination/$1.framework" "$TARGET_TEMP_DIR/CuriumEmbed-$1.stamp"
 }
-# Compile the minimal window scene storyboard when engine-linked.
-scene_sb_src="${SRCROOT}/Curium/App/CuriumScene.storyboard"
-scene_sb_out="${assets}/CuriumScene.storyboardc"
-if [ "$CURIUM_USE_ENGINE_XCFRAMEWORK" = YES ] && [ -f "$scene_sb_src" ]; then
-    /usr/bin/ibtool --minimum-deployment-target 26.0 --target-device iphone --target-device ipad --compile "$scene_sb_out" "$scene_sb_src"
-else
-    /usr/bin/python3 -c 'from pathlib import Path; import shutil, sys; p = Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$scene_sb_out"
-fi
 
 if [ "$CURIUM_USE_ENGINE_XCFRAMEWORK" != YES ]; then
     for name in EarlyMallocZoneRegistration chrome_framework Lottie; do
@@ -58,19 +69,42 @@ if [ "$CURIUM_USE_ENGINE_XCFRAMEWORK" != YES ]; then
 fi
 
 mkdir -p "$destination"
+
+file_sig() {
+    if [ -e "$1" ]; then
+        /usr/bin/stat -f '%z:%m' "$1"
+    else
+        printf 'missing'
+    fi
+}
+
 embed() {
     source="$1/$2.framework"
     output="$destination/$2.framework"
+    stamp="$TARGET_TEMP_DIR/CuriumEmbed-$2.stamp"
     if [ ! -d "$source" ]; then
         printf 'error: Missing Curium engine dependency: %s\n' "$source" >&2
         exit 1
     fi
+
+    sign_key="${CODE_SIGNING_ALLOWED:-NO}:${EXPANDED_CODE_SIGN_IDENTITY:--}"
+    src_sig="${CURIUM_USE_ENGINE_XCFRAMEWORK}|${CURIUM_ENGINE_SLICE:-}|${sign_key}|${source}|$(file_sig "$source/$2")|$(file_sig "$source/Info.plist")"
+    if [ -d "$output" ] && [ -f "$stamp" ]; then
+        out_sig="$(file_sig "$output/$2")|$(file_sig "$output/Info.plist")"
+        expected="${src_sig}|${out_sig}"
+        if [ "$(cat "$stamp")" = "$expected" ]; then
+            return 0
+        fi
+    fi
+
     remove_framework "$2"
     /usr/bin/ditto "$source" "$output"
     if [ "${CODE_SIGNING_ALLOWED:-NO}" = YES ]; then
         /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" \
             --preserve-metadata=identifier,entitlements "$output"
     fi
+    out_sig="$(file_sig "$output/$2")|$(file_sig "$output/Info.plist")"
+    printf '%s|%s\n' "$src_sig" "$out_sig" > "$stamp"
 }
 
 embed "$CURIUM_ENGINE_ALLOCATOR_DIR" EarlyMallocZoneRegistration

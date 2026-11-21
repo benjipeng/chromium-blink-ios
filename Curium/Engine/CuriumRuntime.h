@@ -4,6 +4,10 @@
 NS_ASSUME_NONNULL_BEGIN
 
 void CuriumSetDesktopSite(id<CrIOSTabHostingV1> tab, BOOL enabled);
+void CuriumSetPageZoom(id<CrIOSTabHostingV1> tab, CGFloat scale);
+uint64_t CuriumAvailableMemoryBytes(void);
+// 0 = Jitless, 1 = BrowserEngineCore, 2 = Native MAP_JIT, 3 = TXM Split-W^X.
+NSInteger CuriumActiveV8JitMode(void);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

@@ -14,6 +14,10 @@ struct CuriumDownloadsSheet: View {
         var id: URL { url }
     }
 
+    private var hasActiveDownloads: Bool {
+        store.downloads.contains { $0.isActive }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             CuriumSheetHeader(title: "Downloads")
@@ -32,9 +36,10 @@ struct CuriumDownloadsSheet: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .task {
+        .task(id: hasActiveDownloads) {
+            guard hasActiveDownloads else { return }
             while !Task.isCancelled {
-                for item in store.downloads where item.isStarting || item.state == .pending || item.state == .inProgress {
+                for item in store.downloads where item.isActive {
                     item.refresh()
                 }
                 do { try await Task.sleep(for: .milliseconds(350)) } catch { break }
@@ -60,7 +65,7 @@ struct CuriumDownloadsSheet: View {
             if let failure = item.failure {
                 Text(failure).font(.footnote).foregroundStyle(.secondary)
             }
-            if item.isStarting || item.state == .inProgress {
+            if item.isActive {
                 if let fraction = item.fraction {
                     ProgressView(value: fraction).accessibilityLabel("Download progress")
                 } else {

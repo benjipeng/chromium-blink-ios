@@ -15,6 +15,8 @@ final class CuriumDownload: Identifiable {
     private(set) var fraction: Double?
     private(set) var isStarting = false
 
+    var isActive: Bool { isStarting || state == .inProgress }
+
     init(task: any CrIOSDownloadTaskV1) {
         self.task = task
         id = task.downloadID
@@ -31,8 +33,13 @@ final class CuriumDownload: Identifiable {
     }
 
     func refresh() {
-        state = task.state
-        fraction = task.totalBytes > 0 ? min(1, max(0, Double(task.receivedBytes) / Double(task.totalBytes))) : nil
+        let newState = task.state
+        if state != newState { state = newState }
+        let total = task.totalBytes
+        let newFraction: Double? = total > 0
+            ? min(1, max(0, Double(task.receivedBytes) / Double(total)))
+            : nil
+        if fraction != newFraction { fraction = newFraction }
     }
 
     func start() async {
@@ -40,13 +47,17 @@ final class CuriumDownload: Identifiable {
         isStarting = true
         failure = nil
         defer { isStarting = false; refresh() }
+        let name = filename
         do {
-            let root = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
-                                                   appropriateFor: nil, create: true)
-            let directory = root.appending(path: "Downloads", directoryHint: .isDirectory)
-                .appending(path: UUID().uuidString, directoryHint: .isDirectory)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            savedURL = try await task.start(withDestinationURL: directory.appending(path: filename))
+            let destination = try await Task.detached(priority: .utility) {
+                let root = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                                       appropriateFor: nil, create: true)
+                let directory = root.appending(path: "Downloads", directoryHint: .isDirectory)
+                    .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                return directory.appending(path: name)
+            }.value
+            savedURL = try await task.start(withDestinationURL: destination)
         } catch {
             if task.state != .cancelled { failure = error.localizedDescription }
         }

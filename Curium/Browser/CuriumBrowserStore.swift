@@ -9,6 +9,8 @@ final class CuriumTabModel: Identifiable {
 
     let id: String
     private(set) var engine: (any CrIOSTabHostingV1)?
+    private(set) var webView: UIView?
+    private(set) var scrollView: UIScrollView?
     private(set) var url: URL?
     private(set) var title = "New Tab"
     private(set) var isLoading = false
@@ -19,45 +21,66 @@ final class CuriumTabModel: Identifiable {
     private(set) var zoomScale: CGFloat = 1.0
     private(set) var pageCanvasColor: UIColor?
     private(set) var isFullscreen = false
+    /// The address bar's collapse. Updated every compositor frame while scrolling, so
+    /// only the address bar's leaf views read it.
+    private(set) var chrome = CuriumChromeState()
+    private(set) var pictureInPicture = CuriumPictureInPictureState()
     private(set) var hasPlayingVideo = false
     private(set) var isPictureInPictureActive = false
     private(set) var extensionTabID: Int32 = -1
-    private(set) var snapshot: UIImage?
+    private(set) var thumbnail: UIImage?
 
     @ObservationIgnored private var history: [URL?] = [nil]
     @ObservationIgnored private var historyIndex = 0
-    @ObservationIgnored private var snapshotRevision = 0
-    @ObservationIgnored private var snapshotCapturedRevision: Int?
+    @ObservationIgnored private(set) var snapshotRevision = 0
     @ObservationIgnored private var configuredInitialSiteMode = false
+    @ObservationIgnored private var lastRawTitle: String?
+    @ObservationIgnored private var pictureInPictureTimer: Task<Void, Never>?
 
-    init() { id = UUID().uuidString }
+    init(id: String = UUID().uuidString) { self.id = id }
 
-    init(engine: any CrIOSTabHostingV1) {
-        id = engine.tabID
-        refresh(from: engine)
+    fileprivate func matchesViewport(of engine: any CrIOSTabHostingV1) -> Bool {
+        self.engine === engine && webView === engine.webView && scrollView === engine.scrollView
     }
 
-    func refresh(from engine: any CrIOSTabHostingV1) {
-        if self.engine !== engine { self.engine = engine }
+    /// Reports the engine title when history needs to reconsider this tab.
+    fileprivate func refresh(from engine: any CrIOSTabHostingV1) -> (title: String, titleChanged: Bool)? {
+        let nextView = engine.webView
+        let nextScroll = engine.scrollView
+        if self.engine !== engine || webView !== nextView || scrollView !== nextScroll {
+            clearSnapshot()
+        }
+        if self.engine !== engine {
+            self.engine = engine
+            update(\.chrome) { $0 = CuriumChromeState() }
+        }
+        if webView !== nextView { webView = nextView }
+        if scrollView !== nextScroll { scrollView = nextScroll }
 
         let newURL = engine.currentURL
-        if url != newURL {
+        let urlChanged = url != newURL
+        if urlChanged {
             url = newURL
             if newURL != nil { configuredInitialSiteMode = true }
+            update(\.chrome) { $0.unpin(.navigated) }
             clearSnapshot()
         }
 
-        let newTitle = engine.title.isEmpty ? (newURL?.host() ?? "New Tab") : engine.title
+        let rawTitle = engine.title
+        let titleChanged = lastRawTitle != rawTitle
+        if titleChanged { lastRawTitle = rawTitle }
+        let newTitle = rawTitle.isEmpty ? (newURL?.host() ?? "New Tab") : rawTitle
         if title != newTitle { title = newTitle }
 
-        let wasLoading = isLoading
         let newIsLoading = engine.isLoading
-        if isLoading != newIsLoading { isLoading = newIsLoading }
-        if wasLoading && !newIsLoading {
-            snapshotRevision += 1
+        let loadingChanged = isLoading != newIsLoading
+        if loadingChanged {
+            isLoading = newIsLoading
+            clearSnapshot()
         }
 
-        let newProgress = min(1, max(0, engine.estimatedProgress))
+        // Update the fill in 2% steps so small samples don't retarget its animation.
+        let newProgress = (min(1, max(0, engine.estimatedProgress)) * 50).rounded(.down) / 50
         if progress != newProgress { progress = newProgress }
 
         let newCanGoBack = engine.canGoBack
@@ -73,16 +96,22 @@ final class CuriumTabModel: Identifiable {
         if pageCanvasColor != newCanvas { pageCanvasColor = newCanvas }
 
         let newFullscreen = engine.isWebFullscreen
-        if isFullscreen != newFullscreen { isFullscreen = newFullscreen }
+        if isFullscreen != newFullscreen {
+            isFullscreen = newFullscreen
+            clearSnapshot()
+        }
 
         let newHasVideo = engine.hasPlayingVideo ?? false
         if hasPlayingVideo != newHasVideo { hasPlayingVideo = newHasVideo }
 
         let newPiP = engine.isPictureInPictureActive ?? false
         if isPictureInPictureActive != newPiP { isPictureInPictureActive = newPiP }
+        update(\.pictureInPicture) { $0.engineReported(hasVideo: newHasVideo, active: newPiP) }
+        if newPiP { pictureInPictureTimer?.cancel() }
 
         let newExtTabID = engine.extensionTabID
         if extensionTabID != newExtTabID { extensionTabID = newExtTabID }
+        return urlChanged || titleChanged || loadingChanged ? (rawTitle, titleChanged) : nil
     }
 
     private static func isPureWhite(_ color: UIColor) -> Bool {
@@ -96,13 +125,14 @@ final class CuriumTabModel: Identifiable {
         // ContentWebState::GetUnderPageBackgroundColor() defaults to opaque white even on dark
         // pages without <meta name="theme-color">, whereas RenderWidgetHostViewIOS updates
         // scrollView.backgroundColor with the live SkColor from Blink's RenderFrameMetadata.
-        if let theme = engine.pageCanvasColor, !isPureWhite(theme) {
+        let theme = engine.pageCanvasColor
+        if let theme, !isPureWhite(theme) {
             return theme
         }
         if let liveBg = engine.scrollView?.backgroundColor {
             return liveBg
         }
-        return engine.pageCanvasColor
+        return theme
     }
 
     func syncScrollCanvasColor() {
@@ -156,11 +186,46 @@ final class CuriumTabModel: Identifiable {
 
     func togglePictureInPicture() {
         guard let engine else { return }
-        if isPictureInPictureActive {
+        var next = pictureInPicture
+        let command = next.requested()
+        pictureInPicture = next
+        switch command {
+        case .exit:
             engine.exitPictureInPicture?()
-        } else {
+        case .enter:
             engine.enterPictureInPicture?()
+            pictureInPictureTimer?.cancel()
+            pictureInPictureTimer = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: CuriumPictureInPictureState.confirmationTimeout)
+                guard !Task.isCancelled, let self else { return }
+                self.update(\.pictureInPicture) { $0.confirmationTimedOut() }
+                guard self.pictureInPicture.phase == .refused else { return }
+                try? await Task.sleep(for: CuriumPictureInPictureState.hintDuration)
+                guard !Task.isCancelled else { return }
+                self.update(\.pictureInPicture) { $0.hintExpired() }
+            }
+        case nil:
+            break
         }
+    }
+
+    /// Blink's compositor reports the shown fraction of the top controls; nil means the
+    /// engine has none.
+    func reportChromeCollapse(_ collapse: CGFloat?) {
+        update(\.chrome) { $0.engineReported(collapse: collapse) }
+    }
+
+    func pinChromeOpen() { update(\.chrome) { $0.pin() } }
+
+    func unpinChrome(_ reason: CuriumChromeState.UnpinReason) { update(\.chrome) { $0.unpin(reason) } }
+
+    /// Writes a state value only when a transition changed it, so observers of an
+    /// unchanged value are not woken on every engine update.
+    private func update<State: Equatable>(_ keyPath: ReferenceWritableKeyPath<CuriumTabModel, State>,
+                                          _ transition: (inout State) -> Void) {
+        var next = self[keyPath: keyPath]
+        transition(&next)
+        if next != self[keyPath: keyPath] { self[keyPath: keyPath] = next }
     }
 
     func toggleDesktopSite() {
@@ -186,22 +251,13 @@ final class CuriumTabModel: Identifiable {
     }
 
     func clearSnapshot() {
-        if snapshot != nil { snapshot = nil }
-        snapshotCapturedRevision = nil
+        if thumbnail != nil { thumbnail = nil }
         snapshotRevision += 1
     }
 
-    var hasFreshSnapshot: Bool {
-        snapshot != nil && snapshotCapturedRevision == snapshotRevision
-    }
-
-    /// Directly rasterizes the mounted webView into a compact 768 px SDR buffer (~1.5 MiB)
-    /// instead of allocating a 22–45 MiB full-resolution screen bitmap first.
-    @discardableResult
-    func captureThumbnailDirectly() -> Bool {
-        guard let engine, url != nil, !isFullscreen else { return false }
-        if hasFreshSnapshot { return true }
-        let webView = engine.webView
+    /// Rasterizes the mounted page into a compact SDR thumbnail.
+    fileprivate func captureThumbnail() -> Bool {
+        guard let webView, url != nil, !isLoading, !isFullscreen, thumbnail == nil else { return false }
         let bounds = webView.bounds
         guard webView.window != nil, bounds.width > 1, bounds.height > 1 else { return false }
 
@@ -218,11 +274,21 @@ final class CuriumTabModel: Identifiable {
 
         let revision = snapshotRevision
         let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-        let image = renderer.image { _ in
-            webView.drawHierarchy(in: CGRect(origin: .zero, size: targetSize), afterScreenUpdates: false)
+        var complete = true
+        let image = renderer.image { context in
+            if hasPlayingVideo || isPictureInPictureActive {
+                // Video may be composited separately from the page's layer tree.
+                complete = webView.drawHierarchy(in: CGRect(origin: .zero, size: targetSize), afterScreenUpdates: false)
+            } else {
+                // Blink's page layers can render straight into the thumbnail bitmap.
+                let cg = context.cgContext
+                cg.scaleBy(x: targetSize.width / bounds.width, y: targetSize.height / bounds.height)
+                cg.translateBy(x: -bounds.minX, y: -bounds.minY)
+                webView.layer.render(in: cg)
+            }
         }
-        snapshot = image
-        snapshotCapturedRevision = revision
+        guard complete, revision == snapshotRevision else { return false }
+        thumbnail = image
         return true
     }
 
@@ -244,9 +310,25 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private static let maxRetainedSnapshots = 12
     private static let maxLiveTabs = 24
     private static let minTabAdmissionHeadroomBytes: UInt64 = 192 * 1024 * 1024
+    private static let repeatVisitInterval: Duration = .seconds(2)
+
+    private struct ObservedVisit {
+        let url: URL
+        var title: String
+        var recordedAt: ContinuousClock.Instant
+        var isRepeatLoad = false
+    }
+
+    private struct CommittedHistory {
+        let url: URL
+        var visitURL: URL?
+        var title: String
+    }
 
     private let host: (any CrIOSBrowserHostV1)?
+    private let reportsNavigationCommits: Bool
     let extensions: CuriumExtensionStore
+    let library = CuriumLibrary()
     private(set) var tabs: [CuriumTabModel] = []
     private(set) var activeTab: CuriumTabModel?
     private(set) var downloads: [CuriumDownload] = []
@@ -255,16 +337,25 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     var requestShowTabs = false
 
     @ObservationIgnored private var tabsByID: [String: CuriumTabModel] = [:]
+    @ObservationIgnored private var historyByTabID: [String: ObservedVisit] = [:]
+    @ObservationIgnored private var committedHistoryByTabID: [String: CommittedHistory] = [:]
     @ObservationIgnored private var snapshotLRU: [String] = []
     @ObservationIgnored private var lastExtensionTabID: Int32 = -1
     @ObservationIgnored private var isUnderMemoryPressure = false
-    @ObservationIgnored private var snapshotScheduled = false
+    @ObservationIgnored private var isSceneBackgrounded = false
+    @ObservationIgnored private var isSheetPresented = false
+    @ObservationIgnored private var snapshotTask: Task<Void, Never>?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
     var isEngineReady: Bool { host != nil }
 
     init(host: (any CrIOSBrowserHostV1)? = nil, extensionManager: (any CrIOSExtensionManagingV1)? = nil) {
         self.host = host
+        // The optional delegate method is ours, so probing it cannot tell us
+        // whether Blink sends it. Patch 0097 adds this forwarder to the host.
+        reportsNavigationCommits = host?.responds(to: NSSelectorFromString(
+            "tabHost:didCommitNavigationToURL:navigationID:isSameDocument:isReload:"
+        )) == true
         extensions = CuriumExtensionStore(manager: host == nil ? nil : (extensionManager ?? CuriumSharedExtensionManager()))
         super.init()
         if let host {
@@ -301,6 +392,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleMemoryWarning() {
         isUnderMemoryPressure = true
+        cancelSnapshotCapture()
         snapshotLRU.removeAll()
         for tab in tabs {
             tab.clearSnapshot()
@@ -308,6 +400,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func handleSceneDidEnterBackground() {
+        isSceneBackgrounded = true
+        cancelSnapshotCapture()
         backgroundEpoch += 1
         // Retain at most the active tab's thumbnail in background to minimize idle footprint.
         let keepID = activeTab?.id
@@ -318,33 +412,60 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func handleSceneWillEnterForeground() {
+        isSceneBackgrounded = false
         isUnderMemoryPressure = false
+        if let activeTab { scheduleSnapshot(for: activeTab) }
     }
 
-    /// Schedules a deferred 768 px thumbnail capture on the next runloop turn so sheet
-    /// presentation starts immediately without blocking frame 0.
-    func scheduleSnapshotForActiveTab() {
-        guard !isUnderMemoryPressure, !snapshotScheduled, let tab = activeTab, !tab.hasFreshSnapshot else { return }
-        snapshotScheduled = true
+    func setSheetPresented(_ presented: Bool) {
+        isSheetPresented = presented
+        if presented {
+            cancelSnapshotCapture()
+        } else if let activeTab {
+            scheduleSnapshot(for: activeTab)
+        }
+    }
+
+    func scheduleSnapshot(for tab: CuriumTabModel) {
+        guard activeTab === tab else { return }
+        cancelSnapshotCapture()
+        guard !isUnderMemoryPressure, !isSceneBackgrounded, !isSheetPresented,
+              tab.webView != nil, tab.url != nil,
+              !tab.isLoading, !tab.isFullscreen, tab.thumbnail == nil else { return }
         let targetID = tab.id
-        Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self else { return }
-            self.snapshotScheduled = false
-            guard !self.isUnderMemoryPressure,
-                  let current = self.activeTab,
-                  current.id == targetID else { return }
-            if current.captureThumbnailDirectly() {
-                self.recordSnapshot(for: current.id)
+        let revision = tab.snapshotRevision
+        let initialOffset = tab.scrollView?.contentOffset
+        snapshotTask = Task(priority: .utility) { @MainActor [weak self] in
+            var lastOffset = initialOffset
+            // Blink can move the offset even when UIKit isn't tracking a gesture.
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+                guard !Task.isCancelled, let self, let current = self.activeTab,
+                      current.id == targetID, current.snapshotRevision == revision else { return }
+                let scroll = current.scrollView
+                let offset = scroll?.contentOffset
+                if offset != lastOffset || scroll?.isTracking == true || scroll?.isDecelerating == true {
+                    lastOffset = offset
+                    continue
+                }
+                self.snapshotTask = nil
+                if current.captureThumbnail() {
+                    self.recordSnapshot(for: targetID)
+                }
+                return
             }
         }
     }
 
-    private func captureOutgoingTabThumbnailIfEligible() {
-        guard !isUnderMemoryPressure, let outgoing = activeTab else { return }
-        if outgoing.captureThumbnailDirectly() {
-            recordSnapshot(for: outgoing.id)
-        }
+    private func cancelSnapshotCapture() {
+        snapshotTask?.cancel()
+        snapshotTask = nil
+    }
+
+    private func setActiveTab(_ tab: CuriumTabModel?) {
+        guard activeTab !== tab else { return }
+        cancelSnapshotCapture()
+        activeTab = tab
     }
 
     func submitAddress(_ input: String) {
@@ -360,12 +481,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                   let host = candidate.host(), host.contains(".") || host == "localhost" {
             url = candidate
         } else {
-            var search = URLComponents()
-            search.scheme = "https"
-            search.host = "www.google.com"
-            search.path = "/search"
-            search.queryItems = [URLQueryItem(name: "q", value: text)]
-            url = search.url
+            url = library.searchEngine.searchURL(for: text)
         }
         guard let url else { return }
         let preferDesktop = prefersDesktopByDefault()
@@ -400,7 +516,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         if !tabs.isEmpty && !canAdmitNewTab() {
             return false
         }
-        captureOutgoingTabThumbnailIfEligible()
         let preferDesktop = prefersDesktopByDefault()
         if let host {
             // Create the tab without immediately loading a mobile-UA URL so Desktop Site
@@ -409,11 +524,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                 errorMessage = "Blink could not open a new tab."
                 return false
             }
-            updateTabs(from: host)
-            if let model = tabsByID[createdEngine.tabID] {
+            let createdID = createdEngine.tabID
+            if activeTab?.id != createdID { updateTabs(from: host) }
+            if let model = tabsByID[createdID] {
                 if preferDesktop {
                     CuriumSetDesktopSite(createdEngine, true)
-                    model.refresh(from: createdEngine)
+                    refresh(model, from: createdEngine)
                 }
                 if let url {
                     model.load(url, preferDesktop: preferDesktop)
@@ -424,46 +540,40 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             if let url { tab.load(url, preferDesktop: preferDesktop) }
             tabs.append(tab)
             tabsByID[tab.id] = tab
-            activeTab = tab
+            setActiveTab(tab)
         }
         return true
     }
 
     func select(_ tab: CuriumTabModel) {
         guard activeTab?.id != tab.id else { return }
-        captureOutgoingTabThumbnailIfEligible()
         if let host {
             guard host.activateTab(withID: tab.id) else { return }
-            if let model = tabsByID[tab.id] {
-                if let engine = model.engine {
-                    model.refresh(from: engine)
-                }
-                activeTab = model
-                updateExtensionContext(force: true)
-            } else {
-                updateTabs(from: host)
-            }
+            updateTabs(from: host)
         } else {
-            activeTab = tab
+            setActiveTab(tab)
         }
     }
 
     func close(_ tab: CuriumTabModel) {
         if let host {
+            // A coalesced update may still be queued when the shell closes the tab.
+            if let engine = tab.engine { refresh(tab, from: engine) }
             if host.closeTab(withID: tab.id) { updateTabs(from: host) }
         } else if let index = tabs.firstIndex(where: { $0.id == tab.id }) {
             tabs.remove(at: index)
             tabsByID.removeValue(forKey: tab.id)
             snapshotLRU.removeAll { $0 == tab.id }
-            if activeTab?.id == tab.id { activeTab = tabs.isEmpty ? nil : tabs[min(index, tabs.count - 1)] }
+            if activeTab?.id == tab.id { setActiveTab(tabs.isEmpty ? nil : tabs[min(index, tabs.count - 1)]) }
         }
         if tabs.isEmpty { newTab() }
     }
 
-    func clearBrowsingData() async {
+    /// Clears cookies, cache, and site storage written since `start` (all of it when nil).
+    func clearWebsiteData(since start: Date?) async {
         guard let host else { return }
         do {
-            try await host.clearBrowsingData(of: [.cookies, .cache, .siteStorage], modifiedSince: .distantPast)
+            try await host.clearBrowsingData(of: [.cookies, .cache, .siteStorage], modifiedSince: start ?? .distantPast)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -477,9 +587,99 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard let model = tabsByID[tab.tabID] else { return }
         let oldURL = model.url
         let oldExtID = model.extensionTabID
-        model.refresh(from: tab)
+        refresh(model, from: tab)
         let contextChanged = model.url != oldURL || model.extensionTabID != oldExtID
         if activeTab === model && contextChanged { updateExtensionContext(force: true) }
+    }
+
+    func browserHost(
+        _ host: any CrIOSBrowserHostV1, tab: any CrIOSTabHostingV1,
+        didCommitNavigationTo url: URL, navigationID _: Int64, isSameDocument: Bool, isReload _: Bool
+    ) {
+        guard reportsNavigationCommits else { return }
+        let tabID = tab.tabID
+        let previous = committedHistoryByTabID[tabID]
+        var history = CommittedHistory(url: url, visitURL: nil, title: "")
+        // A fragment-only commit still belongs to the last recorded visit.
+        if isSameDocument && !Self.changedPathOrQuery(from: previous?.url, to: url) {
+            history.visitURL = previous?.visitURL
+            history.title = previous?.title ?? ""
+        } else if Self.isHistoryURL(url) {
+            history.visitURL = url
+            // A new document can still expose the previous page's title while loading.
+            if tab.currentURL == url && (isSameDocument || !tab.isLoading) {
+                history.title = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            library.recordVisit(url: url, title: history.title)
+        }
+        committedHistoryByTabID[tabID] = history
+    }
+
+    private static func changedPathOrQuery(from previous: URL?, to url: URL) -> Bool {
+        guard let previous else { return false }
+        return previous.path(percentEncoded: true) != url.path(percentEncoded: true)
+            || previous.query(percentEncoded: true) != url.query(percentEncoded: true)
+    }
+
+    private static func isHistoryURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        return (scheme == "http" || scheme == "https") && url.host()?.isEmpty == false
+    }
+
+    private func refresh(_ tab: CuriumTabModel, from engine: any CrIOSTabHostingV1) {
+        let revision = tab.snapshotRevision
+        let wasLoading = tab.isLoading
+        if let update = tab.refresh(from: engine) {
+            if reportsNavigationCommits {
+                updateCommittedTitle(for: tab, rawTitle: update.title, titleChanged: update.titleChanged)
+            } else {
+                noteHistory(for: tab, rawTitle: update.title, titleChanged: update.titleChanged, wasLoading: wasLoading)
+            }
+        }
+        if tab.snapshotRevision != revision {
+            scheduleSnapshot(for: tab)
+        }
+    }
+
+    private func updateCommittedTitle(for tab: CuriumTabModel, rawTitle: String, titleChanged: Bool) {
+        guard var history = committedHistoryByTabID[tab.id], history.url == tab.url,
+              let visitURL = history.visitURL, !tab.isLoading || titleChanged else { return }
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, history.title != title else { return }
+        history.title = title
+        committedHistoryByTabID[tab.id] = history
+        library.updateTitle(title, for: visitURL)
+    }
+
+    private func noteHistory(for tab: CuriumTabModel, rawTitle: String, titleChanged: Bool, wasLoading: Bool) {
+        // Older engines expose only the visible URL, which can be provisional.
+        guard let url = tab.url, Self.isHistoryURL(url) else {
+            historyByTabID.removeValue(forKey: tab.id)
+            return
+        }
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasPageTitle = !tab.isLoading || titleChanged
+        let now = ContinuousClock.now
+        guard var visit = historyByTabID[tab.id], visit.url == url else {
+            // A pending URL may still be paired with the previous page's title.
+            let initialTitle = hasPageTitle ? title : ""
+            historyByTabID[tab.id] = ObservedVisit(url: url, title: initialTitle, recordedAt: now)
+            library.recordVisit(url: url, title: initialTitle)
+            return
+        }
+        if !wasLoading && tab.isLoading {
+            // Require a new loading cycle after the first visit's coalesced updates.
+            visit.isRepeatLoad = now - visit.recordedAt > Self.repeatVisitInterval
+        } else if wasLoading && !tab.isLoading && visit.isRepeatLoad {
+            visit.isRepeatLoad = false
+            visit.recordedAt = now
+            if !title.isEmpty { visit.title = title }
+            library.recordVisit(url: url, title: title)
+        } else if hasPageTitle, !title.isEmpty, visit.title != title {
+            visit.title = title
+            library.updateTitle(title, for: url)
+        }
+        historyByTabID[tab.id] = visit
     }
 
     func browserHost(_ host: any CrIOSBrowserHostV1, didCreateDownload download: any CrIOSDownloadTaskV1) {
@@ -500,24 +700,24 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     private func updateTabs(from host: any CrIOSBrowserHostV1) {
         let hostTabs = host.tabs
-        let activeID = host.activeTab?.tabID
+        let activeEngine = host.activeTab
+        let activeID = activeEngine?.tabID
 
         let orderMatches = hostTabs.count == tabs.count
             && zip(hostTabs, tabs).allSatisfy { $0.tabID == $1.id }
         let activeMatches = activeTab?.id == activeID
+        let viewportsMatch = orderMatches
+            && zip(hostTabs, tabs).allSatisfy { $1.matchesViewport(of: $0) }
+        let activeViewportMatches = activeEngine.map { activeTab?.matchesViewport(of: $0) == true } ?? true
 
-        if orderMatches && activeMatches {
+        if viewportsMatch && activeMatches && activeViewportMatches {
             updateExtensionContext(force: false)
             return
         }
 
-        if orderMatches, let activeID, let nextActive = tabsByID[activeID] {
-            if let engine = host.activeTab {
-                nextActive.refresh(from: engine)
-            }
-            if activeTab !== nextActive {
-                activeTab = nextActive
-            }
+        if viewportsMatch, let activeEngine, let nextActive = tabsByID[activeEngine.tabID] {
+            refresh(nextActive, from: activeEngine)
+            setActiveTab(nextActive)
             updateExtensionContext(force: true)
             return
         }
@@ -527,28 +727,31 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         var nextIndex: [String: CuriumTabModel] = [:]
         nextIndex.reserveCapacity(hostTabs.count)
 
-        for engine in hostTabs {
-            let tabID = engine.tabID
+        for listedEngine in hostTabs {
+            let tabID = listedEngine.tabID
+            let engine = activeEngine.flatMap { $0.tabID == tabID ? $0 : nil } ?? listedEngine
             if let existing = tabsByID[tabID] {
-                if tabID == activeID { existing.refresh(from: engine) }
+                if tabID == activeID || !existing.matchesViewport(of: engine) {
+                    refresh(existing, from: engine)
+                }
                 nextTabs.append(existing)
                 nextIndex[tabID] = existing
             } else {
-                let created = CuriumTabModel(engine: engine)
+                let created = CuriumTabModel(id: tabID)
+                refresh(created, from: engine)
                 nextTabs.append(created)
                 nextIndex[tabID] = created
             }
         }
 
-        tabs = nextTabs
+        if !orderMatches { tabs = nextTabs }
         tabsByID = nextIndex
+        historyByTabID = historyByTabID.filter { nextIndex[$0.key] != nil }
+        committedHistoryByTabID = committedHistoryByTabID.filter { nextIndex[$0.key] != nil }
         snapshotLRU.removeAll { nextIndex[$0] == nil }
 
-        let nextActive = activeID.flatMap { nextIndex[$0] }
-        if activeTab !== nextActive {
-            activeTab = nextActive
-        }
-        updateExtensionContext(force: !activeMatches)
+        setActiveTab(activeID.flatMap { nextIndex[$0] })
+        updateExtensionContext(force: !activeMatches || !activeViewportMatches)
     }
 
     private func updateExtensionContext(force: Bool) {

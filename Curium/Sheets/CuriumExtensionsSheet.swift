@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct CuriumExtensionsSheet: View {
     let browser: CuriumBrowserStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var choosingFile = false
     @State private var enteringLink = false
     @State private var storeLink = ""
@@ -24,11 +25,25 @@ struct CuriumExtensionsSheet: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .task {
+        .onAppear {
+            store.refresh(tabID: browser.activeTab?.extensionTabID ?? -1, includeBlockedCounts: true)
+        }
+        .task(id: scenePhase == .active && store.hasEnabledExtensions && (browser.activeTab?.extensionTabID ?? -1) >= 0) {
+            guard scenePhase == .active,
+                  store.hasEnabledExtensions,
+                  (browser.activeTab?.extensionTabID ?? -1) >= 0 else { return }
             while !Task.isCancelled {
-                store.refresh(tabID: browser.activeTab?.extensionTabID ?? -1)
                 do { try await Task.sleep(for: .seconds(2)) } catch { break }
+                store.refreshBlockedCounts(tabID: browser.activeTab?.extensionTabID ?? -1)
             }
+        }
+        .onChange(of: browser.backgroundEpoch) { _, _ in
+            setPopup(nil)
+        }
+        .onChange(of: store.installed) { _, installed in
+            guard let activePopup = popup else { return }
+            let stillValid = installed.contains { $0.id == activePopup.host.extensionID && $0.canShowPopup }
+            if !stillValid { setPopup(nil) }
         }
         .onDisappear {
             setPopup(nil)
@@ -40,6 +55,13 @@ struct CuriumExtensionsSheet: View {
                 if let url { store.prepareSignedFile(url) }
             }
             .ignoresSafeArea()
+        }
+        .sheet(item: Binding(
+            get: { popup },
+            set: { if $0 == nil { setPopup(nil) } }
+        )) { activePopup in
+            CuriumPopupView(presentation: activePopup)
+                .presentationSizing(.fitted)
         }
         .alert("Chrome Web Store Link", isPresented: $enteringLink) {
             TextField("https://chromewebstore.google.com/…", text: $storeLink)
@@ -67,16 +89,27 @@ struct CuriumExtensionsSheet: View {
 
     private var extensionList: some View {
         List {
-            Section("Shield · Current Page") {
-                LabeledContent {
-                    if let count = store.blockedCount {
-                        Text(count, format: .number).monospacedDigit()
-                    } else {
-                        Text("Unavailable")
+            if store.isWorking {
+                Section {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text("Downloading and verifying extension…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                } label: {
-                    Label("Requests Blocked", systemImage: "shield")
                 }
+            }
+
+            if let review = store.review {
+                Section("Review Extension Permissions") {
+                    LabeledContent("Extension", value: review.name)
+                    if !review.version.isEmpty { LabeledContent("Version", value: review.version) }
+                    LabeledContent("Permissions", value: review.permissions.isEmpty ? "None" : review.permissions.joined(separator: ", "))
+                    LabeledContent("Site Access", value: review.hosts.isEmpty ? "None" : review.hosts.joined(separator: ", "))
+                    Button { store.confirmReview() } label: { Label("Add Extension", systemImage: "checkmark") }
+                    Button(role: .cancel) { store.cancelReview() } label: { Label("Cancel Review", systemImage: "xmark") }
+                }
+                .id(review.id)
             }
 
             Section("Installed · Manifest V3") {
@@ -93,19 +126,15 @@ struct CuriumExtensionsSheet: View {
                 }
             }
 
-            if let review = store.review {
-                Section("Review Extension Permissions") {
-                    LabeledContent("Extension", value: review.name)
-                    if !review.version.isEmpty { LabeledContent("Version", value: review.version) }
-                    LabeledContent("Permissions", value: review.permissions.isEmpty ? "None" : review.permissions.joined(separator: ", "))
-                    LabeledContent("Site Access", value: review.hosts.isEmpty ? "None" : review.hosts.joined(separator: ", "))
-                    Button { store.confirmReview() } label: { Label("Add Extension", systemImage: "checkmark") }
-                    Button(role: .cancel) { store.cancelReview() } label: { Label("Cancel Review", systemImage: "xmark") }
-                }
-                .id(review.id)
-            }
-
             Section("Add an Extension") {
+                Button {
+                    if let url = URL(string: "https://chromewebstore.google.com/"),
+                       browser.newTab(url: url) {
+                        dismiss()
+                    }
+                } label: {
+                    Label("Browse Chrome Web Store", systemImage: "safari")
+                }
                 Button { choosingFile = true } label: {
                     Label("Import Signed CRX from Files…", systemImage: "doc.badge.plus")
                 }
@@ -114,9 +143,6 @@ struct CuriumExtensionsSheet: View {
                     enteringLink = true
                 } label: {
                     Label("Install from Chrome Web Store Link…", systemImage: "link")
-                }
-                if store.isWorking {
-                    ProgressView("Working…")
                 }
             }
             .disabled(!store.isAvailable || store.isWorking || store.review != nil)
@@ -133,7 +159,7 @@ struct CuriumExtensionsSheet: View {
                     if !item.version.isEmpty { Text("Version \(item.version)").font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            if let count = item.blockedCount {
+            if let count = item.blockedCount, count > 0 {
                 Text("Blocked on this page: \(count, format: .number)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -150,13 +176,6 @@ struct CuriumExtensionsSheet: View {
             } label: {
                 Label("Open \(item.name)", systemImage: "puzzlepiece.extension")
                     .badge(item.badge.map { Text(verbatim: $0) })
-            }
-            .popover(item: Binding(
-                get: { popup?.host.extensionID == item.id ? popup : nil },
-                set: { if $0 == nil, popup?.host.extensionID == item.id { setPopup(nil) } }
-            ), attachmentAnchor: .rect(.bounds)) { popup in
-                CuriumPopupView(presentation: popup)
-                    .presentationCompactAdaptation(.sheet)
             }
         }
         if item.isEnabled, let url = item.optionsURL {
@@ -232,10 +251,12 @@ private struct CuriumPopupView: View {
 
     var body: some View {
         let size = presentation.host.preferredContentSize
+        let width = min(480, max(320, size.width))
+        let height = min(560, max(440, size.height))
         VStack(spacing: 0) {
             CuriumSheetHeader(title: presentation.name)
             Surface(content: presentation.view)
-                .frame(idealWidth: min(480, max(240, size.width)), idealHeight: min(540, max(120, size.height)))
+                .frame(minWidth: width, idealWidth: width, minHeight: height, idealHeight: height)
         }
     }
 

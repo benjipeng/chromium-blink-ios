@@ -1,6 +1,6 @@
 # Curium
 
-Curium (`com.appautomaton.curium`) is a native iOS browser with a Liquid Glass shell and a Chromium engine: Blink, jitless V8, and Manifest V3 extensions. One repository and one integration branch, `main`, hold the app and the engine build. GitHub Actions compiles Chromium; Xcode with the iOS 27.2 SDK builds the app locally without an upstream Chromium checkout.
+Curium (`com.appautomaton.curium`) is a native iOS browser with a Liquid Glass shell and a Chromium engine: Blink, V8, and Manifest V3 extensions. The engine runs in a single process, as iOS and LiveContainer require. V8 runs jitless by default and switches to JIT when a debugger enables it. One repository and one integration branch, `main`, hold the app and the engine build. GitHub Actions fetches, prunes, compiles, and links Chromium. Xcode with the iOS 27.2 SDK builds and iterates on the app locally, with no upstream Chromium checkout.
 
 ## Local app and engine handoff
 
@@ -8,19 +8,17 @@ Open `Curium.xcodeproj` and select the `Curium` scheme. The Swift shell in `Curi
 
 ```sh
 scripts/sync_curium_engine.py                  # Download the Actions artifact and verify the IPA
-scripts/sync_curium_engine.py --ipa /path/to/Chromium-Blink-159.0.8149.0-arm64.ipa
+scripts/sync_curium_engine.py --ipa /path/to/Chromium-Blink-<version>-arm64.ipa
 scripts/sync_curium_engine.py --status         # Inspect the handoff offline
 ```
 
 Assembly requires Xcode on Apple silicon; downloads also require the GitHub CLI (`gh`). The tool checks the IPA bytes before assembly. Use `--ipa … --skip-sha256` only for disposable local test IPAs; the manifest marks the result as unverified.
 
-[`Kernel.lock`](Kernel.lock) identifies [run 44328959472](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44328959472) and [artifact 14443178991](https://github.com/benjipeng/chromium-blink-ios/actions/runs/44328959472/artifacts/14443178991) for Chromium `159.0.8149.0`. The run came from `probe/extensions-gn` at `1f76114fbc0d5ca7f2b748a4f19fedc4d39edd79`, the commit carried forward onto `main`. The branch name is historical provenance.
-
-The current `KERNEL_IPA_SHA256` value identifies GitHub's outer artifact ZIP. The downloaded IPA hashes to `b34c8abc851a36e05f9a171c2bf73469f168d4b2eb1cdcc8ff3761f8e5973c88`, matching the checksum published by Actions. Verified assembly rejects the current pin until it records the IPA digest.
+[`Kernel.lock`](Kernel.lock) is the single record of the engine in use: its commit, Actions run, artifact, Chromium version, and two digests. `KERNEL_ARTIFACT_ZIP_SHA256` covers the ZIP that GitHub serves; `KERNEL_IPA_SHA256` covers the IPA inside it, and verified assembly checks the IPA against it. Update the pin only from a verified `build-ipa.yml` package.
 
 The handoff contains `EarlyMallocZoneRegistration.xcframework`, `chrome_framework.xcframework`, and `Lottie.xcframework` when present. Each contains an ad hoc signed `ios-arm64` and `ios-arm64-simulator` slice. `EngineResources/` keeps ICU data, resource packs, localizations, scripts, error pages, and bundled extensions. The manifest records the source digest and the number of files and bytes retained, plus the uncompressed bytes omitted from app resources. It records assembly time in UTC; set `SOURCE_DATE_EPOCH` to fix that timestamp for reproducible runs.
 
-The M159 IPA is an assembly baseline. The shell's standalone mode is the default until the headless bridge and its allocator companion are in the engine artifact. Use the [simulator guide](docs/simulator.md) to run the original Chromium app on a disposable simulator copy.
+With `CURIUM_USE_ENGINE_XCFRAMEWORK = YES` in `Version.xcconfig`, the app links the engine and starts Blink; with `NO`, it builds without the engine and starts in standby. See the [app guide](Curium/README.md). To run the standalone Chromium IPA instead, use the [simulator guide](docs/simulator.md).
 
 ## Architecture
 
@@ -28,7 +26,7 @@ The remote build uses a pruned, revision-pinned source snapshot from `sync-sourc
 
 | Stage | Runner | Work |
 | --- | --- | --- |
-| 0 · SDK stub | macOS | Extract the pinned Xcode iPhoneOS SDK and Swift stub; publish the encrypted artifact. |
+| 0 · SDK stub | macOS | Extract the iPhoneOS SDK and Swift stub from the Xcode pinned in `version.lock`; publish the encrypted artifact. |
 | 1 · Codegen | Linux | Apply patches, generate and audit the Ninja graph, and build host tools and generated inputs. |
 | 2 · Apple tools | macOS | Run the Apple-only edges for Swift, assets, interface files, and intents. |
 | 3 · Compile | Linux | Build target objects across 18 stable partitions in parallel, with a separate `ccache` bucket per partition. |
@@ -43,7 +41,7 @@ The pipeline plans before compiling and reuses existing GHCR checkpoints for cod
 
 Keep `patches/`, `args/`, `version.lock`, and the planner's `COMMON` scripts unchanged during Swift and Liquid Glass work. Local app and handoff changes keep **100% of existing GHCR checkpoint keys reusable** for the same source and SDK inputs.
 
-Batch engine C++ changes and pin changes into a single candidate. The next wave combines staged patch 0087 (extension action badges, under `staging/patches/`), the headless `CrIOSBrowserHostV1` bridge (0088), and Chromium M160 (`160.0.8171.0`). Prepare the matching source snapshot and SDK stub, then gate the batch with `graph-diagnose.yml` against a known green graph. Build the IPA after the graph audit passes. Update `Kernel.lock` from the verified package after testing the engine contract.
+Batch engine C++ changes and pin changes into a single candidate. Prepare the matching source snapshot and SDK stub, then gate the batch with `graph-diagnose.yml` against a known green graph; its optional extension object probe compiles the affected objects without linking. Build the IPA after the audit passes, and update `Kernel.lock` from the verified package after testing the engine contract.
 
 ## Repository setup
 

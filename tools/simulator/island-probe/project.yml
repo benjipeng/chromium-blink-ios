@@ -1,0 +1,27 @@
+name: IslandProbe
+options:
+  bundleIdPrefix: com.appautomaton.probe
+  deploymentTarget: { iOS: "27.1" }
+targets:
+  IslandProbe:
+    type: application
+    platform: iOS
+    sources: [App, Shared.swift]
+    info:
+      path: App/Info.plist
+      properties:
+        NSSupportsLiveActivities: true
+        UILaunchScreen: {}
+        CFBundleDisplayName: IslandProbe
+    settings: { base: { PRODUCT_BUNDLE_IDENTIFIER: com.appautomaton.probe.island, CODE_SIGNING_ALLOWED: NO, GENERATE_INFOPLIST_FILE: NO } }
+    dependencies: [{ target: IslandProbeWidget }]
+  IslandProbeWidget:
+    type: app-extension
+    platform: iOS
+    sources: [Widget, Shared.swift]
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: IslandProbeWidget
+        NSExtension: { NSExtensionPointIdentifier: com.apple.widgetkit-extension }
+    settings: { base: { PRODUCT_BUNDLE_IDENTIFIER: com.appautomaton.probe.island.widget, CODE_SIGNING_ALLOWED: NO, GENERATE_INFOPLIST_FILE: NO } }

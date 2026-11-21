@@ -5,6 +5,14 @@ struct CuriumTabsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.layoutDirection) private var layoutDirection
 
+    private struct RowGeometry {
+        let count: Int
+        let leftWidth: CGFloat
+        let rightWidth: CGFloat
+        let leftInset: CGFloat
+        let rightInset: CGFloat
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             CuriumSheetHeader(title: "Tabs")
@@ -18,13 +26,16 @@ struct CuriumTabsSheet: View {
                 let below = horizontal.map { max(0, proxy.size.height - $0.maxY - 8) }
                 let contentHeight = max(above ?? proxy.size.height, below ?? 0)
                 let top = (below ?? 0) > (above ?? proxy.size.height) ? proxy.size.height - contentHeight : 0
+                let rowGeo = computeRowGeometry(width: width, count: count, fold: vertical)
+                let totalTabs = store.tabs.count
+                let rowCount = (totalTabs + count - 1) / count
 
                 ScrollView {
-                    let rows = stride(from: 0, to: store.tabs.count, by: count)
                     LazyVStack(spacing: 14) {
-                        ForEach(Array(rows), id: \.self) { index in
-                            let tabs = Array(store.tabs.dropFirst(index).prefix(count))
-                            tabRow(tabs, count: count, width: width, fold: vertical)
+                        ForEach(0..<rowCount, id: \.self) { rowIndex in
+                            let start = rowIndex * count
+                            let end = min(totalTabs, start + count)
+                            tabRow(range: start..<end, geo: rowGeo)
                         }
                     }
                     .padding(.vertical, 8)
@@ -64,36 +75,17 @@ struct CuriumTabsSheet: View {
             .first { $0.isActive && $0.frame.intersects(canvas) }?.frame.intersection(canvas)
     }
 
-    private func tabRow(_ tabs: [CuriumTabModel], count: Int, width: CGFloat, fold: CGRect?) -> some View {
+    private func computeRowGeometry(width: CGFloat, count: Int, fold: CGRect?) -> RowGeometry {
         let half = count / 2
-        let layout = columnLayout(width: width, columnsPerSide: half, fold: fold)
-        let leftToRight = layoutDirection == .leftToRight
-
-        return HStack(spacing: 0) {
-            cards(Array(tabs.prefix(half)), columns: half)
-                .frame(width: leftToRight ? layout.leftWidth : layout.rightWidth)
-            Spacer(minLength: 0)
-            cards(Array(tabs.dropFirst(half)), columns: half)
-                .frame(width: leftToRight ? layout.rightWidth : layout.leftWidth)
-        }
-        .padding(.leading, leftToRight ? layout.leftInset : layout.rightInset)
-        .padding(.trailing, leftToRight ? layout.rightInset : layout.leftInset)
-    }
-
-    private func columnLayout(width: CGFloat, columnsPerSide: Int, fold: CGRect?)
-        -> (leftWidth: CGFloat, rightWidth: CGFloat, leftInset: CGFloat, rightInset: CGFloat) {
         var leftInset: CGFloat = 16
         var rightInset: CGFloat = 16
         if let fold {
             let left = max(0, fold.minX - leftInset - 8)
             let right = max(0, width - rightInset - fold.maxX - 8)
-            let minimumGroup = CGFloat(columnsPerSide) * 96 + CGFloat(columnsPerSide - 1) * 14
+            let minimumGroup = CGFloat(half) * 96 + CGFloat(half - 1) * 14
             if min(left, right) >= minimumGroup {
-                return (left, right, leftInset, rightInset)
+                return RowGeometry(count: count, leftWidth: left, rightWidth: right, leftInset: leftInset, rightInset: rightInset)
             }
-
-            // A sheet can move to one panel and still overlap the hinge at its edge.
-            // In that posture the narrow side is clearance, not a place for cards.
             if left >= right {
                 rightInset = max(rightInset, width - fold.minX + 8)
             } else {
@@ -101,21 +93,41 @@ struct CuriumTabsSheet: View {
             }
         }
         let group = max(0, (width - leftInset - rightInset - 14) / 2)
-        return (group, group, leftInset, rightInset)
+        return RowGeometry(count: count, leftWidth: group, rightWidth: group, leftInset: leftInset, rightInset: rightInset)
     }
 
-    private func cards(_ tabs: [CuriumTabModel], columns: Int) -> some View {
-        HStack(spacing: 14) {
-            ForEach(tabs) { tab in
-                CuriumTabCard(tab: tab, selected: store.activeTab?.id == tab.id) {
-                    store.select(tab)
-                    dismiss()
-                } onClose: {
-                    store.close(tab)
+    private func tabRow(range: Range<Int>, geo: RowGeometry) -> some View {
+        let half = geo.count / 2
+        let mid = min(range.upperBound, range.lowerBound + half)
+        let leftToRight = layoutDirection == .leftToRight
+
+        return HStack(spacing: 0) {
+            cards(range: range.lowerBound..<mid, columns: half)
+                .frame(width: leftToRight ? geo.leftWidth : geo.rightWidth)
+            Spacer(minLength: 0)
+            cards(range: mid..<range.upperBound, columns: half)
+                .frame(width: leftToRight ? geo.rightWidth : geo.leftWidth)
+        }
+        .padding(.leading, leftToRight ? geo.leftInset : geo.rightInset)
+        .padding(.trailing, leftToRight ? geo.rightInset : geo.leftInset)
+    }
+
+    private func cards(range: Range<Int>, columns: Int) -> some View {
+        let allTabs = store.tabs
+        return HStack(spacing: 14) {
+            ForEach(range, id: \.self) { index in
+                if index < allTabs.count {
+                    let tab = allTabs[index]
+                    CuriumTabCard(tab: tab, selected: store.activeTab?.id == tab.id) {
+                        store.select(tab)
+                        dismiss()
+                    } onClose: {
+                        store.close(tab)
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity)
             }
-            ForEach(0..<max(0, columns - tabs.count), id: \.self) { _ in
+            ForEach(0..<max(0, columns - range.count), id: \.self) { _ in
                 Color.clear.frame(maxWidth: .infinity)
                     .accessibilityHidden(true)
             }
@@ -135,7 +147,7 @@ private struct CuriumTabCard: View {
         Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 0) {
                 GeometryReader { proxy in
-                    if let snapshot = tab.snapshot {
+                    if let snapshot = tab.thumbnail {
                         Image(uiImage: snapshot)
                             .resizable()
                             .scaledToFill()
