@@ -111,7 +111,7 @@ index b94ebd3166ec0db06b35393508091c18c150416a..42ebab37b636c20c9173d91155e0e8a6
    virtual void GetSource(ClipboardBuffer buffer,
                           GetSourceCallback callback) const = 0;
 diff --git a/ui/base/clipboard/clipboard_ios.h b/ui/base/clipboard/clipboard_ios.h
-index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..f60f87c261d700a8e359027b26eafb2d94e5ed09 100644
+index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..fdf53961ee33ec6a971290da610ecbf1a5b748ce 100644
 --- a/ui/base/clipboard/clipboard_ios.h
 +++ b/ui/base/clipboard/clipboard_ios.h
 @@ -5,6 +5,7 @@
@@ -122,7 +122,16 @@ index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..f60f87c261d700a8e359027b26eafb2d
  #include <string_view>
  
  #include "base/component_export.h"
-@@ -28,6 +29,7 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
+@@ -17,6 +18,8 @@ namespace ui {
+ 
+ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
+  public:
++  struct PasteSnapshot;
++
+   ClipboardIOS(const ClipboardIOS&) = delete;
+   ClipboardIOS& operator=(const ClipboardIOS&) = delete;
+ 
+@@ -28,6 +31,7 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
  
    // Clipboard overrides:
    void OnPreShutdown() override;
@@ -130,12 +139,10 @@ index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..f60f87c261d700a8e359027b26eafb2d
    void GetSource(ClipboardBuffer buffer,
                   GetSourceCallback callback) const override;
    const ClipboardSequenceNumberToken& GetSequenceNumber(
-@@ -97,9 +99,18 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
+@@ -97,9 +101,16 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardIOS : public Clipboard {
    void WriteData(const ClipboardFormatType& format,
                   base::span<const uint8_t> data) override;
  
-+  struct PasteSnapshot;
-+
 +  void InvalidatePasteSnapshot() const;
 +  const PasteSnapshot* GetActivePasteSnapshot(UIPasteboard* pasteboard) const;
    std::vector<uint8_t> ReadPngInternal(ClipboardBuffer buffer,
@@ -150,7 +157,7 @@ index 9f95791fc8fe16e0c0ab9f087b1650fc88a84805..f60f87c261d700a8e359027b26eafb2d
    mutable struct {
      NSInteger sequence_number;
 diff --git a/ui/base/clipboard/clipboard_ios.mm b/ui/base/clipboard/clipboard_ios.mm
-index 92206cbd69bcc6b98b1bd76fe9f21694906edfba..0460eb08d1ac8aa575910e8869e752bd88f19f8d 100644
+index 92206cbd69bcc6b98b1bd76fe9f21694906edfba..eecf11010f7b951ce93b15c346198c8356621b4e 100644
 --- a/ui/base/clipboard/clipboard_ios.mm
 +++ b/ui/base/clipboard/clipboard_ios.mm
 @@ -5,7 +5,9 @@
@@ -241,7 +248,7 @@ index 92206cbd69bcc6b98b1bd76fe9f21694906edfba..0460eb08d1ac8aa575910e8869e752bd
 +                                   encoding:NSUTF16LittleEndianStringEncoding];
 +    }
 +    if (bytes.size() >= 6 &&
-+        base::as_string_view(bytes.first(6)) == "bplist") {
++        base::as_string_view(bytes.first<6>()) == "bplist") {
 +      return nil;
 +    }
 +    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
