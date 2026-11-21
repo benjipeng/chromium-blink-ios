@@ -285,6 +285,12 @@ static void CuriumPiPFailedToStart(id self, SEL _cmd, AVPictureInPictureControll
 }
 
 static void CuriumInstallPiPStartWhenReady(Class cls) {
+    if (class_getInstanceMethod(cls, sel_registerName("isReadyToStartPiPForGeneration:nextWait:"))) {
+        os_log(CuriumPiPLog(), "pip start hook: not needed, engine has native start-when-ready");
+        CuriumRecordHookStatus(@"PiP Start-When-Ready", @"skipped",
+                               @"Engine provides native start-when-ready");
+        return;
+    }
     Method start = CuriumExpectMethod(cls, "startPiPForGeneration:", "v24@0:8Q16");
     Method failed = CuriumExpectMethod(
         cls, "pictureInPictureController:failedToStartPictureInPictureWithError:", "v32@0:8@16@24");

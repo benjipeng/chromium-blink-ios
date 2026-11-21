@@ -9,6 +9,12 @@ uint64_t CuriumAvailableMemoryBytes(void);
 // 0 = Jitless, 1 = BrowserEngineCore, 2 = Native MAP_JIT, 3 = TXM Split-W^X.
 NSInteger CuriumActiveV8JitMode(void);
 NSArray<NSDictionary<NSString *, NSString *> *> *CuriumRuntimeHookStatuses(void);
+NSArray<NSDictionary<NSString *, id> *> *CuriumNormalizePasteboardItems(
+    NSArray<NSDictionary<NSString *, id> *> *_Nullable rawItems);
+NSArray<NSData *> *_Nullable CuriumExtractPasteboardDataForType(
+    NSArray<NSDictionary<NSString *, id> *> *_Nullable items,
+    NSString *pasteboardType,
+    NSIndexSet *_Nullable itemSet);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

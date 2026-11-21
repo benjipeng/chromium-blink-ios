@@ -1,4 +1,5 @@
 #import "CuriumRuntime.h"
+#import "CuriumClipboardHook.h"
 #import "CuriumExtensionCoexistenceHook.h"
 #import "CuriumHookSupport.h"
 #import "CuriumInputAccessoryHook.h"
@@ -6,11 +7,20 @@
 #import "CuriumTouchCancelHook.h"
 #import <TargetConditionals.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <os/log.h>
 #import <os/proc.h>
+#import <sys/sysctl.h>
+#import <unistd.h>
 #import <UIKit/UIKit.h>
+
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+
+static const unsigned int kCuriumCsOpsStatus = 0;
+static const uint32_t kCuriumCsDebugged = 0x10000000u;
+static const size_t kCuriumDefaultJitPoolBytes = 64ULL * 1024ULL * 1024ULL;
 
 static os_unfair_lock gCuriumHookStatusLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableArray<NSDictionary<NSString *, NSString *> *> *gCuriumHookStatuses = nil;
@@ -179,12 +189,138 @@ static void CuriumInstallCommandLineGuard(void) {
     });
 }
 
+static void *CuriumOpenChromeFrameworkHandle(void) {
+    // Resolve via the loaded dyld image list first so LiveContainer's MH_DYLIB
+    // / RTLD_LOCAL loading and /var vs /private/var symlink differences never
+    // break symbol lookup.
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "chrome_framework.framework/chrome_framework")) {
+            continue;
+        }
+        void *handle = dlopen(name, RTLD_NOLOAD | RTLD_LAZY);
+        if (handle) {
+            return handle;
+        }
+    }
+    NSString *fwPath = [[[NSBundle mainBundle] privateFrameworksPath]
+        stringByAppendingPathComponent:@"chrome_framework.framework/chrome_framework"];
+    if (fwPath.length > 0) {
+        return dlopen(fwPath.fileSystemRepresentation, RTLD_NOLOAD | RTLD_LAZY);
+    }
+    return NULL;
+}
+
+static void *CuriumResolveChromeSymbol(const char *symbolName) {
+    if (!symbolName) {
+        return NULL;
+    }
+    void *handle = CuriumOpenChromeFrameworkHandle();
+    if (handle) {
+        void *sym = dlsym(handle, symbolName);
+        if (sym) {
+            return sym;
+        }
+    }
+    return dlsym(RTLD_DEFAULT, symbolName);
+}
+
+static void CuriumQueryDebuggerState(uint32_t *csFlagsOut, BOOL *csDebuggedOut, BOOL *tracedOut) {
+    uint32_t csFlags = 0;
+    BOOL csDebugged = (csops(getpid(), kCuriumCsOpsStatus, &csFlags, sizeof(csFlags)) == 0) &&
+                      ((csFlags & kCuriumCsDebugged) != 0);
+
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info;
+    memset(&info, 0, sizeof(info));
+    size_t size = sizeof(info);
+    BOOL traced = (sysctl(mib, 4, &info, &size, NULL, 0) == 0) &&
+                  (size >= sizeof(info)) &&
+                  ((info.kp_proc.p_flag & P_TRACED) != 0);
+
+    if (csFlagsOut) *csFlagsOut = csFlags;
+    if (csDebuggedOut) *csDebuggedOut = csDebugged;
+    if (tracedOut) *tracedOut = traced;
+}
+
+// Prepares V8's iOS JIT memory before ChromeMain installs Crashpad exception
+// handlers or spawns threads. IOSJitMemory::Initialize is idempotent, so
+// AppendSideloadSwitches reuses the resulting mode when RunContentProcess runs.
+static void CuriumPrepareEarlyV8Jit(NSString *_Nullable jitPref) {
+    if ([jitPref isEqualToString:@"jitless"]) {
+        CuriumRecordHookStatus(@"V8 JIT Probe", @"skipped", @"Jitless Only preference");
+        return;
+    }
+
+    typedef int (*V8JitPrepareFn)(size_t, int);
+    V8JitPrepareFn prepareFn =
+        (V8JitPrepareFn)CuriumResolveChromeSymbol("V8IOSJitPrepareForProcess");
+    if (!prepareFn) {
+        CuriumRecordHookStatus(@"V8 JIT Probe", @"skipped",
+                               @"V8IOSJitPrepareForProcess symbol not present");
+        return;
+    }
+
+#if TARGET_OS_SIMULATOR
+    int mode = prepareFn(kCuriumDefaultJitPoolBytes, 0);
+    CuriumRecordHookStatus(@"V8 JIT Probe",
+                           mode != 0 ? @"active" : @"skipped",
+                           [NSString stringWithFormat:@"Simulator mode=%d", mode]);
+#else
+    BOOL inLiveContainer = getenv("LC_HOME_PATH") != NULL;
+    BOOL allowTxm = inLiveContainer || [jitPref isEqualToString:@"forceJIT"];
+    uint32_t csFlags = 0;
+    BOOL csDebugged = NO;
+    BOOL traced = NO;
+    CuriumQueryDebuggerState(&csFlags, &csDebugged, &traced);
+
+    if (!allowTxm) {
+        CuriumRecordHookStatus(@"V8 JIT Probe", @"skipped",
+                               [NSString stringWithFormat:@"Standalone device (cs=%d, traced=%d)",
+                                csDebugged ? 1 : 0, traced ? 1 : 0]);
+        return;
+    }
+
+    if (csDebugged && traced) {
+        int mode = prepareFn(kCuriumDefaultJitPoolBytes, 1);
+        uint32_t csFlagsAfter = 0;
+        BOOL csDebuggedAfter = NO;
+        BOOL tracedAfter = NO;
+        CuriumQueryDebuggerState(&csFlagsAfter, &csDebuggedAfter, &tracedAfter);
+        if (mode != 0) {
+            CuriumRecordHookStatus(@"V8 JIT Probe", @"active",
+                                   [NSString stringWithFormat:@"TXM ready pre-ChromeMain (mode=%d, traced 1->%d)",
+                                    mode, tracedAfter ? 1 : 0]);
+        } else {
+            CuriumRecordHookStatus(@"V8 JIT Probe", @"failed",
+                                   [NSString stringWithFormat:@"TXM probe returned 0 (cs=1, traced 1->%d, csFlags=0x%08x)",
+                                    tracedAfter ? 1 : 0, csFlags]);
+        }
+        return;
+    }
+
+    if (csDebugged) {
+        CuriumRecordHookStatus(@"V8 JIT Probe", @"skipped",
+                               @"CS_DEBUGGED=1, P_TRACED=0 (debugger detached; assign universal.js in StikDebug/LiveContainer)");
+    } else {
+        CuriumRecordHookStatus(@"V8 JIT Probe", @"skipped",
+                               [NSString stringWithFormat:@"No JIT debugger attached (cs=0, traced=%d, csFlags=0x%08x)",
+                                traced ? 1 : 0, csFlags]);
+    }
+#endif
+}
+
 static void CuriumInstallHeadlessRuntimeGuards(void) {
+    NSString *jitPref =
+        [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
     CuriumInstallCommandLineGuard();
+    CuriumPrepareEarlyV8Jit(jitPref);
     CuriumInstallExtensionCoexistenceHooks();
     CuriumInstallPictureInPictureHooks();
     CuriumInstallInputAccessoryHook();
     CuriumInstallTouchCancelHook();
+    CuriumInstallClipboardHook();
     Class metricsMediator = NSClassFromString(@"MetricsMediator");
     if (!metricsMediator) {
         CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",
@@ -219,22 +355,18 @@ uint64_t CuriumAvailableMemoryBytes(void) {
 
 NSInteger CuriumActiveV8JitMode(void) {
     typedef int (*V8JitModeFn)(void);
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
     static V8JitModeFn fn = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *fwPath = [[[NSBundle mainBundle] privateFrameworksPath]
-            stringByAppendingPathComponent:@"chrome_framework.framework/chrome_framework"];
-        if (fwPath.length > 0) {
-            void *handle = dlopen(fwPath.fileSystemRepresentation, RTLD_NOLOAD | RTLD_LAZY);
-            if (handle) {
-                fn = (V8JitModeFn)dlsym(handle, "V8IOSJitGetActiveMode");
-            }
+    os_unfair_lock_lock(&lock);
+    V8JitModeFn resolved = fn;
+    if (!resolved) {
+        resolved = (V8JitModeFn)CuriumResolveChromeSymbol("V8IOSJitGetActiveMode");
+        if (resolved) {
+            fn = resolved;
         }
-        if (!fn) {
-            fn = (V8JitModeFn)dlsym(RTLD_DEFAULT, "V8IOSJitGetActiveMode");
-        }
-    });
-    return fn ? (NSInteger)fn() : 0;
+    }
+    os_unfair_lock_unlock(&lock);
+    return resolved ? (NSInteger)resolved() : 0;
 }
 
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate) {

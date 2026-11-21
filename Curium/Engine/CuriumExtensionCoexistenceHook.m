@@ -162,6 +162,24 @@ static const uintptr_t kOrigTabsSchemaData               = 0x0adc6f1e;
 static const uintptr_t kSlotTabsSchemaLen                = 0x0b74f560;
 static const size_t    kOrigTabsSchemaLen                = 1783;
 
+// IOSExtensionsAPIProvider vtable slots + helpers for registering the "scripting"
+// API permission (kScripting = 230) and its permission feature on Build 35.
+// Build 35 already compiles and registers all extensions/browser/api/scripting/*
+// functions and the "scripting" schema + _api_features dependency, but upstream
+// left kScripting and _permission_features:"scripting" in chrome/common/extensions/.
+static const uintptr_t kSlotIOSAPIProviderAddPermFeatures = 0x0b282bf8;
+static const uintptr_t kSlotIOSAPIProviderRegisterPerms   = 0x0b282c20;
+static const uintptr_t kOrigIOSAPIProviderNoOp            = 0x00024014;
+static const uintptr_t kFnFeatureProviderAddFeatures      = 0x00f620c4;
+static const uintptr_t kFnPermissionsInfoRegisterPerms    = 0x00f879e0;
+static const uintptr_t kAddrUserScriptsFeatureData        = 0x0b29e670;
+static const uintptr_t kAddrUserScriptsFeatureObj         = 0x0b29e758;
+static const uintptr_t kAddrUserScriptsFeatureVtable      = 0x0b747ff8;
+static const uintptr_t kAddrUserScriptsNameStr            = 0x0a1473e5;
+enum { kConstSimpleFeatureDataSize = 0xE8 };
+static const uint64_t  kAPIPermissionIDScripting          = 230;
+static const uint64_t  kAPIPermissionFlagMgmtWarning      = 0x40;
+
 // Struct & virtual-table offsets verified against Build 35 disassembly.
 static const size_t kVtblRPHGetBrowserContext      = 0x158;
 static const size_t kVtblRPHGetID                  = 0x170;
@@ -1724,6 +1742,111 @@ static void PatchTabsSchemaTabIdNone(uintptr_t slide) {
                            [NSString stringWithFormat:@"len %zu -> %zu", actual_len, new_len]);
 }
 
+typedef struct {
+    uint64_t id;
+    const char *name;
+    uint64_t flags;
+    const void *constructor;
+} CrAPIPermissionInitInfo;
+
+_Static_assert(sizeof(CrAPIPermissionInitInfo) == 32, "CrAPIPermissionInitInfo must be 32 bytes");
+
+typedef struct {
+    const void *vtable;
+    const void *data;
+} CrConstSimpleFeatureObj;
+
+static void (*gFnFeatureProviderAddFeatures)(void *, const void *const *, size_t);
+static void (*gFnPermissionsInfoRegisterPerms)(void *, const void *, size_t, const void *, size_t);
+static uint8_t gScriptingFeatureData[kConstSimpleFeatureDataSize] __attribute__((aligned(16)));
+static CrConstSimpleFeatureObj gScriptingFeatureObj;
+static const char kScriptingPermissionName[] = "scripting";
+static const CrAPIPermissionInitInfo kScriptingPermissionInitInfo = {
+    kAPIPermissionIDScripting,
+    kScriptingPermissionName,
+    kAPIPermissionFlagMgmtWarning,
+    NULL,
+};
+
+static void HookIOSAPIProviderAddPermissionFeatures(void *self, void *provider) {
+    (void)self;
+    if (!provider || !gFnFeatureProviderAddFeatures) {
+        return;
+    }
+    const void *feature_ptr = &gScriptingFeatureObj;
+    gFnFeatureProviderAddFeatures(provider, &feature_ptr, 1);
+}
+
+static void HookIOSAPIProviderRegisterPermissions(void *self, void *permissions_info) {
+    (void)self;
+    if (!permissions_info || !gFnPermissionsInfoRegisterPerms) {
+        return;
+    }
+    gFnPermissionsInfoRegisterPerms(permissions_info, &kScriptingPermissionInitInfo, 1, NULL, 0);
+}
+
+static void PatchScriptingAPIPermission(uintptr_t slide) {
+    uintptr_t add_feat_slot = slide + kSlotIOSAPIProviderAddPermFeatures;
+    uintptr_t reg_perm_slot = slide + kSlotIOSAPIProviderRegisterPerms;
+    uintptr_t expected_noop = slide + kOrigIOSAPIProviderNoOp;
+    if (*(const uintptr_t *)add_feat_slot != expected_noop ||
+        *(const uintptr_t *)reg_perm_slot != expected_noop) {
+        os_log_error(CuriumExtHookLog(),
+                     "scripting API permission patch: skipped, IOSExtensionsAPIProvider slot mismatch");
+        CuriumRecordHookStatus(@"Scripting API Permission", @"failed",
+                               @"IOSExtensionsAPIProvider vtable slot mismatch");
+        return;
+    }
+
+    // Verify the "userScripts" ConstSimpleFeature template (channel=stable,
+    // extension_types=["extension"], min_manifest_version=3 — identical to "scripting").
+    const void *const *tmpl_sv = (const void *const *)(slide + kAddrUserScriptsFeatureData);
+    const char *tmpl_name = (const char *)tmpl_sv[0];
+    size_t tmpl_len = (size_t)(uintptr_t)tmpl_sv[1];
+    const CrConstSimpleFeatureObj *tmpl_obj =
+        (const CrConstSimpleFeatureObj *)(slide + kAddrUserScriptsFeatureObj);
+    if ((uintptr_t)tmpl_name != slide + kAddrUserScriptsNameStr ||
+        tmpl_len != 11 ||
+        memcmp(tmpl_name, "userScripts", 11) != 0 ||
+        (uintptr_t)tmpl_obj->vtable != slide + kAddrUserScriptsFeatureVtable ||
+        (uintptr_t)tmpl_obj->data != slide + kAddrUserScriptsFeatureData) {
+        os_log_error(CuriumExtHookLog(),
+                     "scripting API permission patch: skipped, userScripts feature template mismatch");
+        CuriumRecordHookStatus(@"Scripting API Permission", @"failed",
+                               @"userScripts ConstSimpleFeature template mismatch");
+        return;
+    }
+
+    memcpy(gScriptingFeatureData, (const void *)(slide + kAddrUserScriptsFeatureData),
+           kConstSimpleFeatureDataSize);
+    ((const char **)gScriptingFeatureData)[0] = kScriptingPermissionName;
+    ((size_t *)gScriptingFeatureData)[1] = sizeof(kScriptingPermissionName) - 1;
+    gScriptingFeatureObj.vtable = tmpl_obj->vtable;
+    gScriptingFeatureObj.data = gScriptingFeatureData;
+
+    gFnFeatureProviderAddFeatures =
+        (void (*)(void *, const void *const *, size_t))(slide + kFnFeatureProviderAddFeatures);
+    gFnPermissionsInfoRegisterPerms =
+        (void (*)(void *, const void *, size_t, const void *, size_t))(slide + kFnPermissionsInfoRegisterPerms);
+
+    if (!PatchVtableSlot(add_feat_slot, (void *)HookIOSAPIProviderAddPermissionFeatures)) {
+        CuriumRecordHookStatus(@"Scripting API Permission", @"failed",
+                               @"vm_protect failed on AddPermissionFeatures");
+        return;
+    }
+    if (!PatchVtableSlot(reg_perm_slot, (void *)HookIOSAPIProviderRegisterPermissions)) {
+        PatchVtableSlot(add_feat_slot, (void *)expected_noop);
+        CuriumRecordHookStatus(@"Scripting API Permission", @"failed",
+                               @"vm_protect failed on RegisterPermissions");
+        return;
+    }
+
+    os_log(CuriumExtHookLog(),
+           "scripting API permission patch: installed (kScripting=230 + MV3 stable feature)");
+    CuriumRecordHookStatus(@"Scripting API Permission", @"active",
+                           @"kScripting (230) + MV3 stable permission feature");
+}
+
 void CuriumInstallExtensionCoexistenceHooks(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -1734,6 +1857,8 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
             CuriumRecordHookStatus(@"Extension Coexistence", @"skipped",
                                    @"Build 35 chrome_framework UUID not present");
             CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
+                                   @"Build 35 chrome_framework UUID not present");
+            CuriumRecordHookStatus(@"Scripting API Permission", @"skipped",
                                    @"Build 35 chrome_framework UUID not present");
             return;
         }
@@ -1841,6 +1966,8 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
                                        [NSString stringWithFormat:@"Slot mismatch: %s", patches[i].label]);
                 CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
                                        @"Skipped after vtable slot mismatch");
+                CuriumRecordHookStatus(@"Scripting API Permission", @"skipped",
+                                       @"Skipped after vtable slot mismatch");
                 return;
             }
         }
@@ -1880,6 +2007,8 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
                                        [NSString stringWithFormat:@"vm_protect failed: %s", patches[i].label]);
                 CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped",
                                        @"Skipped after vm_protect rollback");
+                CuriumRecordHookStatus(@"Scripting API Permission", @"skipped",
+                                       @"Skipped after vm_protect rollback");
                 return;
             }
             installed++;
@@ -1889,6 +2018,7 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
                                [NSString stringWithFormat:@"%zu Build 35 vtable slots patched", installed]);
 
         PatchTabsSchemaTabIdNone(slide);
+        PatchScriptingAPIPermission(slide);
 
         os_log(CuriumExtHookLog(),
                "extension coexistence hooks: installed (%zu vtable slots on Build 35)",
@@ -1901,6 +2031,7 @@ void CuriumInstallExtensionCoexistenceHooks(void) {
 void CuriumInstallExtensionCoexistenceHooks(void) {
     CuriumRecordHookStatus(@"Extension Coexistence", @"skipped", @"Non-arm64 architecture");
     CuriumRecordHookStatus(@"Tabs Schema TAB_ID_NONE", @"skipped", @"Non-arm64 architecture");
+    CuriumRecordHookStatus(@"Scripting API Permission", @"skipped", @"Non-arm64 architecture");
 }
 
 #endif

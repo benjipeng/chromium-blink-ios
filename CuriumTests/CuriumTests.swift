@@ -403,4 +403,81 @@ struct CuriumDiagnosticsAndLayoutTests {
         )
         #expect(centeredCutout.top == 54)
     }
+
+    @Test("Diagnostics hook summary distinguishes all-active, skipped, and failed hooks")
+    func diagnosticsHookSummary() {
+        let allActive = [
+            CuriumDiagnostics.HookStatus(name: "A", status: "active", detail: ""),
+            CuriumDiagnostics.HookStatus(name: "B", status: "active", detail: ""),
+        ]
+        #expect(CuriumDiagnostics.summarizeHooks(allActive) == ("2/2 active", false))
+
+        let withSkipped = [
+            CuriumDiagnostics.HookStatus(name: "A", status: "active", detail: ""),
+            CuriumDiagnostics.HookStatus(name: "V8 JIT Probe", status: "skipped", detail: "no debugger"),
+        ]
+        #expect(CuriumDiagnostics.summarizeHooks(withSkipped) == ("1 active · 1 skipped", false))
+
+        let withFailed = [
+            CuriumDiagnostics.HookStatus(name: "A", status: "active", detail: ""),
+            CuriumDiagnostics.HookStatus(name: "V8 JIT Probe", status: "failed", detail: "TXM probe returned 0"),
+        ]
+        #expect(CuriumDiagnostics.summarizeHooks(withFailed) == ("1 failed · 1/2 active", true))
+    }
+
+    @Test("Clipboard normalization maps conforming UTIs to Blink canonical types and extracts UTF-8")
+    func clipboardNormalizationAndExtraction() throws {
+        // Empty input returns empty array.
+        #expect(CuriumNormalizePasteboardItems(nil).isEmpty)
+        #expect(CuriumNormalizePasteboardItems([]).isEmpty)
+
+        // iOS plain text arrives as public.utf8-plain-text (including CJK, emoji, newlines).
+        let sampleText = "SecretPass123\n你好🚀"
+        let utf8Items: [[String: Any]] = [["public.utf8-plain-text": sampleText]]
+        let normalizedUTF8 = CuriumNormalizePasteboardItems(utf8Items)
+        #expect(normalizedUTF8.count == 1)
+        #expect(normalizedUTF8[0]["public.plain-text"] as? String == sampleText)
+        let extractedUTF8 = try #require(
+            CuriumExtractPasteboardDataForType(normalizedUTF8, "public.plain-text", nil)
+        )
+        #expect(String(data: extractedUTF8[0], encoding: .utf8) == sampleText)
+
+        // UTF-16LE NSData (public.utf16-plain-text) converts cleanly to UTF-8 for ClipboardIOS::ReadText.
+        let utf16Data = try #require("Hello 世界".data(using: .utf16LittleEndian))
+        let normalizedUTF16 = CuriumNormalizePasteboardItems([["public.utf16-plain-text": utf16Data]])
+        let extractedUTF16 = try #require(
+            CuriumExtractPasteboardDataForType(normalizedUTF16, "public.plain-text", nil)
+        )
+        #expect(String(data: extractedUTF16[0], encoding: .utf8) == "Hello 世界")
+
+        // Bare URL (no plain-text key) exposes public.plain-text via absoluteString.
+        let url = try #require(URL(string: "https://curium.test/login?a=1"))
+        let normalizedURL = CuriumNormalizePasteboardItems([["public.url": url]])
+        #expect(normalizedURL[0]["public.plain-text"] as? String == "https://curium.test/login?a=1")
+        let extractedURL = try #require(
+            CuriumExtractPasteboardDataForType(normalizedURL, "public.plain-text", nil)
+        )
+        #expect(String(data: extractedURL[0], encoding: .utf8) == "https://curium.test/login?a=1")
+
+        // JPEG photo advertises public.image, while SVG does not falsely advertise a raster image.
+        let jpegBytes = Data([0xFF, 0xD8, 0xFF])
+        let normalizedJPEG = CuriumNormalizePasteboardItems([["public.jpeg": jpegBytes]])
+        #expect(normalizedJPEG[0]["public.image"] != nil)
+
+        let svgBytes = Data("<svg/>".utf8)
+        let normalizedSVG = CuriumNormalizePasteboardItems([["public.svg-xml": svgBytes]])
+        #expect(normalizedSVG[0]["public.svg-xml"] != nil)
+        #expect(normalizedSVG[0]["public.image"] == nil)
+
+        // Existing public.plain-text is preserved verbatim.
+        let canonical: [[String: Any]] = [["public.plain-text": "already canonical"]]
+        let preserved = CuriumNormalizePasteboardItems(canonical)
+        #expect(preserved[0]["public.plain-text"] as? String == "already canonical")
+
+        // Redacted empty-dictionary item array does not fabricate data.
+        let redacted = CuriumNormalizePasteboardItems([[:]])
+        #expect(redacted.count == 1)
+        #expect(redacted[0].isEmpty)
+        #expect(CuriumExtractPasteboardDataForType(redacted, "public.plain-text", nil) == nil)
+    }
 }

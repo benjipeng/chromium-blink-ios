@@ -6,7 +6,9 @@
 // only when every ivar and method it touches matches the expected type encoding.
 
 // Returns the ivar only if the engine declares it with the expected type encoding.
-static inline Ivar CuriumExpectIvar(Class cls, const char *name, const char *encoding) {
+static inline Ivar _Nullable CuriumExpectIvar(Class _Nullable cls,
+                                              const char *_Nullable name,
+                                              const char *_Nullable encoding) {
     if (!cls || !name || !encoding) {
         return NULL;
     }
@@ -17,7 +19,9 @@ static inline Ivar CuriumExpectIvar(Class cls, const char *name, const char *enc
 
 // Returns the method only if `cls` itself declares it (never inherited from a
 // superclass such as UIResponder) with the expected type encoding.
-static inline Method CuriumExpectMethod(Class cls, const char *name, const char *encoding) {
+static inline Method _Nullable CuriumExpectMethod(Class _Nullable cls,
+                                                  const char *_Nullable name,
+                                                  const char *_Nullable encoding) {
     if (!cls || !name || !encoding) {
         return NULL;
     }
@@ -34,7 +38,8 @@ static inline Method CuriumExpectMethod(Class cls, const char *name, const char 
     return (types && strcmp(types, encoding) == 0) ? method : NULL;
 }
 
-static inline void *CuriumIvarAddress(__unsafe_unretained id object, Ivar ivar) {
+static inline void *_Nonnull CuriumIvarAddress(__unsafe_unretained id _Nonnull object,
+                                               Ivar _Nonnull ivar) {
     return (uint8_t *)(__bridge void *)object + ivar_getOffset(ivar);
 }
 

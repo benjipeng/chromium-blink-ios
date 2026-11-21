@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct CuriumBrowserView: View {
     @Bindable var store: CuriumBrowserStore
@@ -11,7 +12,7 @@ struct CuriumBrowserView: View {
     @State private var occlusions: [CGRect]?
     @State private var sheet: Destination?
     @State private var dismissKeyboardTrigger = 0
-    @FocusState private var addressFocused: Bool
+    @State private var addressFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     fileprivate enum Destination: Hashable, Identifiable {
@@ -583,14 +584,13 @@ private struct CuriumAddressBar: View {
     let pillMaxWidth: CGFloat
     /// Width of the full bar.
     let span: CGFloat
-    @FocusState.Binding var addressFocused: Bool
+    @Binding var addressFocused: Bool
     let expand: () -> Void
 
     @State private var address = ""
-    /// Focus selects the whole address, so typing replaces it as in every browser.
-    @State private var selection: TextSelection?
     @State private var cachedSite = ""
     @State private var siteWidth: CGFloat = 0
+    @State private var fieldController = CuriumAddressFieldController()
 
     private var text: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -603,10 +603,10 @@ private struct CuriumAddressBar: View {
     }
 
     private var showsReloadButton: Bool {
-        !showsClearButton && tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
+        !addressFocused && tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
     }
 
-    private var hasTrailingButton: Bool {
+    private var showsTrailingActionButton: Bool {
         showsClearButton || showsReloadButton
     }
 
@@ -635,19 +635,19 @@ private struct CuriumAddressBar: View {
 
         VStack(spacing: 6) {
             ZStack {
-                CuriumAddressTextField(
+                CuriumAddressInputField(
+                    controller: fieldController,
                     searchEngineTitle: store.library.searchEngine.title,
-                    addressText: address,
-                    selectionValue: selection,
-                    isFocused: addressFocused,
-                    address: $address,
-                    selection: $selection,
-                    addressFocused: $addressFocused,
+                    text: $address,
+                    isFocused: $addressFocused,
                     leadingInset: showsPictureInPictureButton ? CuriumSpace.tapTarget + 6 : 14,
-                    trailingInset: hasTrailingButton ? CuriumSpace.tapTarget + 6 : 14,
-                    submit: submit
+                    trailingInset: showsClearButton
+                        ? CuriumSpace.tapTarget + 24
+                        : (showsReloadButton ? CuriumSpace.tapTarget + 6 : 14),
+                    leadingPassthroughWidth: showsPictureInPictureButton ? CuriumSpace.tapTarget + 2 : 0,
+                    trailingPassthroughWidth: showsTrailingActionButton ? CuriumSpace.tapTarget + 6 : 0,
+                    onSubmit: submit
                 )
-                .equatable()
                 .frame(width: span, height: CuriumSpace.tapTarget)
                 .scaleEffect(fieldScale)
                 .opacity(fieldOpacity)
@@ -673,9 +673,10 @@ private struct CuriumAddressBar: View {
                     .id(tab?.id)
             }
             .clipShape(Capsule())
-            .glassEffect(.regular.interactive(), in: Capsule())
-            // Keep leading/trailing controls strictly above the glass capsule and text field
-            // in Z-order and non-overlapping in X so accessibility hit-testing reaches them directly.
+            .glassEffect(addressFocused ? .regular : .regular.interactive(), in: Capsule())
+            // Keep leading/trailing controls strictly outside UITextField and above the glass
+            // capsule in Z-order so neither UITextInteraction nor interactive Liquid Glass can
+            // cancel touches, while UITextField passes through hits across the trailing button zone.
             .overlay(alignment: .leading) {
                 if showsPictureInPictureButton, let tab {
                     let active = tab.pictureInPicture.phase == .active
@@ -699,18 +700,20 @@ private struct CuriumAddressBar: View {
             }
             .overlay(alignment: .trailing) {
                 if showsClearButton {
-                    Button { address = "" } label: {
+                    Button {
+                        fieldController.clear()
+                        address = ""
+                        addressFocused = true
+                    } label: {
                         Label("Clear Address", systemImage: "xmark.circle.fill")
                             .labelStyle(.iconOnly)
-                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                            .contentShape(Circle())
+                            .font(.system(size: 18, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .frame(width: CuriumSpace.tapTarget + 4, height: CuriumSpace.tapTarget)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .padding(.trailing, 2)
-                    .scaleEffect(fieldScale)
-                    .opacity(fieldOpacity)
-                    .allowsHitTesting(!collapsed)
-                    .accessibilityHidden(collapsed)
                     .accessibilitySortPriority(2)
                     .accessibilityIdentifier("curium.address.clear")
                 } else if showsReloadButton, let tab {
@@ -770,11 +773,8 @@ private struct CuriumAddressBar: View {
             addressFocused = false
         }
         .onChange(of: addressFocused) {
-            if addressFocused {
-                selection = TextSelection(range: address.startIndex..<address.endIndex)
-            } else {
+            if !addressFocused {
                 // An abandoned edit gives way to the page's address.
-                selection = nil
                 address = tab?.url?.absoluteString ?? ""
             }
         }
@@ -795,47 +795,237 @@ private struct CuriumAddressBar: View {
     }
 }
 
-/// Isolated text-input leaf conforming to `Equatable` so 120Hz chrome collapse updates
-/// skip re-evaluating the `TextField` and prompt string, while keeping its bounds clipped
-/// inside the leading/trailing button slots.
-private struct CuriumAddressTextField: View, Equatable {
+@MainActor
+private final class CuriumAddressFieldController {
+    weak var field: CuriumAddressUITextField?
+
+    func clear() {
+        field?.clearAddressText()
+    }
+}
+
+/// Native UIKit address input paired with an imperative controller so the external
+/// overlay Clear button clears selected URLs and active IME compositions synchronously
+/// without ever living inside UITextField's gesture hierarchy or interactive Liquid Glass.
+private struct CuriumAddressInputField: UIViewRepresentable {
+    let controller: CuriumAddressFieldController
     let searchEngineTitle: String
-    let addressText: String
-    let selectionValue: TextSelection?
-    let isFocused: Bool
-    @Binding var address: String
-    @Binding var selection: TextSelection?
-    @FocusState.Binding var addressFocused: Bool
+    @Binding var text: String
+    @Binding var isFocused: Bool
     let leadingInset: CGFloat
     let trailingInset: CGFloat
-    let submit: () -> Void
+    let leadingPassthroughWidth: CGFloat
+    let trailingPassthroughWidth: CGFloat
+    let onSubmit: () -> Void
 
-    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.searchEngineTitle == rhs.searchEngineTitle
-            && lhs.addressText == rhs.addressText
-            && lhs.selectionValue == rhs.selectionValue
-            && lhs.isFocused == rhs.isFocused
-            && lhs.leadingInset == rhs.leadingInset
-            && lhs.trailingInset == rhs.trailingInset
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> CuriumAddressUITextField {
+        let field = CuriumAddressUITextField()
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        controller.field = field
+        applyConfiguration(to: field)
+        return field
     }
 
-    var body: some View {
-        let prompt = Text("Search \(searchEngineTitle) or enter address")
-        TextField(text: $address, selection: $selection, prompt: prompt.foregroundStyle(CuriumSpace.secondaryInk)) { prompt }
-            .textFieldStyle(.plain)
-            .font(.body)
-            .keyboardType(.webSearch)
-            .submitLabel(.go)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .focused($addressFocused)
-            .onSubmit(submit)
-            .frame(minWidth: 0, maxWidth: .infinity, minHeight: CuriumSpace.tapTarget, alignment: .leading)
-            .clipped()
-            .contentShape(Rectangle())
-            .accessibilityIdentifier("curium.address")
-            .padding(.leading, leadingInset)
-            .padding(.trailing, trailingInset)
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: CuriumAddressUITextField,
+        context: Context
+    ) -> CGSize? {
+        CGSize(
+            width: proposal.width ?? uiView.intrinsicContentSize.width,
+            height: proposal.height ?? CuriumSpace.tapTarget
+        )
+    }
+
+    func updateUIView(_ field: CuriumAddressUITextField, context: Context) {
+        context.coordinator.parent = self
+        controller.field = field
+        applyConfiguration(to: field)
+
+        if field.markedTextRange == nil, field.text != text {
+            field.text = text
+        }
+
+        if isFocused, !field.isFirstResponder {
+            if field.window != nil {
+                field.becomeFirstResponder()
+            } else {
+                DispatchQueue.main.async { [weak field] in
+                    guard let field, !field.isFirstResponder, field.window != nil else { return }
+                    field.becomeFirstResponder()
+                }
+            }
+        } else if !isFocused, field.isFirstResponder {
+            field.resignFirstResponder()
+        }
+    }
+
+    private func applyConfiguration(to field: CuriumAddressUITextField) {
+        let promptText = "Search \(searchEngineTitle) or enter address"
+        if field.placeholderText != promptText {
+            field.placeholderText = promptText
+            field.attributedPlaceholder = NSAttributedString(
+                string: promptText,
+                attributes: [
+                    .foregroundColor: UIColor.secondaryLabel,
+                    .font: UIFont.preferredFont(forTextStyle: .body),
+                ]
+            )
+        }
+        field.updateInsets(
+            leading: leadingInset,
+            trailing: trailingInset,
+            leadingPassthrough: leadingPassthroughWidth,
+            trailingPassthrough: trailingPassthroughWidth
+        )
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: CuriumAddressInputField
+
+        init(parent: CuriumAddressInputField) {
+            self.parent = parent
+        }
+
+        @objc func editingChanged(_ textField: UITextField) {
+            let next = textField.text ?? ""
+            if parent.text != next {
+                parent.text = next
+            }
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            if !parent.isFocused {
+                parent.isFocused = true
+            }
+            guard let curiumField = textField as? CuriumAddressUITextField else { return }
+            let session = curiumField.beginEditSession()
+            if !(curiumField.text?.isEmpty ?? true) {
+                DispatchQueue.main.async { [weak curiumField] in
+                    guard let curiumField,
+                          curiumField.editSessionID == session,
+                          curiumField.isFirstResponder,
+                          !(curiumField.text?.isEmpty ?? true) else { return }
+                    curiumField.selectAll(nil)
+                }
+            }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            if parent.isFocused {
+                parent.isFocused = false
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            parent.onSubmit()
+            return false
+        }
+    }
+}
+
+private final class CuriumAddressUITextField: UITextField {
+    /// Generous clearance between the text editing rect and the trailing Clear overlay so
+    /// UIKit's trailing text-selection grabber never overlaps or pulls touches from Clear.
+    private static let clearEditingInset: CGFloat = CuriumSpace.tapTarget + 24
+
+    var placeholderText = ""
+    private(set) var editSessionID: UInt = 0
+
+    private var leadingInset: CGFloat = 14
+    private var trailingInset: CGFloat = 14
+    private var leadingPassthroughWidth: CGFloat = 0
+    private var trailingPassthroughWidth: CGFloat = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        borderStyle = .none
+        backgroundColor = .clear
+        font = UIFont.preferredFont(forTextStyle: .body)
+        adjustsFontForContentSizeCategory = true
+        textColor = .label
+        keyboardType = .webSearch
+        returnKeyType = .go
+        autocapitalizationType = .none
+        autocorrectionType = .no
+        spellCheckingType = .no
+        smartQuotesType = .no
+        smartDashesType = .no
+        enablesReturnKeyAutomatically = false
+        clearButtonMode = .never
+        rightView = nil
+        accessibilityIdentifier = "curium.address"
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("Use init(frame:).")
+    }
+
+    func beginEditSession() -> UInt {
+        editSessionID &+= 1
+        return editSessionID
+    }
+
+    func updateInsets(
+        leading: CGFloat,
+        trailing: CGFloat,
+        leadingPassthrough: CGFloat,
+        trailingPassthrough: CGFloat
+    ) {
+        let changed = leadingInset != leading
+            || trailingInset != trailing
+            || leadingPassthroughWidth != leadingPassthrough
+            || trailingPassthroughWidth != trailingPassthrough
+        guard changed else { return }
+        leadingInset = leading
+        trailingInset = trailing
+        leadingPassthroughWidth = leadingPassthrough
+        trailingPassthroughWidth = trailingPassthrough
+        setNeedsLayout()
+    }
+
+    func clearAddressText() {
+        editSessionID &+= 1
+        unmarkText()
+        selectedTextRange = nil
+        text = ""
+        if isFirstResponder, let start = textRange(from: beginningOfDocument, to: beginningOfDocument) {
+            selectedTextRange = start
+        }
+    }
+
+    override func textRect(forBounds bounds: CGRect) -> CGRect {
+        let right = (isFirstResponder && !(text?.isEmpty ?? true))
+            ? max(trailingInset, Self.clearEditingInset)
+            : trailingInset
+        return bounds.inset(by: UIEdgeInsets(top: 0, left: leadingInset, bottom: 0, right: right))
+    }
+
+    override func editingRect(forBounds bounds: CGRect) -> CGRect {
+        let right = !(text?.isEmpty ?? true)
+            ? max(trailingInset, Self.clearEditingInset)
+            : trailingInset
+        return bounds.inset(by: UIEdgeInsets(top: 0, left: leadingInset, bottom: 0, right: right))
+    }
+
+    override func placeholderRect(forBounds bounds: CGRect) -> CGRect {
+        textRect(forBounds: bounds)
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if leadingPassthroughWidth > 0, point.x < leadingPassthroughWidth {
+            return nil
+        }
+        if trailingPassthroughWidth > 0, point.x > bounds.width - trailingPassthroughWidth {
+            return nil
+        }
+        return super.hitTest(point, with: event)
     }
 }
 
