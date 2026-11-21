@@ -19,11 +19,20 @@ final class CuriumFingerprintStore {
     private let fileURL: URL
     private(set) var selectedProfileID: String?
     private(set) var profiles: [CuriumFingerprintProfile]
+    private(set) var lastPersistError: String?
 
     /// The profile currently selected for next launch, or `nil` when using Build 39 defaults.
     var selectedProfile: CuriumFingerprintProfile? {
         guard let selectedProfileID else { return nil }
         return profiles.first { $0.id == selectedProfileID }
+    }
+
+    var builtInProfiles: [CuriumFingerprintProfile] {
+        profiles.filter(\.isBuiltIn)
+    }
+
+    var customProfiles: [CuriumFingerprintProfile] {
+        profiles.filter { !$0.isBuiltIn }
     }
 
     init(fileURL: URL) {
@@ -61,21 +70,45 @@ final class CuriumFingerprintStore {
         if let id, !profiles.contains(where: { $0.id == id }) {
             return false
         }
+        let previous = selectedProfileID
         selectedProfileID = id
-        persist()
+        if !persist() {
+            selectedProfileID = previous
+            return false
+        }
         return true
     }
 
-    func resetToBuild39Default() {
+    @discardableResult
+    func resetToBuild39Default() -> Bool {
+        let previous = selectedProfileID
         selectedProfileID = nil
-        persist()
+        if !persist() {
+            selectedProfileID = previous
+            return false
+        }
+        return true
     }
 
+    /// Creates or updates a user-owned custom profile. Built-in presets are
+    /// immutable templates and must be duplicated to a new ID before editing.
+    /// Comparisons use case-insensitive matching to prevent APFS directory collisions.
     @discardableResult
     func upsert(_ profile: CuriumFingerprintProfile) -> CuriumFingerprintValidationReport {
-        let report = CuriumFingerprintValidator.validate(profile)
+        var report = CuriumFingerprintValidator.validate(profile)
+        let loweredID = profile.id.lowercased()
+        let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+        if builtInLowered.contains(loweredID) {
+            report.errors.append("Built-in profile \"\(profile.id)\" cannot be overwritten directly. Duplicate it to a new ID first.")
+        }
+        if let collision = profiles.first(where: { $0.id.lowercased() == loweredID && $0.id != profile.id }) {
+            report.errors.append("Profile ID \"\(profile.id)\" conflicts with existing profile \"\(collision.id)\" on case-insensitive APFS.")
+        }
         guard report.isValid else { return report }
+
         var updated = profile
+        updated.isBuiltIn = false
+        let previousProfiles = profiles
         if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
             updated.revision = max(profile.revision, profiles[idx].revision + 1)
             profiles[idx] = updated
@@ -83,35 +116,81 @@ final class CuriumFingerprintStore {
             updated.revision = max(profile.revision, 1)
             profiles.append(updated)
         }
-        persist()
+        if !persist() {
+            profiles = previousProfiles
+            report.errors.append(lastPersistError ?? "Failed to save profile store to disk.")
+        }
         return report
     }
 
     @discardableResult
     func deleteProfile(id: String) -> Bool {
-        guard id != "default" else { return false }
+        let loweredID = id.lowercased()
+        let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+        guard loweredID != "default", !builtInLowered.contains(loweredID) else { return false }
         guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return false }
         guard !profiles[idx].isBuiltIn else { return false }
+        let previousProfiles = profiles
+        let previousSelection = selectedProfileID
         profiles.remove(at: idx)
         if selectedProfileID == id {
             selectedProfileID = nil
         }
-        persist()
+        if !persist() {
+            profiles = previousProfiles
+            selectedProfileID = previousSelection
+            return false
+        }
         return true
     }
 
+    func nextAvailableID(base: String) -> String {
+        let sanitizedChars = base.unicodeScalars.map { scalar -> Character in
+            let v = scalar.value
+            if (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122)
+                || scalar == "-" || scalar == "_"
+            {
+                return Character(scalar)
+            }
+            return "-"
+        }
+        var stem = String(sanitizedChars).trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        if stem.isEmpty || stem.lowercased() == "default" {
+            stem = "profile"
+        }
+        let existingLowered = Set(profiles.map { $0.id.lowercased() })
+        for suffix in 2...999 {
+            let suffixStr = "-\(suffix)"
+            let maxStemLen = max(1, 32 - suffixStr.count)
+            let candidate = String(stem.prefix(maxStemLen)) + suffixStr
+            if CuriumFingerprintValidator.isValidProfileID(candidate),
+               !existingLowered.contains(candidate.lowercased())
+            {
+                return candidate
+            }
+        }
+        return "custom-\(UUID().uuidString.prefix(8).lowercased())"
+    }
+
     func duplicateProfile(from sourceID: String, newID: String, displayName: String) -> CuriumFingerprintProfile? {
+        let loweredNew = newID.lowercased()
+        let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
         guard CuriumFingerprintValidator.isValidProfileID(newID),
-              newID != "default",
-              !profiles.contains(where: { $0.id == newID }),
+              loweredNew != "default",
+              !builtInLowered.contains(loweredNew),
+              !profiles.contains(where: { $0.id.lowercased() == loweredNew }),
               var copy = profiles.first(where: { $0.id == sourceID })
         else { return nil }
         copy.id = newID
         copy.displayName = displayName
         copy.isBuiltIn = false
         copy.revision = 1
+        let previousProfiles = profiles
         profiles.append(copy)
-        persist()
+        guard persist() else {
+            profiles = previousProfiles
+            return nil
+        }
         return copy
     }
 
@@ -124,13 +203,42 @@ final class CuriumFingerprintStore {
         return try encoder.encode(profile)
     }
 
+    /// Imports either a full `CuriumFingerprintProfile` JSON document or a
+    /// Build 40 engine wire payload (`schemaVersion` + `profileId`).
+    /// Rejects built-in profile IDs so users duplicate rather than overwrite templates.
     func importProfileJSON(_ data: Data) throws -> CuriumFingerprintValidationReport {
-        var profile = try JSONDecoder().decode(CuriumFingerprintProfile.self, from: data)
-        profile.isBuiltIn = false
-        return upsert(profile)
+        let decoder = JSONDecoder()
+        if var profile = try? decoder.decode(CuriumFingerprintProfile.self, from: data) {
+            profile.isBuiltIn = false
+            return upsert(profile)
+        }
+        let wire = try decoder.decode(EngineWireImportPayload.self, from: data)
+        guard wire.schemaVersion == CuriumFingerprintSchema.version else {
+            return CuriumFingerprintValidationReport(
+                errors: ["Unsupported fingerprint schemaVersion: \(wire.schemaVersion) (expected \(CuriumFingerprintSchema.version))."]
+            )
+        }
+        let imported = CuriumFingerprintProfile(
+            id: wire.profileId,
+            displayName: wire.profileId,
+            notes: "Imported from engine wire JSON",
+            isBuiltIn: false,
+            revision: wire.revision ?? 1,
+            defaultSlot: wire.defaultSlot ?? .mobile,
+            mobile: wire.mobile ?? CuriumIdentitySlot(),
+            desktop: wire.desktop ?? CuriumIdentitySlot(),
+            languages: wire.languages,
+            proxy: wire.proxy ?? .system,
+            webrtcIpHandlingPolicy: wire.webrtcIpHandlingPolicy ?? .default,
+            enableDoNotTrack: wire.enableDoNotTrack ?? false,
+            enableGlobalPrivacyControl: wire.enableGlobalPrivacyControl ?? false,
+            hardware: wire.hardware ?? .native
+        )
+        return upsert(imported)
     }
 
-    private func persist() {
+    @discardableResult
+    private func persist() -> Bool {
         let state = PersistedState(
             version: 1,
             selectedProfileID: selectedProfileID,
@@ -145,19 +253,44 @@ final class CuriumFingerprintStore {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(state)
             try data.write(to: fileURL, options: .atomic)
+            lastPersistError = nil
+            return true
         } catch {
+            lastPersistError = error.localizedDescription
             Self.log.error("fingerprint store persist failed: \(String(describing: error), privacy: .public)")
+            return false
         }
     }
 
+    /// Emits built-in presets first in canonical order (keeping definitions up to date
+    /// across app updates), followed by user-owned custom profiles (case-insensitively deduplicated).
     private static func mergedWithBuiltIns(_ stored: [CuriumFingerprintProfile]) -> [CuriumFingerprintProfile] {
-        var result = stored
-        for builtIn in CuriumFingerprintPresets.allBuiltIns {
-            if !result.contains(where: { $0.id == builtIn.id }) {
-                result.append(builtIn)
-            }
+        var result = CuriumFingerprintPresets.allBuiltIns
+        var seenLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+        for item in stored {
+            let key = item.id.lowercased()
+            guard !seenLowered.contains(key) else { continue }
+            seenLowered.insert(key)
+            var custom = item
+            custom.isBuiltIn = false
+            result.append(custom)
         }
         return result
+    }
+
+    private struct EngineWireImportPayload: Decodable {
+        let schemaVersion: Int
+        let revision: UInt64?
+        let profileId: String
+        let defaultSlot: CuriumDefaultSlot?
+        let mobile: CuriumIdentitySlot?
+        let desktop: CuriumIdentitySlot?
+        let languages: [String]?
+        let proxy: CuriumProxyConfig?
+        let webrtcIpHandlingPolicy: CuriumWebRTCPolicy?
+        let enableDoNotTrack: Bool?
+        let enableGlobalPrivacyControl: Bool?
+        let hardware: CuriumHardwareOverrides?
     }
 
     private static let log = Logger(subsystem: "com.appautomaton.curium", category: "fingerprint")

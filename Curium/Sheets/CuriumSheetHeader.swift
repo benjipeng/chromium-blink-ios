@@ -72,6 +72,7 @@ struct CuriumSettingsSheet: View {
     let engineReady: Bool
 
     @State private var showingDiagnostics = false
+    @State private var showingFingerprintStudio = false
     @State private var availableMemoryText = ""
     @State private var hooksSummary = ""
     @State private var hasHookFailure = false
@@ -174,41 +175,31 @@ struct CuriumSettingsSheet: View {
 
                 Section {
                     Button {
-                        fingerprintStore.resetToBuild39Default()
+                        showingFingerprintStudio = true
                     } label: {
-                        HStack {
+                        LabeledContent {
+                            HStack(spacing: 6) {
+                                Text(fingerprintStore.selectedProfile?.displayName ?? "Default (Build 39)")
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .accessibilityHidden(true)
+                            }
+                        } label: {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Default (Build 39 Authentic Chrome)")
+                                Text("Manage Profiles & Fingerprints")
                                     .foregroundStyle(.primary)
-                                Text("Legacy Chromium profile · Native Apple hardware")
+                                Text(selectedProfileSummarySubtitle)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Spacer()
-                            if fingerprintStore.selectedProfileID == nil {
-                                Image(systemName: "checkmark").foregroundStyle(.tint)
-                            }
                         }
                     }
-                    ForEach(fingerprintStore.profiles) { profile in
-                        Button {
-                            fingerprintStore.selectProfile(id: profile.id)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(profile.displayName)
-                                        .foregroundStyle(.primary)
-                                    Text("\(profile.id) · \(profile.usesNativeHardwareAndGPU ? "Native Apple HW/GPU" : "Custom HW/GPU") · \(profile.proxy.summary)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if fingerprintStore.selectedProfileID == profile.id {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
-                        }
-                    }
+                    .foregroundStyle(.primary)
+                    .accessibilityIdentifier("curium.settings.fingerprintStudio")
+
                     if fingerprintStore.selectedProfileID == nil {
                         Picker("Browser Brand", selection: $uaBrandPreference) {
                             ForEach(CuriumUABrandPreference.allCases) { option in
@@ -263,9 +254,22 @@ struct CuriumSettingsSheet: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .onAppear { refreshDiagnosticsSummary() }
+        .sheet(isPresented: $showingFingerprintStudio, onDismiss: { refreshDiagnosticsSummary() }) {
+            CuriumFingerprintStudioSheet(store: fingerprintStore) {
+                refreshDiagnosticsSummary()
+            }
+        }
         .sheet(isPresented: $showingDiagnostics, onDismiss: { refreshDiagnosticsSummary() }) {
             CuriumDiagnosticsSheet(engineReady: engineReady)
         }
+    }
+
+    private var selectedProfileSummarySubtitle: String {
+        if let profile = fingerprintStore.selectedProfile {
+            let hw = profile.usesNativeHardwareAndGPU ? "Native Apple HW/GPU" : "Custom HW/GPU"
+            return "\(profile.id) · \(hw) · \(profile.proxy.summary)"
+        }
+        return "Legacy Chromium profile · Native Apple HW/GPU"
     }
 
     private func refreshDiagnosticsSummary() {
@@ -291,6 +295,9 @@ private struct CuriumDiagnosticsSheet: View {
     @State private var availableMemoryText = ""
     @State private var logFileSummary = "Memory only"
     @State private var copied = false
+    @State private var fingerprintStatus: CuriumEngineFingerprintStatus?
+    @State private var fingerprintCapabilities: CuriumEngineFingerprintCapabilities?
+    @State private var nextLaunchProfileLabel = "Default (Build 39)"
 
     private var environmentLabel: String {
         ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil
@@ -326,6 +333,60 @@ private struct CuriumDiagnosticsSheet: View {
                     LabeledContent("V8 Runtime", value: engineReady ? CuriumDiagnostics.jitModeLabel(CuriumActiveV8JitMode()) : "Standby")
                     LabeledContent("Available Memory", value: availableMemoryText)
                     LabeledContent("Log File", value: logFileSummary)
+                }
+
+                Section("Fingerprint & Profile Contract") {
+                    if let status = fingerprintStatus {
+                        LabeledContent("Contract Version", value: "v\(status.contractVersion)")
+                        LabeledContent("Engine State") {
+                            Text(status.state)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(status.state == "rejected" ? .red : .secondary)
+                        }
+                        LabeledContent("Applied Profile") {
+                            Text("\(status.appliedProfileId) (rev \(status.appliedConfigRevision))")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        LabeledContent("Directory Opened", value: status.profileDirectoryOpened ? "Yes" : "No")
+                        if status.contractVersion > 0 {
+                            LabeledContent("Default Slot", value: status.defaultSlot)
+                            LabeledContent("Proxy Mode", value: status.proxyMode)
+                            LabeledContent("Hardware Mode", value: status.hardwareOverridesActive ? "Custom Override" : "Native Apple HW/GPU")
+                        }
+                        if let reason = status.rejectionReason, !reason.isEmpty {
+                            LabeledContent("Rejection") {
+                                Text(reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .multilineTextAlignment(.trailing)
+                            }
+                        }
+                    } else {
+                        LabeledContent("Engine Contract", value: "Not linked / Pre-Build 40")
+                    }
+
+                    LabeledContent("Next Launch Selection", value: nextLaunchProfileLabel)
+
+                    if let caps = fingerprintCapabilities, caps.supportsLaunchFingerprintConfig {
+                        DisclosureGroup("Engine Capabilities (\(caps.features.count) features)") {
+                            LabeledContent("Max Config Payload", value: "\(caps.maxConfigBytes) bytes")
+                            ForEach(caps.features.keys.sorted(), id: \.self) { key in
+                                LabeledContent(key) {
+                                    Text(caps.features[key] == true ? "enabled" : "off")
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(caps.features[key] == true ? .green : .secondary)
+                                }
+                            }
+                            ForEach(caps.activationScopes.keys.sorted(), id: \.self) { key in
+                                LabeledContent("scope.\(key)") {
+                                    Text(caps.activationScopes[key] ?? "")
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Section("Engine Hooks") {
@@ -371,9 +432,23 @@ private struct CuriumDiagnosticsSheet: View {
         let diag = CuriumDiagnostics.shared
         let hooks = diag.hookStatuses()
         let current = diag.currentLines()
+        let status = CuriumFingerprintBootstrap.activeEngineStatus()
+        let caps = CuriumFingerprintBootstrap.engineCapabilities()
+        let store = CuriumFingerprintStore.loadShared()
+        let nextLabel = store.selectedProfileID ?? "default (Build 39)"
+
         hookStatuses = hooks
         lines = current
-        reportText = diag.formattedReport(hooks: hooks, lines: current)
+        fingerprintStatus = status
+        fingerprintCapabilities = caps
+        nextLaunchProfileLabel = nextLabel
+        reportText = diag.formattedReport(
+            hooks: hooks,
+            lines: current,
+            fingerprintStatus: status,
+            fingerprintCapabilities: caps,
+            nextLaunchProfile: nextLabel
+        )
         availableMemoryText = ByteCountFormatter.string(
             fromByteCount: Int64(CuriumAvailableMemoryBytes()),
             countStyle: .memory

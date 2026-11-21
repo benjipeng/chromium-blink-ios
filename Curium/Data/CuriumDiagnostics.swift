@@ -163,7 +163,13 @@ final class CuriumDiagnostics: @unchecked Sendable {
         Self.summarizeHooks(hookStatuses()).summary
     }
 
-    func formattedReport(hooks: [HookStatus]? = nil, lines: [String]? = nil) -> String {
+    func formattedReport(
+        hooks: [HookStatus]? = nil,
+        lines: [String]? = nil,
+        fingerprintStatus: CuriumEngineFingerprintStatus? = nil,
+        fingerprintCapabilities: CuriumEngineFingerprintCapabilities? = nil,
+        nextLaunchProfile: String? = nil
+    ) -> String {
         recordStartupIfNeeded()
         let resolvedHooks = hooks ?? hookStatuses()
         let resolvedLines = lines ?? currentLines()
@@ -183,8 +189,26 @@ final class CuriumDiagnostics: @unchecked Sendable {
             "V8 Runtime: \(jit)",
             "Available Memory: \(avail)",
             "Engine Hooks: \(Self.summarizeHooks(resolvedHooks).summary)",
-            ""
         ]
+        if let status = fingerprintStatus {
+            out.append(
+                "Fingerprint Contract: v\(status.contractVersion) state=\(status.state) "
+                    + "profile=\(status.appliedProfileId) rev=\(status.appliedConfigRevision) "
+                    + "dirOpened=\(status.profileDirectoryOpened) slot=\(status.defaultSlot) "
+                    + "proxy=\(status.proxyMode) hw=\(status.hardwareOverridesActive ? "override" : "native-apple")"
+            )
+            if let reason = status.rejectionReason, !reason.isEmpty {
+                out.append("Fingerprint Rejection: \(reason)")
+            }
+        }
+        if let nextLaunchProfile {
+            out.append("Next Launch Profile: \(nextLaunchProfile)")
+        }
+        if let caps = fingerprintCapabilities, caps.supportsLaunchFingerprintConfig {
+            let enabled = caps.features.filter(\.value).map(\.key).sorted().joined(separator: ",")
+            out.append("Fingerprint Capabilities: v\(caps.contractVersion) maxBytes=\(caps.maxConfigBytes) features=[\(enabled)]")
+        }
+        out.append("")
         out.append(contentsOf: resolvedHooks.map { hook in
             hook.detail.isEmpty
                 ? "  [\(hook.status)] \(hook.name)"

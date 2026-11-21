@@ -8,8 +8,12 @@ enum CuriumFingerprintPresets {
         iosBlinkAuthentic,
         macosDesktopFirst,
         windowsWorkstation,
+        linuxDesktop,
+        pixelAndroid,
         privacyHardened,
     ]
+
+    static let builtInIDs: Set<String> = Set(allBuiltIns.map(\.id))
 
     /// Build 39 authentic Chrome dual-slot profile with 100% native Apple hardware & GPU.
     static let defaultAuthenticChrome = CuriumFingerprintProfile(
@@ -195,6 +199,95 @@ enum CuriumFingerprintPresets {
             deviceMemoryGB: 8,
             timezone: nil
         )
+    )
+
+    /// Desktop-first Linux x86_64 profile with coherent Mesa/Intel WebGL & desktop input capabilities.
+    static let linuxDesktop = CuriumFingerprintProfile(
+        id: "linux-desktop",
+        displayName: "Linux Desktop (x86_64)",
+        notes: "Isolated Linux x86_64 Chrome workstation with empty Sec-CH-UA-Platform-Version (matching upstream Linux Chrome), desktop pointer, and Mesa Intel WebGL.",
+        isBuiltIn: true,
+        revision: 1,
+        defaultSlot: .desktop,
+        mobile: CuriumIdentitySlot(
+            osCpu: "X11; Linux x86_64",
+            appendMobileToken: false,
+            primaryBrand: "Google Chrome",
+            platform: "Linux",
+            platformVersion: "",
+            architecture: "x86",
+            bitness: "64",
+            model: "",
+            mobile: false,
+            wow64: false,
+            formFactors: ["Desktop"],
+            navigatorPlatform: "Linux x86_64",
+            maxTouchPoints: 0,
+            pointerType: .fine,
+            hoverType: .hover,
+            webglVendor: "Google Inc. (Intel)",
+            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)"
+        ),
+        desktop: CuriumIdentitySlot(
+            osCpu: "X11; Linux x86_64",
+            appendMobileToken: false,
+            primaryBrand: "Google Chrome",
+            platform: "Linux",
+            platformVersion: "",
+            architecture: "x86",
+            bitness: "64",
+            model: "",
+            mobile: false,
+            wow64: false,
+            formFactors: ["Desktop"],
+            navigatorPlatform: "Linux x86_64",
+            maxTouchPoints: 0,
+            pointerType: .fine,
+            hoverType: .hover,
+            webglVendor: "Google Inc. (Intel)",
+            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)"
+        ),
+        languages: ["en-US", "en"],
+        proxy: .system,
+        webrtcIpHandlingPolicy: .defaultPublicInterfaceOnly,
+        enableDoNotTrack: false,
+        enableGlobalPrivacyControl: false,
+        hardware: CuriumHardwareOverrides(
+            hardwareConcurrency: 8,
+            deviceMemoryGB: 8,
+            timezone: nil
+        )
+    )
+
+    /// Pixel 9 Android 15 mobile profile with Chrome Reduced UA, Pixel 9 CH model, and native hardware (auto-capped at 8 GB).
+    static let pixelAndroid = CuriumFingerprintProfile(
+        id: "pixel-android",
+        displayName: "Pixel 9 (Android 15)",
+        notes: "Isolated Pixel 9 Android 15 mobile identity (Reduced UA with Pixel 9 Client Hint model) and macOS Desktop slot, keeping native hardware.",
+        isBuiltIn: true,
+        revision: 1,
+        defaultSlot: .mobile,
+        mobile: CuriumIdentitySlot(
+            osCpu: "Linux; Android 10; K",
+            appendMobileToken: true,
+            primaryBrand: "Google Chrome",
+            platform: "Android",
+            platformVersion: "15.0.0",
+            architecture: "",
+            bitness: "",
+            model: "Pixel 9",
+            mobile: true,
+            wow64: false,
+            formFactors: ["Mobile"],
+            navigatorPlatform: "Linux armv81"
+        ),
+        desktop: defaultAuthenticChrome.desktop,
+        languages: nil,
+        proxy: .system,
+        webrtcIpHandlingPolicy: .default,
+        enableDoNotTrack: false,
+        enableGlobalPrivacyControl: false,
+        hardware: .native
     )
 
     /// Privacy-hardened profile keeping native Apple hardware while locking down WebRTC UDP & enabling GPC.

@@ -79,6 +79,7 @@ static void CuriumNoOpLogLaunchMetrics(id self, SEL _cmd, id startupInfo, NSArra
 
 static NSArray<NSString *> *gCuriumAugmentedArguments = nil;
 static BOOL gCuriumExplicitFingerprintConfigured = NO;
+static BOOL gCuriumEnableGlobalPrivacyControl = NO;
 
 // Adds a bare switch once.
 static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
@@ -220,6 +221,7 @@ static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *na
 static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL supportsDisableSync,
                                                  BOOL hasExplicitFingerprintConfig,
+                                                 BOOL enableGlobalPrivacyControl,
                                                  NSString *_Nullable jitPref,
                                                  NSString *_Nullable uaBrandPref,
                                                  NSString *_Nullable mobileUAPref,
@@ -252,6 +254,13 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumAddSwitch(args, @"--curium-disable-jit");
     } else if ([jitPref isEqualToString:@"forceJIT"]) {
         changed |= CuriumAddSwitch(args, @"--curium-enable-jit");
+    }
+
+    if (enableGlobalPrivacyControl) {
+        // Chromium 160 gates both navigator.globalPrivacyControl and the
+        // Sec-GPC header behind the GlobalPrivacyControlApi base::Feature.
+        // Only enable it when the active launch profile explicitly opted in.
+        changed |= CuriumMergeListSwitch(args, @"--enable-features", @",", @"GlobalPrivacyControlApi");
     }
 
     // Never merge legacy 0105 switches field-by-field into an explicit
@@ -292,9 +301,10 @@ static void CuriumInstallCommandLineGuard(void) {
             : CuriumNormalizedAcceptLanguages([NSLocale preferredLanguages]);
         NSString *mobileModelPref = [[defaults stringForKey:@"curium.mobileModel"] copy];
         BOOL hasExplicitConfig = gCuriumExplicitFingerprintConfigured;
+        BOOL enableGPC = gCuriumEnableGlobalPrivacyControl;
         gCuriumAugmentedArguments = CuriumBuildArguments(
-            base, supportsDisableSync, hasExplicitConfig, jitPref, uaBrandPref,
-            mobileUAPref, acceptLangPref, mobileModelPref);
+            base, supportsDisableSync, hasExplicitConfig, enableGPC, jitPref,
+            uaBrandPref, mobileUAPref, acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
         SEL sel = @selector(arguments);
@@ -539,6 +549,10 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
     }
     if (jsonData.length > 0) {
         gCuriumExplicitFingerprintConfigured = YES;
+        id parsed = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+        gCuriumEnableGlobalPrivacyControl = [parsed isKindOfClass:[NSDictionary class]]
+            && [parsed[@"enableGlobalPrivacyControl"] isKindOfClass:[NSNumber class]]
+            && [parsed[@"enableGlobalPrivacyControl"] boolValue];
         NSDictionary<NSString *, id> *status = CuriumEngineActiveFingerprintStatusDict();
         NSString *profileId = [status[@"appliedProfileId"] isKindOfClass:[NSString class]]
             ? status[@"appliedProfileId"] : @"unknown";
@@ -550,6 +564,8 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
                                 profileId, rev.unsignedLongLongValue,
                                 hwOverrides ? @"override" : @"native-apple"]);
     } else {
+        gCuriumExplicitFingerprintConfigured = NO;
+        gCuriumEnableGlobalPrivacyControl = NO;
         CuriumRecordHookStatus(@"Fingerprint Profile", @"active", @"default (Build 39 0105)");
     }
     return YES;

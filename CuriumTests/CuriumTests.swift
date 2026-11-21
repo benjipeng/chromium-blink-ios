@@ -461,11 +461,19 @@ struct CuriumFingerprintTests {
             #expect(obj["notes"] == nil)
             #expect(obj["isBuiltIn"] == nil)
         }
+        #expect(CuriumFingerprintPresets.allBuiltIns.count == 7)
         #expect(CuriumFingerprintPresets.defaultAuthenticChrome.usesNativeHardwareAndGPU)
         #expect(CuriumFingerprintPresets.iosBlinkAuthentic.usesNativeHardwareAndGPU)
         #expect(CuriumFingerprintPresets.macosDesktopFirst.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.pixelAndroid.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.pixelAndroid.mobile.model == "Pixel 9")
+        #expect(CuriumFingerprintPresets.pixelAndroid.mobile.architecture == "")
         #expect(CuriumFingerprintPresets.privacyHardened.usesNativeHardwareAndGPU)
         #expect(!CuriumFingerprintPresets.windowsWorkstation.usesNativeHardwareAndGPU)
+        #expect(!CuriumFingerprintPresets.linuxDesktop.usesNativeHardwareAndGPU)
+        #expect(CuriumFingerprintPresets.linuxDesktop.desktop.platform == "Linux")
+        #expect(CuriumFingerprintPresets.linuxDesktop.desktop.platformVersion == "")
+        #expect(CuriumFingerprintPresets.linuxDesktop.desktop.navigatorPlatform == "Linux x86_64")
     }
 
     @Test("Validator rejects unsafe profile IDs, bad W3C deviceMemory buckets, invalid proxies, and bad timezones")
@@ -513,6 +521,17 @@ struct CuriumFingerprintTests {
         let androidReport = CuriumFingerprintValidator.validate(android16)
         #expect(androidReport.isValid)
         #expect(androidReport.warnings.contains { $0.contains("caps navigator.deviceMemory at 8 GB") })
+
+        var linuxNativeGPU = CuriumFingerprintPresets.linuxDesktop
+        linuxNativeGPU.desktop.webglVendor = nil
+        linuxNativeGPU.desktop.webglRenderer = nil
+        linuxNativeGPU.mobile.webglVendor = nil
+        linuxNativeGPU.mobile.webglRenderer = nil
+        linuxNativeGPU.mobile.mobile = true
+        let linuxReport = CuriumFingerprintValidator.validate(linuxNativeGPU)
+        #expect(linuxReport.isValid)
+        #expect(linuxReport.warnings.contains { $0.contains("Linux identity with native Apple Metal GPU") })
+        #expect(linuxReport.warnings.contains { $0.contains("Linux x86_64") })
     }
 
     @Test("Proxy wire encoding stays strictly mutually exclusive across system, direct, and fixed modes")
@@ -569,6 +588,171 @@ struct CuriumFingerprintTests {
 
         #expect(reloaded.deleteProfile(id: "office-win"))
         #expect(reloaded.selectedProfileID == nil)
+
+        // Built-ins stay protected against direct overwrite and deletion (including case variants on APFS),
+        // and always sort before custom profiles.
+        var builtInAttempt = CuriumFingerprintPresets.linuxDesktop
+        builtInAttempt.displayName = "Tampered Linux"
+        #expect(!reloaded.upsert(builtInAttempt).isValid)
+        var builtInCaseAttempt = CuriumFingerprintPresets.iosBlinkAuthentic
+        builtInCaseAttempt.id = "IOS-Blink"
+        #expect(!reloaded.upsert(builtInCaseAttempt).isValid)
+        #expect(!reloaded.deleteProfile(id: "linux-desktop"))
+        #expect(reloaded.builtInProfiles.map(\.id) == CuriumFingerprintPresets.allBuiltIns.map(\.id))
+
+        // Engine wire JSON import creates a valid custom profile, and case-insensitive APFS collisions are rejected.
+        let wireJSON = Data("""
+        {
+          "schemaVersion": 1,
+          "revision": 3,
+          "profileId": "wire-import-01",
+          "defaultSlot": "desktop",
+          "desktop": { "platform": "macOS", "navigatorPlatform": "MacIntel" },
+          "languages": ["ja-JP", "en-US"],
+          "proxy": { "mode": "direct" },
+          "webrtcIpHandlingPolicy": "disable_non_proxied_udp",
+          "enableDoNotTrack": true,
+          "enableGlobalPrivacyControl": true
+        }
+        """.utf8)
+        let wireReport = try reloaded.importProfileJSON(wireJSON)
+        #expect(wireReport.isValid)
+        let importedWire = try #require(reloaded.profiles.first { $0.id == "wire-import-01" })
+        #expect(importedWire.proxy == .direct)
+        #expect(importedWire.enableGlobalPrivacyControl)
+        #expect(!importedWire.isBuiltIn)
+
+        var apfsCollision = importedWire
+        apfsCollision.id = "Wire-Import-01"
+        #expect(!reloaded.upsert(apfsCollision).isValid)
+        #expect(reloaded.duplicateProfile(from: "default", newID: "WIRE-IMPORT-01", displayName: "Collision") == nil)
+
+        let nextID = reloaded.nextAvailableID(base: "wire-import-01")
+        #expect(CuriumFingerprintValidator.isValidProfileID(nextID))
+        #expect(nextID.lowercased() != "wire-import-01")
+    }
+
+    @Test("Profile storage measures usage safely and refuses active, default, locked, or symlinked wipes")
+    func profileStorageSafetyAndWipe() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "curium-storage-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSupport = root.appending(path: "Application Support", directoryHint: .isDirectory)
+        let caches = root.appending(path: "Caches", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+
+        let loc = try #require(CuriumFingerprintProfileStorage.locations(
+            for: "iso-work",
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches
+        ))
+        try FileManager.default.createDirectory(at: loc.supportDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: loc.cacheDirectory, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 4096).write(to: loc.supportDirectory.appending(path: "Cookies"))
+        try Data(repeating: 0x42, count: 2048).write(to: loc.cacheDirectory.appending(path: "cache.bin"))
+
+        let usage = CuriumFingerprintProfileStorage.measureUsage(
+            for: "iso-work",
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches
+        )
+        #expect(usage.exists)
+        #expect(usage.totalBytes >= 4096)
+
+        // Default and active profiles must always fail closed.
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.defaultProfileProtected) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                "default",
+                isActiveInCurrentProcess: false,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches
+            )
+        }
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.activeProfileProtected) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                "iso-work",
+                isActiveInCurrentProcess: true,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches
+            )
+        }
+
+        // Advisory flock held by another process must block wiping.
+        let lockPath = try #require(loc.lockFile).path
+        let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        #expect(fd >= 0)
+        #expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        // Same-process second fd on flock is independent on Darwin, so flock(LOCK_EX|LOCK_NB) fails with EWOULDBLOCK.
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.profileLockedByAnotherInstance) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                "iso-work",
+                isActiveInCurrentProcess: false,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches
+            )
+        }
+        close(fd)
+
+        // Once unlocked and inactive, wipe clears both Application Support and Caches cleanly.
+        try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+            "iso-work",
+            isActiveInCurrentProcess: false,
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches
+        )
+        #expect(!FileManager.default.fileExists(atPath: loc.supportDirectory.path))
+        #expect(!FileManager.default.fileExists(atPath: loc.cacheDirectory.path))
+
+        // Symlinked profile root must be refused cleanly.
+        let decoy = root.appending(path: "decoy", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+        let symLoc = try #require(CuriumFingerprintProfileStorage.locations(
+            for: "sym-escape",
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches
+        ))
+        try FileManager.default.createSymbolicLink(at: symLoc.supportDirectory, withDestinationURL: decoy)
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.unsafeSymlinkDetected) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                "sym-escape",
+                isActiveInCurrentProcess: false,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches
+            )
+        }
+        #expect(FileManager.default.fileExists(atPath: decoy.path))
+    }
+
+    @Test("Diagnostics report embeds Build 40 fingerprint contract status and capabilities")
+    func diagnosticsReportIncludesFingerprintContract() {
+        let diag = CuriumDiagnostics(directory: nil, observeSystemNotifications: false)
+        let status = CuriumEngineFingerprintStatus(dictionary: [
+            "contractVersion": 1,
+            "state": "configured",
+            "appliedProfileId": "linux-desktop",
+            "profileDirectoryOpened": true,
+            "appliedConfigRevision": 4,
+            "defaultSlot": "desktop",
+            "proxyMode": "fixed",
+            "hardwareOverridesActive": true,
+        ])
+        let caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 1,
+            "maxConfigBytes": 65536,
+            "features": ["zstdBaseline": true, "oopifDesktopInheritance": true],
+        ])
+        let report = diag.formattedReport(
+            hooks: [],
+            lines: [],
+            fingerprintStatus: status,
+            fingerprintCapabilities: caps,
+            nextLaunchProfile: "pixel-android"
+        )
+        #expect(report.contains("Fingerprint Contract: v1 state=configured profile=linux-desktop rev=4"))
+        #expect(report.contains("proxy=fixed hw=override"))
+        #expect(report.contains("Next Launch Profile: pixel-android"))
+        #expect(report.contains("Fingerprint Capabilities: v1 maxBytes=65536 features=[oopifDesktopInheritance,zstdBaseline]"))
     }
 
     @Test("Bootstrap fails closed when an explicit profile is selected without a Build 40+ engine")
